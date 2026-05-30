@@ -116,4 +116,109 @@ describe('censusSearchVariables', () => {
     expect(text).toContain('MEDIAN HOUSEHOLD INCOME');
     expect(text).toContain('B19013_001M');
   });
+
+  it('throws dataset_not_found when service rejects unknown dataset', async () => {
+    const { McpError, JsonRpcErrorCode: codes } = await import('@cyanheads/mcp-ts-core/errors');
+    mockSearchVariables.mockRejectedValue(
+      new McpError(codes.NotFound, 'Dataset not found: bogus/ds', { reason: 'dataset_not_found' }),
+    );
+    const ctx = createMockContext({ errors: censusSearchVariables.errors });
+    const input = censusSearchVariables.input.parse({ query: 'income', dataset: 'bogus/ds' });
+    await expect(censusSearchVariables.handler(input, ctx)).rejects.toMatchObject({
+      code: codes.NotFound,
+    });
+  });
+
+  it('throws variables_unavailable when service is down', async () => {
+    const { McpError, JsonRpcErrorCode: codes } = await import('@cyanheads/mcp-ts-core/errors');
+    mockSearchVariables.mockRejectedValue(
+      new McpError(codes.ServiceUnavailable, 'Variable metadata fetch failed', {
+        reason: 'variables_unavailable',
+      }),
+    );
+    const ctx = createMockContext({ errors: censusSearchVariables.errors });
+    const input = censusSearchVariables.input.parse({ query: 'poverty' });
+    await expect(censusSearchVariables.handler(input, ctx)).rejects.toMatchObject({
+      code: codes.ServiceUnavailable,
+    });
+  });
+
+  it('sets notice enrichment when no variables matched', async () => {
+    const { getEnrichment } = await import('@cyanheads/mcp-ts-core/testing');
+    mockSearchVariables.mockResolvedValue({ variables: [], totalMatches: 0 });
+    const ctx = createMockContext();
+    const input = censusSearchVariables.input.parse({ query: 'zzznomatch' });
+    await censusSearchVariables.handler(input, ctx);
+    expect(getEnrichment(ctx).notice).toContain('zzznomatch');
+  });
+
+  it('passes custom year to variable cache service', async () => {
+    mockSearchVariables.mockResolvedValue({ variables: [], totalMatches: 0 });
+    const ctx = createMockContext();
+    const input = censusSearchVariables.input.parse({ query: 'income', year: 2020 });
+    await censusSearchVariables.handler(input, ctx);
+    expect(mockSearchVariables).toHaveBeenCalledWith(
+      expect.objectContaining({ year: 2020 }),
+      expect.anything(),
+    );
+  });
+
+  it('applies minimum limit of 1 without crashing', async () => {
+    mockSearchVariables.mockResolvedValue({ variables: [], totalMatches: 0 });
+    const ctx = createMockContext();
+    const input = censusSearchVariables.input.parse({ query: 'income', limit: 1 });
+    await censusSearchVariables.handler(input, ctx);
+    expect(mockSearchVariables).toHaveBeenCalledWith(
+      expect.objectContaining({ limit: 1 }),
+      expect.anything(),
+    );
+  });
+
+  it('format includes estimate_code when present', () => {
+    const output = {
+      variables: [
+        {
+          variable_code: 'B19013_001M',
+          label: 'Margin of error!!Median household income',
+          concept: 'MEDIAN HOUSEHOLD INCOME',
+          predicate_type: 'int',
+          estimate_code: 'B19013_001E',
+        },
+      ],
+    };
+    const blocks = censusSearchVariables.format!(output);
+    const text = (blocks[0] as { type: string; text: string }).text;
+    expect(text).toContain('B19013_001E');
+  });
+
+  it('format output never contains API key', () => {
+    const output = {
+      variables: [
+        {
+          variable_code: 'B19013_001E',
+          label: 'Median income',
+          concept: 'MEDIAN INCOME',
+          predicate_type: 'int',
+        },
+      ],
+    };
+    const blocks = censusSearchVariables.format!(output);
+    const text = (blocks[0] as { type: string; text: string }).text;
+    expect(text).not.toMatch(/CENSUS_API_KEY/);
+    expect(text).not.toMatch(/api.key/i);
+  });
+
+  it('injection attempt in query string is safely passed to service', async () => {
+    mockSearchVariables.mockResolvedValue({ variables: [], totalMatches: 0 });
+    const ctx = createMockContext();
+    const injectionPayload = "'; DROP TABLE vars; --";
+    const input = censusSearchVariables.input.parse({ query: injectionPayload });
+    const result = await censusSearchVariables.handler(input, ctx);
+    expect(result.variables).toHaveLength(0);
+    // Query was forwarded as-is — no sanitization error
+    expect(mockSearchVariables).toHaveBeenCalledWith(
+      expect.objectContaining({ query: injectionPayload }),
+      expect.anything(),
+    );
+  });
 });

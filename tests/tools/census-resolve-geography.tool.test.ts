@@ -133,6 +133,114 @@ describe('censusResolveGeography', () => {
     expect(mockResolveGeography).not.toHaveBeenCalled();
   });
 
+  it('includes place_fips when service resolves a place', async () => {
+    mockResolveGeography.mockResolvedValue({
+      name: 'Seattle, Washington',
+      geographyType: 'place',
+      stateFips: '53',
+      placeFips: '63000',
+      fipsSummary: '63000',
+    });
+
+    const ctx = createMockContext({ errors: censusResolveGeography.errors });
+    const input = censusResolveGeography.input.parse({ name: 'Seattle, WA' });
+    const result = await censusResolveGeography.handler(input, ctx);
+
+    expect(result.place_fips).toBe('63000');
+    expect(result.geography_type).toBe('place');
+    expect(result).not.toHaveProperty('county_fips');
+  });
+
+  it('throws ambiguous_name when service rejects with ambiguity', async () => {
+    const { McpError, JsonRpcErrorCode: codes } = await import('@cyanheads/mcp-ts-core/errors');
+    mockResolveGeography.mockRejectedValue(
+      new McpError(codes.ValidationError, 'Matched multiple geographies', {
+        reason: 'ambiguous_name',
+      }),
+    );
+
+    const ctx = createMockContext({ errors: censusResolveGeography.errors });
+    const input = censusResolveGeography.input.parse({ name: 'Springfield' });
+    await expect(censusResolveGeography.handler(input, ctx)).rejects.toMatchObject({
+      code: codes.ValidationError,
+    });
+  });
+
+  it('throws resolution_unavailable when service is down', async () => {
+    const { McpError, JsonRpcErrorCode: codes } = await import('@cyanheads/mcp-ts-core/errors');
+    mockResolveGeography.mockRejectedValue(
+      new McpError(codes.ServiceUnavailable, 'Geography endpoint unreachable', {
+        reason: 'resolution_unavailable',
+      }),
+    );
+
+    const ctx = createMockContext({ errors: censusResolveGeography.errors });
+    const input = censusResolveGeography.input.parse({ name: 'California' });
+    await expect(censusResolveGeography.handler(input, ctx)).rejects.toMatchObject({
+      code: codes.ServiceUnavailable,
+    });
+  });
+
+  it('strips whitespace from geography_type before passing to service', async () => {
+    mockResolveGeography.mockResolvedValue({
+      name: 'Texas',
+      geographyType: 'state',
+      stateFips: '48',
+      fipsSummary: '48',
+    });
+
+    const ctx = createMockContext({ errors: censusResolveGeography.errors });
+    const input = censusResolveGeography.input.parse({
+      name: 'Texas',
+      geography_type: '  state  ',
+    });
+    await censusResolveGeography.handler(input, ctx);
+    expect(mockResolveGeography).toHaveBeenCalledWith('Texas', 'state', expect.anything());
+  });
+
+  it('format includes tract_fips and place_fips when present', () => {
+    const output = {
+      name: '1600 Pennsylvania Ave NW, Washington, DC',
+      geography_type: 'tract',
+      state_fips: '11',
+      county_fips: '001',
+      tract_fips: '010100',
+      fips_summary: '010100',
+    };
+    const blocks = censusResolveGeography.format!(output);
+    const text = (blocks[0] as { type: string; text: string }).text;
+    expect(text).toContain('010100');
+  });
+
+  it('format output never contains API key or secrets', () => {
+    const output = {
+      name: 'King County, Washington',
+      geography_type: 'county',
+      state_fips: '53',
+      county_fips: '033',
+      fips_summary: '033',
+    };
+    const blocks = censusResolveGeography.format!(output);
+    const text = (blocks[0] as { type: string; text: string }).text;
+    expect(text).not.toMatch(/CENSUS_API_KEY/);
+    expect(text).not.toMatch(/api.key/i);
+    expect(text).not.toMatch(/secret/i);
+  });
+
+  it('injection attempt in name does not crash handler', async () => {
+    const { McpError, JsonRpcErrorCode: codes } = await import('@cyanheads/mcp-ts-core/errors');
+    mockResolveGeography.mockRejectedValue(
+      new McpError(codes.NotFound, 'No geography matched', { reason: 'no_match' }),
+    );
+    const ctx = createMockContext({ errors: censusResolveGeography.errors });
+    const input = censusResolveGeography.input.parse({
+      name: "'; SELECT * FROM geographies; --",
+    });
+    await expect(censusResolveGeography.handler(input, ctx)).rejects.toMatchObject({
+      code: codes.NotFound,
+    });
+  });
+
   it('formats output with state and geography FIPS', () => {
     const output = {
       name: 'King County, Washington',

@@ -97,6 +97,75 @@ describe('censusListGeographies', () => {
     expect(zcta?.example).toContain('90001');
   });
 
+  it('assigns example FIPS for "us" and "block group" levels', async () => {
+    mockFetchGeographyLevels.mockResolvedValue([
+      { name: 'us', geoLevelId: '010', requires: [] },
+      { name: 'block group', geoLevelId: '150', requires: ['state', 'county', 'tract'] },
+    ]);
+
+    const ctx = createMockContext({ errors: censusListGeographies.errors });
+    const input = censusListGeographies.input.parse({ dataset: 'acs/acs5' });
+    const result = await censusListGeographies.handler(input, ctx);
+
+    const us = result.geography_levels.find((g) => g.geography_level === 'us');
+    expect(us?.example).toBe('1');
+
+    const bg = result.geography_levels.find((g) => g.geography_level === 'block group');
+    expect(bg?.example).toBe('1');
+  });
+
+  it('assigns wildcard example for unrecognized geography names', async () => {
+    mockFetchGeographyLevels.mockResolvedValue([
+      { name: 'congressional district', geoLevelId: '500', requires: ['state'] },
+    ]);
+
+    const ctx = createMockContext({ errors: censusListGeographies.errors });
+    const input = censusListGeographies.input.parse({ dataset: 'acs/acs5' });
+    const result = await censusListGeographies.handler(input, ctx);
+
+    const cd = result.geography_levels.find((g) => g.geography_level === 'congressional district');
+    expect(cd?.example).toBe('* (all)');
+  });
+
+  it('uses default year when year not provided', async () => {
+    mockFetchGeographyLevels.mockResolvedValue([
+      { name: 'state', geoLevelId: '040', requires: [] },
+    ]);
+
+    const ctx = createMockContext({ errors: censusListGeographies.errors });
+    const input = censusListGeographies.input.parse({ dataset: 'acs/acs5' });
+    await censusListGeographies.handler(input, ctx);
+
+    const { getEnrichment } = await import('@cyanheads/mcp-ts-core/testing');
+    expect(getEnrichment(ctx).year).toBe(2024);
+  });
+
+  it('passes custom year to api service', async () => {
+    mockFetchGeographyLevels.mockResolvedValue([
+      { name: 'state', geoLevelId: '040', requires: [] },
+    ]);
+
+    const ctx = createMockContext({ errors: censusListGeographies.errors });
+    const input = censusListGeographies.input.parse({ dataset: 'acs/acs5', year: 2019 });
+    await censusListGeographies.handler(input, ctx);
+
+    expect(mockFetchGeographyLevels).toHaveBeenCalledWith('acs/acs5', 2019, expect.anything());
+  });
+
+  it('enrich reports correct totalLevels count', async () => {
+    mockFetchGeographyLevels.mockResolvedValue([
+      { name: 'state', geoLevelId: '040', requires: [] },
+      { name: 'county', geoLevelId: '050', requires: ['state'] },
+      { name: 'tract', geoLevelId: '140', requires: ['state', 'county'] },
+    ]);
+
+    const { getEnrichment } = await import('@cyanheads/mcp-ts-core/testing');
+    const ctx = createMockContext({ errors: censusListGeographies.errors });
+    const input = censusListGeographies.input.parse({ dataset: 'acs/acs5' });
+    await censusListGeographies.handler(input, ctx);
+    expect(getEnrichment(ctx).totalLevels).toBe(3);
+  });
+
   it('formats output listing geography levels', () => {
     const output = {
       geography_levels: [
@@ -121,5 +190,22 @@ describe('censusListGeographies', () => {
     expect(text).toContain('county');
     expect(text).toContain('06 (California)');
     expect(text).toContain('037 (Los Angeles County)');
+  });
+
+  it('format output does not contain API key or secrets', () => {
+    const output = {
+      geography_levels: [
+        {
+          geography_level: 'state',
+          requires_parent: false,
+          required_parent_levels: [],
+          example: '06 (California)',
+        },
+      ],
+    };
+    const blocks = censusListGeographies.format!(output);
+    const text = (blocks[0] as { type: string; text: string }).text;
+    expect(text).not.toMatch(/CENSUS_API_KEY/);
+    expect(text).not.toMatch(/api.key/i);
   });
 });

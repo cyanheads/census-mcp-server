@@ -257,4 +257,221 @@ describe('censusQueryData', () => {
     expect(text).toContain('Suppressed');
     expect(text).toContain('geography too small');
   });
+
+  it('includes moe in output when service returns it', async () => {
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'California',
+        geographyFips: '06',
+        variables: {
+          B19013_001E: {
+            estimate: 75000,
+            moe: 150,
+            label: 'Median income',
+            suppressed: false,
+          },
+        },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'state',
+      geography_fips: '06',
+    });
+    const result = await censusQueryData.handler(input, ctx);
+    const vars = result.rows[0]?.variables as Record<string, { moe?: number }>;
+    expect(vars.B19013_001E?.moe).toBe(150);
+  });
+
+  it('wildcard geography_fips passes "*" to api service', async () => {
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'Alabama',
+        geographyFips: '01',
+        variables: {
+          B01001_001E: { estimate: 4900000, label: 'Total', suppressed: false },
+        },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['B01001_001E'],
+      geography_level: 'state',
+      geography_fips: '*',
+    });
+    await censusQueryData.handler(input, ctx);
+    expect(mockQueryData).toHaveBeenCalledWith(
+      expect.objectContaining({ geographyFips: '*' }),
+      expect.anything(),
+    );
+  });
+
+  it('label enrichment from variable cache falls through to api label on cache failure', async () => {
+    // variable cache throws — handler catches and continues
+    const { getVariableCacheService } = await import(
+      '@/services/variable-cache/variable-cache-service.js'
+    );
+    vi.mocked(getVariableCacheService).mockReturnValue({
+      getVariablesByCode: vi.fn().mockRejectedValue(new Error('cache cold')),
+    } as never);
+
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'Oregon',
+        geographyFips: '41',
+        variables: {
+          B01001_001E: { estimate: 4200000, label: 'Total population', suppressed: false },
+        },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['B01001_001E'],
+      geography_level: 'state',
+      geography_fips: '41',
+    });
+    const result = await censusQueryData.handler(input, ctx);
+    // Falls back to api-provided label
+    const vars = result.rows[0]?.variables as Record<string, { label: string }>;
+    expect(vars.B01001_001E?.label).toBe('Total population');
+  });
+
+  it('throws upstream_error when api service rejects', async () => {
+    const { McpError, JsonRpcErrorCode: codes } = await import('@cyanheads/mcp-ts-core/errors');
+    mockQueryData.mockRejectedValue(
+      new McpError(codes.ServiceUnavailable, 'Census API returned 503', {
+        reason: 'upstream_error',
+      }),
+    );
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'state',
+      geography_fips: '06',
+    });
+    await expect(censusQueryData.handler(input, ctx)).rejects.toMatchObject({
+      code: codes.ServiceUnavailable,
+    });
+  });
+
+  it('format shows moe alongside estimate when present', () => {
+    const output = {
+      rows: [
+        {
+          geography_name: 'Oregon',
+          geography_fips: '41',
+          variables: {
+            B19013_001E: {
+              estimate: 75000,
+              moe: 300,
+              label: 'Median income',
+              suppressed: false,
+            },
+          },
+        },
+      ],
+    };
+    const blocks = censusQueryData.format!(output);
+    const text = (blocks[0] as { type: string; text: string }).text;
+    expect(text).toContain('±');
+    expect(text).toContain('300');
+  });
+
+  it('format output never contains API key or secrets', () => {
+    const output = {
+      rows: [
+        {
+          geography_name: 'Oregon',
+          geography_fips: '41',
+          variables: {
+            B19013_001E: {
+              estimate: 75000,
+              label: 'Median income',
+              suppressed: false,
+            },
+          },
+        },
+      ],
+    };
+    const blocks = censusQueryData.format!(output);
+    const text = (blocks[0] as { type: string; text: string }).text;
+    expect(text).not.toMatch(/CENSUS_API_KEY/);
+    expect(text).not.toMatch(/api.key/i);
+    expect(text).not.toMatch(/secret/i);
+  });
+
+  it('injection attempt in variable codes is safely forwarded', async () => {
+    const { McpError, JsonRpcErrorCode: codes } = await import('@cyanheads/mcp-ts-core/errors');
+    mockQueryData.mockRejectedValue(
+      new McpError(codes.ValidationError, 'Invalid variable code', {
+        reason: 'variable_not_found',
+      }),
+    );
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const injectionPayload = "B19013_001E'; DROP TABLE vars; --";
+    const input = censusQueryData.input.parse({
+      variables: [injectionPayload],
+      geography_level: 'state',
+      geography_fips: '06',
+    });
+    await expect(censusQueryData.handler(input, ctx)).rejects.toMatchObject({
+      code: codes.ValidationError,
+    });
+  });
+
+  it('throws with exactly 50 variables — boundary accepted', async () => {
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'State X',
+        geographyFips: '01',
+        variables: Object.fromEntries(
+          Array.from({ length: 50 }, (_, i) => [
+            `B${String(i).padStart(7, '0')}E`,
+            { estimate: i, label: `Var ${i}`, suppressed: false },
+          ]),
+        ),
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const vars50 = Array.from({ length: 50 }, (_, i) => `B${String(i).padStart(7, '0')}E`);
+    const input = censusQueryData.input.parse({
+      variables: vars50,
+      geography_level: 'state',
+      geography_fips: '01',
+    });
+    const result = await censusQueryData.handler(input, ctx);
+    expect(result.rows).toHaveLength(1);
+  });
+
+  it('format handles multiple rows correctly', () => {
+    const output = {
+      rows: [
+        {
+          geography_name: 'King County',
+          geography_fips: '033',
+          variables: {
+            B19013_001E: { estimate: 105000, label: 'Median income', suppressed: false },
+          },
+        },
+        {
+          geography_name: 'Pierce County',
+          geography_fips: '053',
+          variables: {
+            B19013_001E: { estimate: 72000, label: 'Median income', suppressed: false },
+          },
+        },
+      ],
+    };
+    const blocks = censusQueryData.format!(output);
+    const text = (blocks[0] as { type: string; text: string }).text;
+    expect(text).toContain('King County');
+    expect(text).toContain('Pierce County');
+  });
 });

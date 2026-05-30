@@ -159,4 +159,124 @@ describe('censusGetVariable', () => {
     expect(text).toContain('Households');
     expect(text).toContain('B19013_001M');
   });
+
+  it('defaults to acs/acs5 dataset when not provided', async () => {
+    mockGetVariablesByCode.mockResolvedValue([
+      {
+        code: 'B01001_001E',
+        label: 'Total population',
+        concept: 'SEX BY AGE',
+        predicateType: 'int',
+      },
+    ]);
+    const ctx = createMockContext();
+    const input = censusGetVariable.input.parse({ variables: ['B01001_001E'] });
+    const result = await censusGetVariable.handler(input, ctx);
+    expect(result.dataset).toBe('acs/acs5');
+  });
+
+  it('trims whitespace from dataset before forwarding to service', async () => {
+    mockGetVariablesByCode.mockResolvedValue([
+      {
+        code: 'B01001_001E',
+        label: 'Total population',
+        concept: 'SEX BY AGE',
+        predicateType: 'int',
+      },
+    ]);
+    const ctx = createMockContext();
+    const input = censusGetVariable.input.parse({
+      variables: ['B01001_001E'],
+      dataset: '  acs/acs5  ',
+    });
+    const result = await censusGetVariable.handler(input, ctx);
+    expect(result.dataset).toBe('acs/acs5');
+  });
+
+  it('throws variables_unavailable when service is unreachable', async () => {
+    const { McpError, JsonRpcErrorCode: codes } = await import('@cyanheads/mcp-ts-core/errors');
+    mockGetVariablesByCode.mockRejectedValue(
+      new McpError(codes.ServiceUnavailable, 'Variable metadata endpoint unreachable', {
+        reason: 'variables_unavailable',
+      }),
+    );
+    const ctx = createMockContext({ errors: censusGetVariable.errors });
+    const input = censusGetVariable.input.parse({ variables: ['B19013_001E'] });
+    await expect(censusGetVariable.handler(input, ctx)).rejects.toMatchObject({
+      code: codes.ServiceUnavailable,
+    });
+  });
+
+  it('format includes estimate_code sibling when present', () => {
+    const output = {
+      variables: [
+        {
+          variable_code: 'B19013_001M',
+          label: 'Margin of error!!Median income',
+          concept: 'MEDIAN INCOME',
+          predicate_type: 'int',
+          estimate_code: 'B19013_001E',
+        },
+      ],
+      dataset: 'acs/acs5',
+      year: 2024,
+    };
+    const blocks = censusGetVariable.format!(output);
+    const text = (blocks[0] as { type: string; text: string }).text;
+    expect(text).toContain('B19013_001E');
+  });
+
+  it('format includes dataset and year header', () => {
+    const output = {
+      variables: [
+        {
+          variable_code: 'B01001_001E',
+          label: 'Total population',
+          concept: 'SEX BY AGE',
+          predicate_type: 'int',
+        },
+      ],
+      dataset: 'acs/acs1',
+      year: 2022,
+    };
+    const blocks = censusGetVariable.format!(output);
+    const text = (blocks[0] as { type: string; text: string }).text;
+    expect(text).toContain('acs/acs1');
+    expect(text).toContain('2022');
+  });
+
+  it('format output never contains API key or secret', () => {
+    const output = {
+      variables: [
+        {
+          variable_code: 'B01001_001E',
+          label: 'Total population',
+          concept: 'SEX BY AGE',
+          predicate_type: 'int',
+        },
+      ],
+      dataset: 'acs/acs5',
+      year: 2024,
+    };
+    const blocks = censusGetVariable.format!(output);
+    const text = (blocks[0] as { type: string; text: string }).text;
+    expect(text).not.toMatch(/CENSUS_API_KEY/);
+    expect(text).not.toMatch(/api.key/i);
+    expect(text).not.toMatch(/secret/i);
+  });
+
+  it('handles unicode variable labels without crashing', async () => {
+    mockGetVariablesByCode.mockResolvedValue([
+      {
+        code: 'B03001_003E',
+        label: 'Estimate!!Hispanic or Latino—Mexican',
+        concept: 'HISPANIC OR LATINO ORIGIN BY SPECIFIC ORIGIN',
+        predicateType: 'int',
+      },
+    ]);
+    const ctx = createMockContext();
+    const input = censusGetVariable.input.parse({ variables: ['B03001_003E'] });
+    const result = await censusGetVariable.handler(input, ctx);
+    expect(result.variables[0]?.label).toContain('—Mexican');
+  });
 });

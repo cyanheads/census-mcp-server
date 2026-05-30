@@ -237,6 +237,231 @@ describe('censusCompareGeographies', () => {
     expect(result.rows[1]?.geography_name).toBe('Tiny County');
   });
 
+  it('uses sort_by variable when provided', async () => {
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'County A',
+        geographyFips: '001',
+        variables: {
+          B17001_002E: { estimate: 5000, label: 'Poverty', suppressed: false },
+          B01001_001E: { estimate: 100000, label: 'Population', suppressed: false },
+        },
+      },
+      {
+        geographyName: 'County B',
+        geographyFips: '002',
+        variables: {
+          B17001_002E: { estimate: 8000, label: 'Poverty', suppressed: false },
+          B01001_001E: { estimate: 200000, label: 'Population', suppressed: false },
+        },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['B17001_002E', 'B01001_001E'],
+      geography_level: 'county',
+      sort_by: 'B01001_001E',
+    });
+    const result = await censusCompareGeographies.handler(input, ctx);
+
+    // Sort by B01001_001E desc — County B (200K) should be rank 1
+    expect(result.rows[0]?.geography_name).toBe('County B');
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.sortVariable).toBe('B01001_001E');
+  });
+
+  it('caps limit at 500 even when input is higher', async () => {
+    const manyRows = Array.from({ length: 600 }, (_, i) => ({
+      geographyName: `County ${i}`,
+      geographyFips: String(i).padStart(5, '0'),
+      variables: {
+        B19013_001E: { estimate: i * 1000, label: 'Median income', suppressed: false },
+      },
+    }));
+    mockQueryData.mockResolvedValue(manyRows);
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'county',
+      limit: 999,
+    });
+    const result = await censusCompareGeographies.handler(input, ctx);
+
+    expect(result.rows.length).toBeLessThanOrEqual(500);
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.truncated).toBe(true);
+    expect(enrichment.totalCount).toBe(600);
+  });
+
+  it('sets truncated=false when results fit within limit', async () => {
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'King County, WA',
+        geographyFips: '53033',
+        variables: {
+          B19013_001E: { estimate: 105000, label: 'Median income', suppressed: false },
+        },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'county',
+      limit: 50,
+    });
+    await censusCompareGeographies.handler(input, ctx);
+    expect(getEnrichment(ctx).truncated).toBe(false);
+  });
+
+  it('sets truncation notice enrichment when results truncated', async () => {
+    const manyRows = Array.from({ length: 60 }, (_, i) => ({
+      geographyName: `County ${i}`,
+      geographyFips: String(i).padStart(5, '0'),
+      variables: {
+        B19013_001E: { estimate: i * 1000, label: 'Median income', suppressed: false },
+      },
+    }));
+    mockQueryData.mockResolvedValue(manyRows);
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'county',
+      limit: 10,
+    });
+    await censusCompareGeographies.handler(input, ctx);
+    expect(getEnrichment(ctx).notice).toContain('truncated');
+  });
+
+  it('throws upstream_error when api service rejects', async () => {
+    const { McpError, JsonRpcErrorCode: codes } = await import('@cyanheads/mcp-ts-core/errors');
+    mockQueryData.mockRejectedValue(
+      new McpError(codes.ServiceUnavailable, 'Census API unavailable', {
+        reason: 'upstream_error',
+      }),
+    );
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'county',
+    });
+    await expect(censusCompareGeographies.handler(input, ctx)).rejects.toMatchObject({
+      code: codes.ServiceUnavailable,
+    });
+  });
+
+  it('enriches with dataset and year', async () => {
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'State A',
+        geographyFips: '01',
+        variables: {
+          B19013_001E: { estimate: 50000, label: 'Median income', suppressed: false },
+        },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'state',
+      dataset: 'acs/acs5',
+      year: 2022,
+    });
+    await censusCompareGeographies.handler(input, ctx);
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.dataset).toBe('acs/acs5');
+    expect(enrichment.year).toBe(2022);
+  });
+
+  it('label enrichment cache failure does not block comparison', async () => {
+    const { getVariableCacheService } = await import(
+      '@/services/variable-cache/variable-cache-service.js'
+    );
+    vi.mocked(getVariableCacheService).mockReturnValue({
+      getVariablesByCode: vi.fn().mockRejectedValue(new Error('cache cold')),
+    } as never);
+
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'County X',
+        geographyFips: '001',
+        variables: {
+          B19013_001E: { estimate: 80000, label: 'Median income', suppressed: false },
+        },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'county',
+    });
+    const result = await censusCompareGeographies.handler(input, ctx);
+    expect(result.rows).toHaveLength(1);
+  });
+
+  it('format output never contains API key or secrets', () => {
+    const output = {
+      rows: [
+        {
+          geography_name: 'King County, WA',
+          geography_fips: '53033',
+          variables: {
+            B19013_001E: { estimate: 105000, label: 'Median income', suppressed: false },
+          },
+          rank: 1,
+        },
+      ],
+    };
+    const blocks = censusCompareGeographies.format!(output);
+    const text = (blocks[0] as { type: string; text: string }).text;
+    expect(text).not.toMatch(/CENSUS_API_KEY/);
+    expect(text).not.toMatch(/api.key/i);
+    expect(text).not.toMatch(/secret/i);
+  });
+
+  it('format shows moe alongside estimate when present', () => {
+    const output = {
+      rows: [
+        {
+          geography_name: 'King County, WA',
+          geography_fips: '53033',
+          variables: {
+            B19013_001E: { estimate: 105000, moe: 500, label: 'Median income', suppressed: false },
+          },
+          rank: 1,
+        },
+      ],
+    };
+    const blocks = censusCompareGeographies.format!(output);
+    const text = (blocks[0] as { type: string; text: string }).text;
+    expect(text).toContain('±');
+    expect(text).toContain('500');
+  });
+
+  it('injection attempt in geography_level is safely forwarded to service', async () => {
+    const { McpError, JsonRpcErrorCode: codes } = await import('@cyanheads/mcp-ts-core/errors');
+    mockQueryData.mockRejectedValue(
+      new McpError(codes.ValidationError, 'Invalid geography level', {
+        reason: 'geography_not_supported',
+      }),
+    );
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: "county'; DROP TABLE geo; --",
+    });
+    await expect(censusCompareGeographies.handler(input, ctx)).rejects.toMatchObject({
+      code: codes.ValidationError,
+    });
+  });
+
   it('formats output with ranked geography table', () => {
     const output = {
       rows: [

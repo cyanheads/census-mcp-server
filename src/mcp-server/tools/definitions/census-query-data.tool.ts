@@ -38,7 +38,13 @@ export const censusQueryData = tool('census_query_data', {
       .string()
       .optional()
       .describe(
-        'FIPS of the parent geography when the level requires one (e.g., state FIPS "53" when querying counties within WA). Required for sub-state levels. census_resolve_geography returns this as state_fips.',
+        'State FIPS code when querying sub-state levels (e.g., "53" for Washington). Required for county, tract, and block-group queries. census_resolve_geography returns this as state_fips.',
+      ),
+    county_fips: z
+      .string()
+      .optional()
+      .describe(
+        'County FIPS code (3 digits) when querying tracts or block groups within a specific county (e.g., "033" for King County within WA). Required for tract and block-group queries scoped to a county — use alongside parent_fips (state). census_resolve_geography returns this as county_fips.',
       ),
     dataset: z
       .string()
@@ -86,6 +92,12 @@ export const censusQueryData = tool('census_query_data', {
 
   errors: [
     {
+      reason: 'dataset_not_found',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'Dataset code is not recognized.',
+      recovery: 'Call census_list_datasets to discover valid dataset codes like acs/acs5.',
+    },
+    {
       reason: 'missing_api_key',
       code: JsonRpcErrorCode.Unauthorized,
       when: 'CENSUS_API_KEY is not configured or the key is invalid.',
@@ -108,9 +120,9 @@ export const censusQueryData = tool('census_query_data', {
     {
       reason: 'parent_required',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The geography level requires a parent FIPS code but parent_fips was not provided.',
+      when: 'The geography level requires a parent FIPS code but parent_fips was not provided, or a tract/block-group level requires county_fips but it was omitted.',
       recovery:
-        'Add the parent_fips parameter — use census_resolve_geography to get the state_fips value.',
+        'Add parent_fips (state FIPS) from census_resolve_geography state_fips. For tract or block-group levels also add county_fips from census_resolve_geography county_fips.',
     },
     {
       reason: 'no_data',
@@ -152,9 +164,10 @@ export const censusQueryData = tool('census_query_data', {
     }
 
     if (!KNOWN_DATASETS.has(input.dataset ?? 'acs/acs5')) {
-      throw validationError(
+      throw ctx.fail(
+        'dataset_not_found',
         `Unknown dataset: "${input.dataset}". Call census_list_datasets to discover valid dataset codes.`,
-        { dataset: input.dataset },
+        { dataset: input.dataset, ...ctx.recoveryFor('dataset_not_found') },
       );
     }
 
@@ -189,12 +202,14 @@ export const censusQueryData = tool('census_query_data', {
 
     const apiService = getCensusApiService();
     const parentFips = input.parent_fips?.trim() || undefined;
+    const countyFips = input.county_fips?.trim() || undefined;
     const rows = await apiService.queryData(
       {
         variables: input.variables,
         geographyLevel: input.geography_level,
         geographyFips: input.geography_fips,
         ...(parentFips !== undefined && { parentFips }),
+        ...(countyFips !== undefined && { countyFips }),
         dataset,
         year,
       },

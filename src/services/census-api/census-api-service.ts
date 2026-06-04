@@ -23,7 +23,10 @@ export class CensusApiService {
       variables: string[];
       geographyLevel: string;
       geographyFips: string;
+      /** State FIPS code — required for sub-state geography levels. */
       parentFips?: string;
+      /** County FIPS code — required when querying tracts or block groups within a specific county. */
+      countyFips?: string;
       dataset: string;
       year: number;
     },
@@ -33,7 +36,15 @@ export class CensusApiService {
 
     const varList = ['NAME', ...params.variables].join(',');
     const forClause = `${params.geographyLevel}:${params.geographyFips}`;
-    const inClause = params.parentFips ? `&in=state:${params.parentFips}` : '';
+
+    // Build compound in= clause: county FIPS requires state FIPS as the outer scope.
+    let inClause = '';
+    if (params.parentFips) {
+      inClause = `&in=state:${params.parentFips}`;
+      if (params.countyFips) {
+        inClause += `%20county:${params.countyFips}`;
+      }
+    }
 
     const url = `${CENSUS_API_BASE}/${params.year}/${params.dataset}?get=${encodeURIComponent(varList)}&for=${encodeURIComponent(forClause)}${inClause}&key=${censusApiKey}`;
 

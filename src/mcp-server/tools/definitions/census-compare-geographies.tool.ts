@@ -33,7 +33,13 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
       .string()
       .optional()
       .describe(
-        'FIPS of the parent geography to constrain results (e.g., state FIPS "53" to compare counties within WA only). Omit to compare all geographies at the level nationally. Use census_resolve_geography to get this FIPS.',
+        'State FIPS to constrain results (e.g., "53" to compare counties or tracts within WA only). Omit to compare all geographies at the level nationally. Use census_resolve_geography to get state_fips.',
+      ),
+    within_county: z
+      .string()
+      .optional()
+      .describe(
+        'County FIPS (3 digits) to constrain tract or block-group comparisons to a single county within the state specified by within (e.g., "033" for King County). Required when geography_level is "tract" or "block group" and you want county-scoped results. census_resolve_geography returns this as county_fips.',
       ),
     geographies: z
       .array(z.string())
@@ -207,6 +213,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
     // Determine geography_fips — use wildcard to get all geographies at the level
     const geographyFips = '*';
     const parentFips = input.within?.trim() || undefined;
+    const countyFips = input.within_county?.trim() || undefined;
 
     const apiService = getCensusApiService();
     const rows = await apiService.queryData(
@@ -215,6 +222,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
         geographyLevel: input.geography_level,
         geographyFips,
         ...(parentFips !== undefined && { parentFips }),
+        ...(countyFips !== undefined && { countyFips }),
         dataset,
         year,
       },

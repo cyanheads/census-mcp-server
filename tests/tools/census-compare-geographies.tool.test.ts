@@ -181,6 +181,55 @@ describe('censusCompareGeographies', () => {
     expect(enrichment.totalCount).toBe(60);
   });
 
+  it('passes countyFips to apiService when within_county is provided', async () => {
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'Census Tract 1, King County, Washington',
+        geographyFips: '000100',
+        variables: {
+          B19013_001E: { estimate: 98000, label: 'Median income', suppressed: false },
+        },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'tract',
+      within: '53',
+      within_county: '033',
+    });
+    await censusCompareGeographies.handler(input, ctx);
+
+    expect(mockQueryData).toHaveBeenCalledWith(
+      expect.objectContaining({ parentFips: '53', countyFips: '033' }),
+      expect.anything(),
+    );
+  });
+
+  it('omits countyFips from apiService when within_county is not provided', async () => {
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'King County, WA',
+        geographyFips: '53033',
+        variables: {
+          B19013_001E: { estimate: 105000, label: 'Median income', suppressed: false },
+        },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'county',
+      within: '53',
+    });
+    await censusCompareGeographies.handler(input, ctx);
+
+    const callArgs = mockQueryData.mock.calls[0]?.[0];
+    expect(callArgs).not.toHaveProperty('countyFips');
+  });
+
   it('throws dataset_not_found for unknown dataset', async () => {
     const ctx = createMockContext({ errors: censusCompareGeographies.errors });
     const input = censusCompareGeographies.input.parse({

@@ -19,10 +19,10 @@ export const censusResolveGeography = tool('census_resolve_geography', {
         'Place name (e.g., "King County, WA", "Seattle, WA", "California") or street address (e.g., "1600 Pennsylvania Ave NW, Washington, DC 20500"). Include the state abbreviation to disambiguate places with common names.',
       ),
     geography_type: z
-      .string()
+      .enum(['state', 'county', 'place', 'tract'])
       .optional()
       .describe(
-        'Expected geography type to resolve to: "state", "county", "place", or "tract". Optional — auto-detected from the name when omitted (county if "County"/"Borough"/"Parish" appears, state for two-letter abbreviations).',
+        'Expected geography type to resolve to. Optional — auto-detected from the name when omitted (county if "County"/"Borough"/"Parish" appears, state for two-letter abbreviations).',
       ),
   }),
   output: z.object({
@@ -95,11 +95,7 @@ export const censusResolveGeography = tool('census_resolve_geography', {
     ctx.log.info('Resolving geography', { name: input.name, geographyType: input.geography_type });
 
     const service = getGeographyService();
-    const resolved = await service.resolveGeography(
-      input.name,
-      input.geography_type?.trim() || undefined,
-      ctx,
-    );
+    const resolved = await service.resolveGeography(input.name, input.geography_type, ctx);
 
     return {
       name: resolved.name,
@@ -113,6 +109,7 @@ export const censusResolveGeography = tool('census_resolve_geography', {
   },
 
   format: (result) => {
+    const isTractLevel = result.geography_type === 'tract';
     const lines: string[] = [
       `## Resolved: ${result.name}`,
       `**Type:** ${result.geography_type}`,
@@ -120,7 +117,12 @@ export const censusResolveGeography = tool('census_resolve_geography', {
       `**Geography FIPS:** \`${result.fips_summary}\` — use as \`geography_fips\` in census_query_data`,
     ];
 
-    if (result.county_fips) lines.push(`**County FIPS:** \`${result.county_fips}\``);
+    if (result.county_fips) {
+      const countyNote = isTractLevel
+        ? ` — also use as \`county_fips\` in census_query_data for tract-level queries`
+        : '';
+      lines.push(`**County FIPS:** \`${result.county_fips}\`${countyNote}`);
+    }
     if (result.tract_fips) lines.push(`**Tract FIPS:** \`${result.tract_fips}\``);
     if (result.place_fips) lines.push(`**Place FIPS:** \`${result.place_fips}\``);
 

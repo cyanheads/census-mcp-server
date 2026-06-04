@@ -181,21 +181,22 @@ describe('censusResolveGeography', () => {
     });
   });
 
-  it('strips whitespace from geography_type before passing to service', async () => {
-    mockResolveGeography.mockResolvedValue({
-      name: 'Texas',
-      geographyType: 'state',
-      stateFips: '48',
-      fipsSummary: '48',
-    });
+  it('rejects invalid geography_type values at the schema boundary', () => {
+    expect(() =>
+      censusResolveGeography.input.parse({
+        name: 'Texas',
+        geography_type: 'city',
+      }),
+    ).toThrow();
+  });
 
-    const ctx = createMockContext({ errors: censusResolveGeography.errors });
-    const input = censusResolveGeography.input.parse({
-      name: 'Texas',
-      geography_type: '  state  ',
-    });
-    await censusResolveGeography.handler(input, ctx);
-    expect(mockResolveGeography).toHaveBeenCalledWith('Texas', 'state', expect.anything());
+  it('rejects whitespace-padded geography_type values at the schema boundary', () => {
+    expect(() =>
+      censusResolveGeography.input.parse({
+        name: 'Texas',
+        geography_type: '  state  ',
+      }),
+    ).toThrow();
   });
 
   it('format includes tract_fips and place_fips when present', () => {
@@ -210,6 +211,35 @@ describe('censusResolveGeography', () => {
     const blocks = censusResolveGeography.format!(output);
     const text = (blocks[0] as { type: string; text: string }).text;
     expect(text).toContain('010100');
+  });
+
+  it('format notes county_fips usage as county_fips in census_query_data for tract-level results', () => {
+    const output = {
+      name: '1600 Pennsylvania Ave NW, Washington, DC',
+      geography_type: 'tract',
+      state_fips: '11',
+      county_fips: '001',
+      tract_fips: '010100',
+      fips_summary: '010100',
+    };
+    const blocks = censusResolveGeography.format!(output);
+    const text = (blocks[0] as { type: string; text: string }).text;
+    expect(text).toContain('county_fips');
+  });
+
+  it('format does not note county_fips usage for non-tract results', () => {
+    const output = {
+      name: 'King County, Washington',
+      geography_type: 'county',
+      state_fips: '53',
+      county_fips: '033',
+      fips_summary: '033',
+    };
+    const blocks = censusResolveGeography.format!(output);
+    const text = (blocks[0] as { type: string; text: string }).text;
+    // county_fips appears in the parent_fips line for non-tract geography types but not the county_fips instruction
+    expect(text).toContain('033');
+    expect(text).not.toContain('also use as');
   });
 
   it('format output never contains API key or secrets', () => {

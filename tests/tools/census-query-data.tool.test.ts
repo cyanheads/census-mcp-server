@@ -150,7 +150,58 @@ describe('censusQueryData', () => {
     });
   });
 
-  it('throws ValidationError for unknown dataset', async () => {
+  it('passes countyFips to apiService for tract-level queries', async () => {
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'Census Tract 1, King County, Washington',
+        geographyFips: '000100',
+        variables: {
+          B19013_001E: { estimate: 98000, label: 'B19013_001E', suppressed: false },
+        },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'tract',
+      geography_fips: '000100',
+      parent_fips: '53',
+      county_fips: '033',
+    });
+    await censusQueryData.handler(input, ctx);
+
+    expect(mockQueryData).toHaveBeenCalledWith(
+      expect.objectContaining({ parentFips: '53', countyFips: '033' }),
+      expect.anything(),
+    );
+  });
+
+  it('omits countyFips from apiService call when county_fips not provided', async () => {
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'King County, Washington',
+        geographyFips: '033',
+        variables: {
+          B19013_001E: { estimate: 105000, label: 'B19013_001E', suppressed: false },
+        },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'county',
+      geography_fips: '033',
+      parent_fips: '53',
+    });
+    await censusQueryData.handler(input, ctx);
+
+    const callArgs = mockQueryData.mock.calls[0]?.[0];
+    expect(callArgs).not.toHaveProperty('countyFips');
+  });
+
+  it('throws dataset_not_found for unknown dataset', async () => {
     const ctx = createMockContext({ errors: censusQueryData.errors });
     const input = censusQueryData.input.parse({
       variables: ['B19013_001E'],
@@ -159,7 +210,8 @@ describe('censusQueryData', () => {
       dataset: 'invalid/dataset',
     });
     await expect(censusQueryData.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.ValidationError,
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'dataset_not_found' },
     });
   });
 

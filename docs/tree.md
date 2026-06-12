@@ -1,9 +1,11 @@
 # census-mcp-server - Directory Structure
 
-Generated on: 2026-06-02 13:56:59
+Generated on: 2026-06-12 07:21:00
 
 ```text
 census-mcp-server/
+├── .agents/
+├── .claude/
 ├── .claude-plugin/
 │   └── plugin.json
 ├── .codex-plugin/
@@ -31,6 +33,7 @@ census-mcp-server/
 │   ├── check-framework-antipatterns.ts
 │   ├── check-skill-versions.ts
 │   ├── check-skills-sync.ts
+│   ├── clean-mcpb.ts
 │   ├── clean.ts
 │   ├── devcheck.ts
 │   ├── lint-mcp.ts
@@ -116,6 +119,10 @@ census-mcp-server/
 │   ├── security-pass/
 │   │   └── SKILL.md
 │   ├── setup/
+│   │   └── SKILL.md
+│   ├── techniques/
+│   │   ├── references/
+│   │   │   └── outline-on-overflow.md
 │   │   └── SKILL.md
 │   └── tool-defs-analysis/
 │       └── SKILL.md

@@ -106,7 +106,7 @@ export const censusQueryData = tool('census_query_data', {
     },
     {
       reason: 'variable_not_found',
-      code: JsonRpcErrorCode.ValidationError,
+      code: JsonRpcErrorCode.NotFound,
       when: 'One or more variable codes do not exist in the requested dataset and year.',
       recovery:
         'Call census_search_variables or census_get_variable to confirm codes for this dataset and year.',

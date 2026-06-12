@@ -152,6 +152,28 @@ describe('censusSearchVariables', () => {
     expect(getEnrichment(ctx).notice).toContain('zzznomatch');
   });
 
+  it('discloses truncation enrichment when total_matches exceeds the limit', async () => {
+    mockSearchVariables.mockResolvedValue({
+      variables: [
+        {
+          code: 'B19013_001E',
+          label: 'Median household income',
+          concept: 'MEDIAN HOUSEHOLD INCOME',
+          predicateType: 'int',
+        },
+      ],
+      totalMatches: 42,
+    });
+    const ctx = createMockContext();
+    const input = censusSearchVariables.input.parse({ query: 'income', limit: 1 });
+    await censusSearchVariables.handler(input, ctx);
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.truncated).toBe(true);
+    expect(enrichment.shown).toBe(1);
+    expect(enrichment.cap).toBe(1);
+    expect(enrichment.notice).toContain('42');
+  });
+
   it('passes custom year to variable cache service', async () => {
     mockSearchVariables.mockResolvedValue({ variables: [], totalMatches: 0 });
     const ctx = createMockContext();

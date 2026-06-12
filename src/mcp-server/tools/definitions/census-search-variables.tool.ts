@@ -83,11 +83,17 @@ export const censusSearchVariables = tool('census_search_variables', {
     totalMatches: z
       .number()
       .describe('Total variables matching the query before the limit was applied.'),
+    truncated: z
+      .boolean()
+      .optional()
+      .describe('True when total_matches exceeded the limit and results were cut off.'),
+    shown: z.number().optional().describe('Number of variables returned after the limit.'),
+    cap: z.number().optional().describe('The limit that was applied.'),
     notice: z
       .string()
       .optional()
       .describe(
-        'Guidance when no variables matched — suggests broader keywords or a different dataset.',
+        'Guidance when no variables matched, or when results were truncated — suggests broader keywords, a narrower query, or a higher limit.',
       ),
   },
 
@@ -128,6 +134,12 @@ export const censusSearchVariables = tool('census_search_variables', {
       ctx.enrich.notice(
         `No variables matched "${input.query}". Try broader keywords or a different dataset.`,
       );
+    } else if (totalMatches > limit) {
+      ctx.enrich.truncated({
+        shown: variables.length,
+        cap: limit,
+        guidance: `${totalMatches} variables matched — ${totalMatches - variables.length} not shown. Narrow the query or raise limit (max 100).`,
+      });
     }
 
     return {

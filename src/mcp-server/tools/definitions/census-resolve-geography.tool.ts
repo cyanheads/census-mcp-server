@@ -4,7 +4,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, validationError } from '@cyanheads/mcp-ts-core/errors';
 import { getGeographyService } from '@/services/geography/geography-service.js';
 
 export const censusResolveGeography = tool('census_resolve_geography', {
@@ -83,8 +83,7 @@ export const censusResolveGeography = tool('census_resolve_geography', {
 
   async handler(input, ctx) {
     if (!input.name.trim()) {
-      throw ctx.fail(
-        'no_match',
+      throw validationError(
         'Place name is required — provide a city, county, state, or street address.',
         {
           recovery: { hint: 'Provide a non-empty name such as "King County, WA" or "Washington".' },

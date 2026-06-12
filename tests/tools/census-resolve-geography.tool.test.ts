@@ -113,22 +113,20 @@ describe('censusResolveGeography', () => {
     expect(mockResolveGeography).toHaveBeenCalledWith('California', 'state', expect.anything());
   });
 
-  it('throws no_match for empty name', async () => {
+  it('throws ValidationError for empty name', async () => {
     const ctx = createMockContext({ errors: censusResolveGeography.errors });
     const input = censusResolveGeography.input.parse({ name: '' });
     await expect(censusResolveGeography.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.NotFound,
-      data: { reason: 'no_match' },
+      code: JsonRpcErrorCode.ValidationError,
     });
     expect(mockResolveGeography).not.toHaveBeenCalled();
   });
 
-  it('throws no_match for whitespace-only name', async () => {
+  it('throws ValidationError for whitespace-only name', async () => {
     const ctx = createMockContext({ errors: censusResolveGeography.errors });
     const input = censusResolveGeography.input.parse({ name: '   ' });
     await expect(censusResolveGeography.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.NotFound,
-      data: { reason: 'no_match' },
+      code: JsonRpcErrorCode.ValidationError,
     });
     expect(mockResolveGeography).not.toHaveBeenCalled();
   });

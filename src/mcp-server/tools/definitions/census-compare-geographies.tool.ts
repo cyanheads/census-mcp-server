@@ -148,8 +148,8 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
     },
     {
       reason: 'variable_not_found',
-      code: JsonRpcErrorCode.ValidationError,
-      when: 'One or more variable codes are invalid for this dataset and year.',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'One or more variable codes are not found in this dataset and year.',
       recovery:
         'Use census_search_variables or census_get_variable to confirm codes for this dataset and year.',
     },

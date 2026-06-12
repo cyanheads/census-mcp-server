@@ -1,6 +1,6 @@
 {
   "name": "@cyanheads/census-mcp-server",
-  "version": "0.1.5",
+  "version": "0.1.10",
   "description": "Query U.S. Census Bureau data, variables, and geography via MCP. STDIO or Streamable HTTP.",
   "author": {
     "name": "cyanheads",

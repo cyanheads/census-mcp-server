@@ -1,5 +1,5 @@
 {
-  "@cyanheads/census-mcp-server": {
+  "census-mcp-server": {
     "command": "npx",
     "args": ["-y", "@cyanheads/census-mcp-server"],
     "env": {

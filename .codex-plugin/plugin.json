@@ -1,5 +1,5 @@
 {
-  "name": "@cyanheads/census-mcp-server",
+  "name": "census-mcp-server",
   "version": "0.1.10",
   "description": "Query U.S. Census Bureau data, variables, and geography via MCP. STDIO or Streamable HTTP.",
   "author": {
@@ -13,7 +13,7 @@
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "census", "census-bureau", "acs", "geography", "open-data"],
   "mcpServers": "./.codex-plugin/mcp.json",
   "interface": {
-    "displayName": "@cyanheads/census-mcp-server",
+    "displayName": "census-mcp-server",
     "shortDescription": "Query U.S. Census Bureau data, variables, and geography via MCP.",
     "longDescription": "",
     "developerName": "cyanheads",

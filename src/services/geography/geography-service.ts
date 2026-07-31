@@ -14,29 +14,116 @@ import type {
   TigerwebFeature,
   TigerwebResponse,
 } from './types.js';
+import { GEOGRAPHY_TYPES } from './types.js';
 
 const TIGERWEB_BASE = 'https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb';
 const GEOCODER_BASE = 'https://geocoding.geo.census.gov/geocoder/geographies/onelineaddress';
 
 /**
- * TIGERweb layer config per geography type.
+ * One TIGERweb layer group — the fields a level exposes and the WHERE clauses it accepts.
  *
- * `STUSAB` exists only on the state layer — requesting it on any other layer makes
- * TIGERweb answer HTTP 400, so those layers carry the numeric `STATE` FIPS instead and
- * the abbreviation is derived from it. `BASENAME` is the unqualified name ("Seattle"
- * for `NAME` "Seattle city") and is present on all four layers.
+ * Field availability differs per layer and a clause naming an absent field is answered with
+ * HTTP 200 carrying an ArcGIS error body, not an empty result, so scoping is declared here
+ * rather than assumed: `STUSAB` exists only on the state layer, and the CBSA and CSA layers
+ * carry no `STATE` at all. `BASENAME` is the unqualified name ("Seattle" for `NAME` "Seattle
+ * city") and is present on every layer.
  */
+interface TigerwebLayerSpec {
+  /** Attribute holding this level's own code, and the width that code zero-pads to. */
+  codeField: string;
+  codeLength: number;
+  /** Layer carries `COUNTY`, so a county FIPS can scope the query. */
+  countyScoped: boolean;
+  /** Layer IDs making up this level — queried together, since a level can span two of them. */
+  layers: number[];
+  outFields: string;
+  /** MapServer service under the TIGERweb root. */
+  service: string;
+  /**
+   * Layer has no `STATE` field but spells the states it spans into `NAME` ("Aberdeen, WA Micro
+   * Area"), so a state suffix scopes the rows after the fetch instead of the WHERE clause.
+   */
+  stateInName: boolean;
+  /** Layer carries `STATE`, so a state suffix on the name can scope the query. */
+  stateScoped: boolean;
+}
+
+/** TIGERweb layer config per geography type. */
 const TIGERWEB_LAYERS = {
-  state: { service: 'State_County', layer: 0, outFields: 'NAME,BASENAME,STATE,STUSAB' },
-  county: { service: 'State_County', layer: 1, outFields: 'NAME,BASENAME,STATE,COUNTY' },
+  state: {
+    service: 'State_County',
+    layers: [0],
+    outFields: 'NAME,BASENAME,STATE,STUSAB',
+    codeField: 'STATE',
+    codeLength: 2,
+    stateScoped: true,
+    countyScoped: false,
+    stateInName: false,
+  },
+  county: {
+    service: 'State_County',
+    layers: [1],
+    outFields: 'NAME,BASENAME,STATE,COUNTY',
+    codeField: 'COUNTY',
+    codeLength: 3,
+    stateScoped: true,
+    countyScoped: true,
+    stateInName: false,
+  },
   // Incorporated places are in layer 4 of Places_CouSub_ConCity_SubMCD (layer 0 = county subdivisions).
   place: {
     service: 'Places_CouSub_ConCity_SubMCD',
-    layer: 4,
+    layers: [4],
     outFields: 'NAME,BASENAME,STATE,PLACE',
+    codeField: 'PLACE',
+    codeLength: 5,
+    stateScoped: true,
+    countyScoped: false,
+    stateInName: false,
   },
-  tract: { service: 'Tracts_Blocks', layer: 0, outFields: 'NAME,BASENAME,STATE,COUNTY,TRACT' },
-} satisfies Record<GeographyType, { service: string; layer: number; outFields: string }>;
+  tract: {
+    service: 'Tracts_Blocks',
+    layers: [0],
+    outFields: 'NAME,BASENAME,STATE,COUNTY,TRACT',
+    codeField: 'TRACT',
+    codeLength: 6,
+    stateScoped: true,
+    countyScoped: true,
+    stateInName: false,
+  },
+  // Metropolitan (layer 3) and micropolitan (layer 4) areas are one Census level split across
+  // two layers, so both are queried — a name can match either and neither layer knows the other.
+  'metropolitan statistical area/micropolitan statistical area': {
+    service: 'CBSA',
+    layers: [3, 4],
+    outFields: 'NAME,BASENAME,GEOID,CBSA',
+    codeField: 'GEOID',
+    codeLength: 5,
+    stateScoped: false,
+    countyScoped: false,
+    stateInName: true,
+  },
+  'combined statistical area': {
+    service: 'CBSA',
+    layers: [0],
+    outFields: 'NAME,BASENAME,GEOID,CSA',
+    codeField: 'GEOID',
+    codeLength: 3,
+    stateScoped: false,
+    countyScoped: false,
+    stateInName: true,
+  },
+  'consolidated city': {
+    service: 'Places_CouSub_ConCity_SubMCD',
+    layers: [3],
+    outFields: 'NAME,BASENAME,STATE,CONCITY',
+    codeField: 'CONCITY',
+    codeLength: 5,
+    stateScoped: true,
+    countyScoped: false,
+    stateInName: false,
+  },
+} satisfies Record<GeographyType, TigerwebLayerSpec>;
 
 /** States, DC, and territories — the single source for the FIPS/abbreviation/name lookups below. */
 const US_STATES: ReadonlyArray<{ abbr: string; fips: string; name: string }> = [
@@ -125,6 +212,14 @@ const STATE_NAME_TO_ABBR: Record<string, string> = {
 /** Candidates listed in an `ambiguous_name` error. */
 const MAX_CANDIDATES = 10;
 
+/**
+ * The states a CBSA or CSA name spans — `MO-KS` out of "Kansas City, MO-KS Metro Area".
+ *
+ * Every name on those layers carries exactly one comma, followed by the hyphenated state list
+ * and the area suffix, so the list is the segment between them.
+ */
+const NAME_STATE_LIST = /,\s*([A-Z]{2}(?:-[A-Z]{2})*)\b/;
+
 export class GeographyService {
   /**
    * Resolve a place name or address to Census FIPS identifiers.
@@ -132,35 +227,86 @@ export class GeographyService {
    * Without an explicit `geographyType` the name is matched against an ordered chain of
    * layers (see {@link GeographyService.detectGeographyTypes}); a layer with no rows falls
    * through to the next, and only an exhausted chain is a `no_match`.
+   *
+   * A `countyFips` restricts that chain to the levels whose layers carry `COUNTY`, so the
+   * scope is either applied or reported — never carried past a layer that cannot express it.
    */
   async resolveGeography(
-    name: string,
-    geographyType: GeographyType | undefined,
+    params: { name: string; geographyType?: GeographyType; countyFips?: string },
     ctx: Context,
   ): Promise<ResolvedGeography> {
-    ctx.log.info('Resolving geography', { name, geographyType });
+    const { name, geographyType } = params;
+    // TIGERweb stores COUNTY zero-padded, so an unpadded '51' would match nothing at all.
+    const countyFips = params.countyFips?.padStart(3, '0');
+    ctx.log.info('Resolving geography', { name, geographyType, countyFips });
 
-    if (this.looksLikeAddress(name)) {
-      return this.resolveAddress(name, ctx);
+    const isAddress = this.looksLikeAddress(name);
+    const detected = isAddress
+      ? []
+      : geographyType
+        ? [geographyType]
+        : this.detectGeographyTypes(name);
+
+    // A level with no COUNTY field answers exactly as it would have with no county named, so
+    // the scope narrows the chain rather than riding along unapplied: a caller who scoped a
+    // lookup must never get back a match that ignored the scope. A chain the filter empties
+    // is the answer, not a licence to fall through to an unscoped layer.
+    const types = countyFips
+      ? detected.filter((type) => TIGERWEB_LAYERS[type].countyScoped)
+      : detected;
+
+    if (countyFips && types.length === 0) {
+      throw this.countyScopeUnsupported(geographyType, isAddress, detected);
     }
 
-    const types = geographyType ? [geographyType] : this.detectGeographyTypes(name);
+    if (isAddress) return this.resolveAddress(name, ctx);
 
     for (const type of types) {
-      const resolved = await this.resolveNamedPlace(name, type, ctx);
+      const resolved = await this.resolveNamedPlace(name, type, countyFips, ctx);
       if (resolved) return resolved;
     }
 
-    throw this.noMatch(name, types);
+    throw this.noMatch(name, types, countyFips);
   }
 
-  /** Query one TIGERweb layer. Resolves to `null` when that layer has no row for the name. */
+  /**
+   * Build the `county_scope_unsupported` error for a `county_fips` no level reached by this
+   * call can apply — only `county` and `tract` sit inside a county, and a street address
+   * resolves to a single point rather than a set a county could narrow.
+   */
+  private countyScopeUnsupported(
+    geographyType: GeographyType | undefined,
+    isAddress: boolean,
+    detected: GeographyType[],
+  ) {
+    const subject = isAddress
+      ? 'a street address, which already resolves to one county on its own'
+      : geographyType
+        ? `the ${geographyType} level`
+        : `the ${detected.join(' or ')} level${detected.length > 1 ? 's' : ''} this name auto-detects to`;
+
+    return validationError(
+      `county_fips does not apply to ${subject} — only county and tract sit within a county.`,
+      {
+        reason: 'county_scope_unsupported',
+        ...(geographyType && { geographyType }),
+        ...(detected.length > 0 && { attemptedTypes: detected }),
+        recovery: {
+          hint: 'Drop county_fips, or set geography_type to "county" or "tract" to use it.',
+        },
+      },
+    );
+  }
+
+  /** Query one geography level. Resolves to `null` when its layers have no row for the name. */
   private resolveNamedPlace(
     name: string,
     geographyType: GeographyType,
+    countyFips: string | undefined,
     ctx: Context,
   ): Promise<ResolvedGeography | null> {
     const trimmed = name.trim();
+    const spec = TIGERWEB_LAYERS[geographyType];
 
     // The state layer's NAME is the full state name, so a bare abbreviation has to
     // match on STUSAB — 'WA' is not a substring of 'Washington'.
@@ -178,7 +324,9 @@ export class GeographyService {
 
     let whereClause = `NAME LIKE '%${placeName.replace(/'/g, "''")}%'`;
 
-    if (stateAbbr) {
+    // A statistical area spans whatever states it spans, so its layer carries no STATE to
+    // filter on — scoping it would be an ArcGIS error, not a narrower answer.
+    if (stateAbbr && spec.stateScoped) {
       if (geographyType === 'state') {
         whereClause += ` AND STUSAB='${stateAbbr}'`;
       } else {
@@ -187,26 +335,91 @@ export class GeographyService {
       }
     }
 
+    if (countyFips && spec.countyScoped) {
+      whereClause += ` AND COUNTY='${countyFips}'`;
+    }
+
     return this.fetchAndMapFeatures({
       ctx,
       geographyType,
       name,
       queryTerm: placeName,
       whereClause,
+      // The statistical-area layers have no STATE to filter on, so the state the caller named
+      // is matched against the row names instead — dropping it would answer "Aberdeen, WA"
+      // with the South Dakota micro area alongside the Washington one.
+      ...(stateAbbr && spec.stateInName && { nameStateAbbr: stateAbbr }),
     });
   }
 
-  /** Fetch TIGERweb features and map them to a ResolvedGeography. */
+  /** Fetch TIGERweb features across a level's layers and map them to a ResolvedGeography. */
   private async fetchAndMapFeatures(opts: {
     ctx: Context;
     geographyType: GeographyType;
     name: string;
+    /** State abbreviation to match against row names, on layers that carry no `STATE`. */
+    nameStateAbbr?: string;
     queryTerm: string;
     whereClause: string;
   }): Promise<ResolvedGeography | null> {
-    const { ctx, geographyType, name, queryTerm, whereClause } = opts;
-    const { service, layer, outFields } = TIGERWEB_LAYERS[geographyType];
-    const url = `${TIGERWEB_BASE}/${service}/MapServer/${layer}/query?where=${encodeURIComponent(whereClause)}&outFields=${outFields}&returnGeometry=false&f=json`;
+    const { ctx, geographyType, name, nameStateAbbr, queryTerm, whereClause } = opts;
+    const spec = TIGERWEB_LAYERS[geographyType];
+
+    const perLayer = await Promise.all(
+      spec.layers.map((layer) => this.queryLayer(spec, layer, whereClause, ctx)),
+    );
+    const fetched = perLayer.flat();
+    const features = nameStateAbbr ? this.filterByStateInName(fetched, nameStateAbbr) : fetched;
+
+    if (features.length === 0) return null;
+
+    const matches = this.preferExactMatches(features, queryTerm);
+
+    // Any surviving row is a distinct geography, so picking the first of several is a
+    // coin flip between real places — "Boston" alone matches towns in IN, GA, and MA.
+    // Report every candidate instead and let the caller choose.
+    if (matches.length > 1) {
+      throw this.ambiguousName(name, geographyType, matches);
+    }
+
+    // biome-ignore lint/style/noNonNullAssertion: matches is derived from a non-empty features array
+    const attrs = matches[0]!.attributes;
+
+    const stateFips = this.levelCode(attrs, 'STATE', 2);
+    const countyFips = this.levelCode(attrs, 'COUNTY', 3);
+    const placeFips = this.levelCode(attrs, 'PLACE', 5);
+    const tractFips = this.levelCode(attrs, 'TRACT', 6);
+    const fipsSummary = this.levelCode(attrs, spec.codeField, spec.codeLength);
+
+    if (!fipsSummary) {
+      throw serviceUnavailable(
+        `TIGERweb returned a ${geographyType} row without its ${spec.codeField} code.`,
+        { reason: 'resolution_unavailable' },
+      );
+    }
+
+    const result: ResolvedGeography = {
+      name: String(attrs.NAME ?? name),
+      geographyType,
+      fipsSummary,
+    };
+
+    if (stateFips) result.stateFips = stateFips;
+    if (countyFips) result.countyFips = countyFips;
+    if (tractFips) result.tractFips = tractFips;
+    if (placeFips) result.placeFips = placeFips;
+
+    return result;
+  }
+
+  /** Query one TIGERweb layer, returning its rows. */
+  private async queryLayer(
+    spec: TigerwebLayerSpec,
+    layer: number,
+    whereClause: string,
+    ctx: Context,
+  ): Promise<TigerwebFeature[]> {
+    const url = `${TIGERWEB_BASE}/${spec.service}/MapServer/${layer}/query?where=${encodeURIComponent(whereClause)}&outFields=${spec.outFields}&returnGeometry=false&f=json`;
 
     ctx.log.debug('TIGERweb query', { url, whereClause });
 
@@ -248,53 +461,39 @@ export class GeographyService {
       });
     }
 
-    const features = data.features ?? [];
+    return data.features ?? [];
+  }
 
-    if (features.length === 0) return null;
+  /**
+   * Read one code off a TIGERweb row, zero-padded to its documented width.
+   *
+   * TIGERweb drops leading zeros on some numeric fields — an unpadded `5` for Arkansas would
+   * miss every FIPS lookup keyed on `05`.
+   */
+  private levelCode(
+    attrs: TigerwebFeature['attributes'],
+    field: string,
+    length: number,
+  ): string | undefined {
+    const raw = attrs[field];
+    if (raw === undefined || raw === null || raw === '') return;
+    return String(raw).padStart(length, '0');
+  }
 
-    const matches = this.preferExactMatches(features, queryTerm);
-
-    // Any surviving row is a distinct geography, so picking the first of several is a
-    // coin flip between real places — "Boston" alone matches towns in IN, GA, and MA.
-    // Report every candidate instead and let the caller choose.
-    if (matches.length > 1) {
-      throw this.ambiguousName(name, geographyType, matches);
-    }
-
-    // biome-ignore lint/style/noNonNullAssertion: matches is derived from a non-empty features array
-    const attrs = matches[0]!.attributes;
-
-    const stateFips = String(attrs.STATE ?? '').padStart(2, '0');
-    const countyFipsRaw = attrs.COUNTY;
-    const placeFipsRaw = attrs.PLACE;
-    const tractFipsRaw = attrs.TRACT;
-
-    const countyFips =
-      countyFipsRaw !== undefined ? String(countyFipsRaw).padStart(3, '0') : undefined;
-    const placeFips = placeFipsRaw !== undefined ? String(placeFipsRaw) : undefined;
-    const tractFips = tractFipsRaw !== undefined ? String(tractFipsRaw) : undefined;
-
-    const fipsSummary =
-      geographyType === 'state'
-        ? stateFips
-        : geographyType === 'county' && countyFips
-          ? countyFips
-          : geographyType === 'place' && placeFips
-            ? placeFips
-            : (tractFips ?? stateFips);
-
-    const result: ResolvedGeography = {
-      name: String(attrs.NAME ?? name),
-      geographyType,
-      stateFips,
-      fipsSummary,
-    };
-
-    if (countyFips) result.countyFips = countyFips;
-    if (tractFips) result.tractFips = tractFips;
-    if (placeFips) result.placeFips = placeFips;
-
-    return result;
+  /**
+   * Narrow to rows whose name spans the state the caller named.
+   *
+   * A statistical area covers whatever states it covers, so its layer carries no `STATE` to
+   * put in a WHERE clause — but its name ends in the hyphenated list of those states, which
+   * means the named one can sit second or third rather than first: "Kansas City, MO" and
+   * "Kansas City, KS" are both the MO-KS metro area. A row whose name yields no state list
+   * fails the check, since an unverifiable row does not satisfy a scope that was asked for.
+   */
+  private filterByStateInName(features: TigerwebFeature[], stateAbbr: string): TigerwebFeature[] {
+    return features.filter((f) => {
+      const states = NAME_STATE_LIST.exec(String(f.attributes.NAME ?? ''))?.[1];
+      return states?.split('-').includes(stateAbbr) ?? false;
+    });
   }
 
   /**
@@ -317,22 +516,27 @@ export class GeographyService {
     return exact.length > 0 ? exact : features;
   }
 
-  /** Build the `ambiguous_name` error, naming each candidate's state so the caller can re-query. */
+  /**
+   * Build the `ambiguous_name` error, giving each candidate enough to act on without a
+   * re-query: its own code, plus the state that separates same-named places.
+   */
   private ambiguousName(name: string, geographyType: GeographyType, matches: TigerwebFeature[]) {
+    const spec = TIGERWEB_LAYERS[geographyType];
+
     const candidates = matches.slice(0, MAX_CANDIDATES).map((f) => {
-      // Pad before the reverse lookup: an unpadded '5' would miss every single-digit
-      // FIPS state (AL 01 … CT 09) and leave those candidates without a state.
-      const stateFips = String(f.attributes.STATE ?? '').padStart(2, '0');
+      const stateFips = this.levelCode(f.attributes, 'STATE', 2);
+      const countyFips = this.levelCode(f.attributes, 'COUNTY', 3);
+      const tractFips = this.levelCode(f.attributes, 'TRACT', 6);
       return {
         name: String(f.attributes.NAME ?? ''),
         geographyType,
-        stateFips,
-        stateAbbr: STATE_FIPS_TO_ABBR[stateFips] ?? '',
-        ...(f.attributes.COUNTY !== undefined && {
-          countyFips: String(f.attributes.COUNTY).padStart(3, '0'),
-        }),
+        // Every candidate carries the value resolving it would have returned, so the caller
+        // can take one straight to census_query_data instead of narrowing the name.
+        fipsSummary: this.levelCode(f.attributes, spec.codeField, spec.codeLength) ?? '',
+        ...(stateFips && { stateFips, stateAbbr: STATE_FIPS_TO_ABBR[stateFips] ?? '' }),
+        ...(countyFips && { countyFips }),
         // Tract candidates share a name, so the FIPS pair is the only way to act on one.
-        ...(f.attributes.TRACT !== undefined && { tractFips: String(f.attributes.TRACT) }),
+        ...(tractFips && { tractFips }),
       };
     });
 
@@ -348,11 +552,10 @@ export class GeographyService {
     const more = remaining > 0 ? `, and ${remaining} more` : '';
 
     // A tract candidate is not re-queryable by name — every one of them carries the same
-    // name and state, and this tool takes no county input. Hand over the county FIPS
-    // instead, which is what census_query_data needs to pin the right one.
+    // name and state, so the county FIPS is the only input that separates them.
     const next =
       geographyType === 'tract'
-        ? ' — tract names repeat within a state, so pass the county FIPS of the one you want as county_fips to census_query_data'
+        ? ' — tract names repeat within a state, so re-call census_resolve_geography with county_fips set to the county of the one you want'
         : '';
 
     return validationError(`"${name}" matched ${matches.length} geographies.`, {
@@ -363,17 +566,23 @@ export class GeographyService {
   }
 
   /** Build the `no_match` error for a name no layer in the chain matched. */
-  private noMatch(name: string, types: GeographyType[]) {
+  private noMatch(name: string, types: GeographyType[], countyFips?: string) {
     const { placeName, stateAbbr } = this.splitStateSuffix(name.trim());
     const attempted = types.join(' or ');
+    const levels = GEOGRAPHY_TYPES.join(', ');
+    // county_fips narrows the chain to the levels that sit in a county, so it is part of why
+    // nothing matched — a caller told only to check the spelling would re-run the same miss.
+    const scope = countyFips ? ` in county ${countyFips}` : '';
+    const dropScope = countyFips ? ' drop county_fips,' : '';
     const hint = stateAbbr
-      ? `No ${attempted} named "${placeName}" exists in ${stateAbbr} — check the spelling, set geography_type to search a different level (state, county, place, tract), or pass a full street address.`
-      : `Add the state abbreviation (e.g., "${placeName}, WA"), set geography_type to search a specific level (state, county, place, tract), or pass a full street address.`;
+      ? `No ${attempted} named "${placeName}" exists in ${stateAbbr}${scope} — check the spelling,${dropScope} set geography_type to search a different level (${levels}), or pass a full street address.`
+      : `Add the state abbreviation (e.g., "${placeName}, WA"),${dropScope} set geography_type to search a specific level (${levels}), or pass a full street address.`;
 
-    return notFound(`No ${attempted} matched "${name}".`, {
+    return notFound(`No ${attempted} matched "${name}"${scope}.`, {
       reason: 'no_match',
       name,
       attemptedTypes: types,
+      ...(countyFips && { countyFips }),
       recovery: { hint },
     });
   }

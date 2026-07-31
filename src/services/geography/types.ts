@@ -3,8 +3,25 @@
  * @module services/geography/types
  */
 
-/** Census geography level a name can resolve to — one TIGERweb layer each. */
-export type GeographyType = 'state' | 'county' | 'place' | 'tract';
+/**
+ * Census geography levels a name can resolve to.
+ *
+ * Each value is the level's own Census API name, so a resolved `geographyType` is also the
+ * `geography_level` census_query_data takes. Statistical areas are the verbose ones because
+ * that is what the Census API calls them.
+ */
+export const GEOGRAPHY_TYPES = [
+  'state',
+  'county',
+  'place',
+  'tract',
+  'metropolitan statistical area/micropolitan statistical area',
+  'combined statistical area',
+  'consolidated city',
+] as const;
+
+/** Census geography level a name can resolve to — one or more TIGERweb layers each. */
+export type GeographyType = (typeof GEOGRAPHY_TYPES)[number];
 
 /** Resolved geography with FIPS identifiers. */
 export interface ResolvedGeography {
@@ -18,8 +35,11 @@ export interface ResolvedGeography {
   name: string;
   /** Place FIPS code (when applicable). */
   placeFips?: string;
-  /** 2-digit state FIPS code. */
-  stateFips: string;
+  /**
+   * 2-digit state FIPS code. Absent for levels that sit outside the state hierarchy —
+   * a metropolitan or combined statistical area can span several states.
+   */
+  stateFips?: string;
   /** 6-digit tract FIPS code (when applicable). */
   tractFips?: string;
 }
@@ -30,10 +50,15 @@ export interface TigerwebFeature {
     NAME: string;
     /** Unqualified name — "Seattle" for NAME "Seattle city", "King" for "King County". */
     BASENAME?: string;
-    STATE: string;
+    /** Absent on the CBSA and CSA layers, which carry no state at all. */
+    STATE?: string;
     COUNTY?: string;
     PLACE?: string;
     TRACT?: string;
+    /** Consolidated city code — 5 digits, scoped to its state. */
+    CONCITY?: string;
+    /** Nationally unique code on the CBSA and CSA layers — 5 digits for a CBSA, 3 for a CSA. */
+    GEOID?: string;
     [key: string]: string | number | undefined;
   };
 }

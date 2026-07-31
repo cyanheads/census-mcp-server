@@ -47,18 +47,33 @@ describe('censusListDatasets', () => {
   );
 
   /**
-   * These datasets publish CBSA, CSA, and economic-place levels that census_resolve_geography
-   * cannot resolve a name to, so the catalog has to say which levels are actually reachable.
+   * These datasets publish levels census_resolve_geography cannot resolve a name to — zip code,
+   * congressional district, region, metropolitan division, economic place — so the catalog has to
+   * name the gap. `us` is a level of all three and resolves from no name at all, so even nonemp,
+   * whose named levels all resolve, cannot claim blanket coverage.
    */
-  it.each(['cbp', 'ecnbasic', 'nonemp'])(
-    'tells a caller which %s geography levels census_resolve_geography reaches',
-    (id) => {
+  it.each([
+    ['cbp', ['congressional district', 'zip code']],
+    ['ecnbasic', ['region', 'metropolitan division', 'economic place']],
+    ['nonemp', []],
+  ] as const)(
+    'tells a caller which %s geography levels census_resolve_geography cannot reach',
+    (id, unreachable) => {
       const ctx = createMockContext();
       const result = censusListDatasets.handler(censusListDatasets.input.parse({}), ctx);
       const entry = result.datasets.find((d) => d.dataset_id === id);
+      const description = entry?.description ?? '';
 
-      expect(entry?.description).toContain('census_resolve_geography');
-      expect(entry?.description).toContain('state and county');
+      expect(description).toContain('census_resolve_geography');
+
+      const gap = description.slice(description.indexOf('census_resolve_geography'));
+      expect(gap).toContain('literal value 1');
+      for (const level of unreachable) {
+        expect(gap).toContain(level);
+      }
+      if (unreachable.length === 0) {
+        expect(gap).not.toContain('another source');
+      }
     },
   );
 

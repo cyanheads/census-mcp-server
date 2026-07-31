@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.14-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/census-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/census-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/census-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.2.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/census-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/census-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/census-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -72,9 +72,11 @@ Convert place names and addresses to Census FIPS identifiers.
 - Named places (e.g., "King County, WA", "Seattle, WA", "California") resolved via TIGERweb MapServer
 - Street addresses resolved to tract level via Census Geocoder
 - Auto-detects the geography level — state for an abbreviation or spelled-out state name, county for "County"/"Borough"/"Parish", tract for "Tract", otherwise place falling back to county; `geography_type` overrides it
+- Also resolves metropolitan/micropolitan statistical areas, combined statistical areas, and consolidated cities — never auto-detected, since their names overlap city names, so each needs an explicit `geography_type`. The value is the level's own Census API name, so it feeds `geography_level` unchanged
+- Optional `county_fips` pins a tract name to one county, since a tract name is unique only inside its county. Only county and tract sit within a county, so it restricts resolution to those two levels rather than being dropped on a layer that cannot apply it
 - Prefers an exactly-named match, so "Kansas City, MO" does not resolve to North Kansas City
-- Never picks between matches: anything still matching more than one geography comes back as `ambiguous_name` with every candidate and its state abbreviation
-- Returns `state_fips` (→ `parent_fips`) and `fips_summary` (→ `geography_fips`) ready to pass to other tools
+- Never picks between matches: anything still matching more than one geography comes back as `ambiguous_name`, with every candidate carrying the code resolving it would have returned, plus the state that separates same-named places
+- Returns `state_fips` (→ `parent_fips`) and `fips_summary` (→ `geography_fips`) ready to pass to other tools; a statistical area omits `state_fips`, since it can span several states and takes no parent
 
 ---
 

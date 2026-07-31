@@ -110,7 +110,133 @@ describe('censusResolveGeography', () => {
     });
     await censusResolveGeography.handler(input, ctx);
 
-    expect(mockResolveGeography).toHaveBeenCalledWith('California', 'state', expect.anything());
+    expect(mockResolveGeography).toHaveBeenCalledWith(
+      { name: 'California', geographyType: 'state' },
+      expect.anything(),
+    );
+  });
+
+  it('passes county_fips through to the service', async () => {
+    mockResolveGeography.mockResolvedValue({
+      name: 'Census Tract 104.01',
+      geographyType: 'tract',
+      stateFips: '05',
+      countyFips: '143',
+      tractFips: '010401',
+      fipsSummary: '010401',
+    });
+
+    const ctx = createMockContext({ errors: censusResolveGeography.errors });
+    const input = censusResolveGeography.input.parse({
+      name: 'Census Tract 104.01, AR',
+      geography_type: 'tract',
+      county_fips: '143',
+    });
+    const result = await censusResolveGeography.handler(input, ctx);
+
+    expect(mockResolveGeography).toHaveBeenCalledWith(
+      { name: 'Census Tract 104.01, AR', geographyType: 'tract', countyFips: '143' },
+      expect.anything(),
+    );
+    expect(result.county_fips).toBe('143');
+    expect(result.tract_fips).toBe('010401');
+  });
+
+  it('omits countyFips from the service call when it was not supplied', async () => {
+    mockResolveGeography.mockResolvedValue({
+      name: 'Washington',
+      geographyType: 'state',
+      stateFips: '53',
+      fipsSummary: '53',
+    });
+
+    const ctx = createMockContext({ errors: censusResolveGeography.errors });
+    const input = censusResolveGeography.input.parse({ name: 'Washington' });
+    await censusResolveGeography.handler(input, ctx);
+
+    expect(mockResolveGeography).toHaveBeenCalledWith({ name: 'Washington' }, expect.anything());
+  });
+
+  it('rejects a non-numeric or over-long county_fips at the schema boundary', () => {
+    for (const county_fips of ['033a', '0333', '', 'abc']) {
+      expect(() =>
+        censusResolveGeography.input.parse({ name: 'Census Tract 104.01, AR', county_fips }),
+      ).toThrow();
+    }
+    expect(() =>
+      censusResolveGeography.input.parse({ name: 'Census Tract 104.01, AR', county_fips: '33' }),
+    ).not.toThrow();
+  });
+
+  it('resolves a metropolitan statistical area with no state_fips', async () => {
+    mockResolveGeography.mockResolvedValue({
+      name: 'Seattle-Tacoma-Bellevue, WA Metro Area',
+      geographyType: 'metropolitan statistical area/micropolitan statistical area',
+      fipsSummary: '42660',
+    });
+
+    const ctx = createMockContext({ errors: censusResolveGeography.errors });
+    const input = censusResolveGeography.input.parse({
+      name: 'Seattle-Tacoma-Bellevue, WA',
+      geography_type: 'metropolitan statistical area/micropolitan statistical area',
+    });
+    const result = await censusResolveGeography.handler(input, ctx);
+
+    expect(result.geography_type).toBe(
+      'metropolitan statistical area/micropolitan statistical area',
+    );
+    expect(result.fips_summary).toBe('42660');
+    expect(result).not.toHaveProperty('state_fips');
+  });
+
+  it('accepts every geography level the service resolves', () => {
+    for (const geography_type of [
+      'state',
+      'county',
+      'place',
+      'tract',
+      'metropolitan statistical area/micropolitan statistical area',
+      'combined statistical area',
+      'consolidated city',
+    ]) {
+      expect(() =>
+        censusResolveGeography.input.parse({ name: 'Somewhere', geography_type }),
+      ).not.toThrow();
+    }
+  });
+
+  it('throws county_scope_unsupported when the service rejects the county scope', async () => {
+    const { McpError, JsonRpcErrorCode: codes } = await import('@cyanheads/mcp-ts-core/errors');
+    mockResolveGeography.mockRejectedValue(
+      new McpError(codes.ValidationError, 'county_fips does not apply to the place level', {
+        reason: 'county_scope_unsupported',
+      }),
+    );
+
+    const ctx = createMockContext({ errors: censusResolveGeography.errors });
+    const input = censusResolveGeography.input.parse({
+      name: 'Seattle, WA',
+      geography_type: 'place',
+      county_fips: '033',
+    });
+    await expect(censusResolveGeography.handler(input, ctx)).rejects.toMatchObject({
+      code: codes.ValidationError,
+      data: { reason: 'county_scope_unsupported' },
+    });
+  });
+
+  it('format names the level to query at and reports no parent for a statistical area', () => {
+    const blocks = censusResolveGeography.format!({
+      name: 'Seattle-Tacoma, WA CSA',
+      geography_type: 'combined statistical area',
+      fips_summary: '500',
+    });
+    const text = (blocks[0] as { type: string; text: string }).text;
+
+    expect(text).toContain('geography_level');
+    expect(text).toContain('combined statistical area');
+    expect(text).toContain('without `parent_fips`');
+    expect(text).not.toContain('State FIPS');
   });
 
   it('throws ValidationError for empty name', async () => {

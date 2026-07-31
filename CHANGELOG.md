@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.14](changelog/0.1.x/0.1.14.md) — 2026-07-31
+
+Added County Business Patterns, Economic Census, and Nonemployer Statistics with predicate filtering (#9), and fixed census_search_variables/census_get_variable fabricating margin-of-error codes on non-ACS datasets (#17)
+
 ## [0.1.13](changelog/0.1.x/0.1.13.md) — 2026-07-31
 
 census_query_data/census_compare_geographies: fixed cross-geography filtering with a new geography_geoid field (#16), and a geography level missing a required parent now fails before the query with an actionable error instead of a raw upstream 400 (#19)

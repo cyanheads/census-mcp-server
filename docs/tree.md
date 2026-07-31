@@ -1,6 +1,6 @@
 # census-mcp-server - Directory Structure
 
-Generated on: 2026-07-31 21:40:08
+Generated on: 2026-07-31 23:29:34
 
 ```text
 census-mcp-server/
@@ -152,6 +152,7 @@ census-mcp-server/
 │   ├── services/
 │   │   ├── census-api/
 │   │   │   ├── census-api-service.ts
+│   │   │   ├── errors.ts
 │   │   │   └── types.ts
 │   │   ├── geography/
 │   │   │   ├── geography-service.ts

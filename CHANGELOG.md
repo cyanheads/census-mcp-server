@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.2](changelog/0.3.x/0.3.2.md) — 2026-07-31
+
+Fixed census_list_datasets advertising pep/charv vintages the Census API does not publish, and a dataset+year miss reaching the caller as raw upstream HTML (#28); fixed string-valued variables returning estimate: null indistinguishable from genuinely missing data (#29)
+
 ## [0.3.1](changelog/0.3.x/0.3.1.md) — 2026-07-31
 
 Fixed census_list_predicate_values listing dataset-dictionary codes a dataset publishes no rows for (#26), and pep/charv returning two indistinguishable rows per geography that both entered comparison rankings (#27)

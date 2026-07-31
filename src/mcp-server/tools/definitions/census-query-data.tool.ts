@@ -9,6 +9,8 @@ import { getDiscoveryConfig } from '@/config/server-config.js';
 import { getCensusApiService } from '@/services/census-api/census-api-service.js';
 import {
   DATASET_LATEST_YEARS,
+  describeEmptyPredicatedResult,
+  describeUnsetPredicates,
   getVariableCacheService,
   KNOWN_DATASETS,
 } from '@/services/variable-cache/variable-cache-service.js';
@@ -16,13 +18,13 @@ import {
 export const censusQueryData = tool('census_query_data', {
   title: 'Query Census Data',
   description:
-    'Query a Census dataset for one or more variables at a specific geography. Accepts FIPS codes for the target geography — use census_resolve_geography to convert place names to FIPS when needed. Labeled estimates and margin-of-error values are returned together. Suppression codes (geography too small, data not collected) are decoded into human-readable reasons rather than passed through as raw negative numbers. Pass geography_fips as "*" to return all geographies at the level within the parent.',
+    'Query a Census dataset for one or more variables at a specific geography. Accepts FIPS codes for the target geography — use census_resolve_geography to convert place names to FIPS when needed. On ACS datasets, labeled estimates and margin-of-error values are returned together. Suppression codes (geography too small, data not collected) are decoded into human-readable reasons rather than passed through as raw negative numbers. Pass geography_fips as "*" to return all geographies at the level within the parent. On the business datasets (cbp, ecnbasic, nonemp) and pep/charv, use predicates to filter by industry, size class, or demographic dimension — a query that omits them returns the total across every category, which the response notice names.',
   annotations: { readOnlyHint: true, openWorldHint: false },
   input: z.object({
     variables: z
       .array(z.string())
       .describe(
-        'Variable codes to retrieve (e.g., ["B19013_001E", "B19013_001M"]). Max 50 per request. Use census_search_variables to find codes. Include the MOE counterpart (swap E → M suffix) to get margin-of-error alongside each estimate.',
+        'Variable codes to retrieve (e.g., ["B19013_001E", "B19013_001M"]). Max 50 per request. Use census_search_variables to find codes. On ACS datasets only, each estimate has a margin-of-error counterpart at the same code with the E suffix swapped for M — request both to get the margin alongside the estimate. Other dataset families (pep, dec, cbp, ecnbasic, nonemp) publish no margins of error, and an E-final code there is an ordinary code with no M sibling.',
       ),
     geography_level: z
       .string()
@@ -45,6 +47,12 @@ export const censusQueryData = tool('census_query_data', {
       .optional()
       .describe(
         'County FIPS code (3 digits) when querying tracts or block groups within a specific county (e.g., "033" for King County within WA). Required for tract and block-group queries scoped to a county — use alongside parent_fips (state). census_resolve_geography returns this as county_fips.',
+      ),
+    predicates: z
+      .record(z.string(), z.string())
+      .optional()
+      .describe(
+        'Filter values keyed by variable code, sent as extra query parameters — e.g. {"NAICS2017": "5112"} to count only software publishers in cbp. The business datasets (cbp, ecnbasic, nonemp) and pep/charv declare filter dimensions such as industry (NAICS2017/NAICS2022), legal form (LFO), size class (EMPSZES/RCPSZES), tax status (TAXSTAT), operation type (TYPOP), sex (SEX), and age (AGE). Leaving one unset is not an error: the Census API returns the total across every category of that dimension, so an unfiltered count of all industries comes back looking like the industry-specific answer. Any dimension left unset is named in the response notice. Code names vary by dataset and vintage — cbp 2023 uses NAICS2017 while nonemp 2023 uses NAICS2022 — so read them from the notice or from census_search_variables. NAICS values are standard North American Industry Classification System codes at any depth (51 information, 5112 software publishers); the other dimensions use short Census category codes documented with the dataset.',
       ),
     dataset: z
       .string()
@@ -93,6 +101,12 @@ export const censusQueryData = tool('census_query_data', {
     totalRows: z.number().describe('Number of geography rows returned.'),
     dataset: z.string().describe('Dataset queried.'),
     year: z.number().describe('Vintage year queried.'),
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Warning that the dataset declares filter dimensions the query left unset, naming each one. Values in that case are totals across every category of those dimensions, not a filtered subset.',
+      ),
   },
 
   errors: [
@@ -141,6 +155,13 @@ export const censusQueryData = tool('census_query_data', {
       code: JsonRpcErrorCode.ValidationError,
       when: 'More than 50 variable codes were requested.',
       recovery: 'Split the request into multiple calls with at most 50 variables each.',
+    },
+    {
+      reason: 'predicate_not_supported',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A key in predicates is not a variable in this dataset and year.',
+      recovery:
+        'Remove the unrecognized key. Call census_search_variables on this dataset and year for the codes it does define — predicate names are vintage-specific, so NAICS2017 and NAICS2022 belong to different years.',
     },
     {
       reason: 'upstream_error',
@@ -244,8 +265,32 @@ export const censusQueryData = tool('census_query_data', {
       );
     }
 
-    // Fetch variable labels for enrichment (best-effort — don't fail if cache is cold)
     const variableCacheService = getVariableCacheService();
+
+    // Reject unknown predicate keys before spending the call — the Census API answers them with
+    // a 400 whose surfaced message names only the request URL, never which key it rejected.
+    const predicates = input.predicates ?? {};
+    const predicateCheck = await variableCacheService.checkPredicates(
+      { dataset, year, supplied: Object.keys(predicates) },
+      ctx,
+    );
+
+    if (predicateCheck.unknown.length > 0) {
+      throw ctx.fail(
+        'predicate_not_supported',
+        `${predicateCheck.unknown.join(', ')} ${predicateCheck.unknown.length === 1 ? 'is not a variable' : 'are not variables'} in ${dataset} (${year}).`,
+        {
+          dataset,
+          year,
+          unknownPredicates: predicateCheck.unknown,
+          ...ctx.recoveryFor('predicate_not_supported'),
+        },
+      );
+    }
+
+    const unfiltered = predicateCheck.unset;
+
+    // Fetch variable labels for enrichment (best-effort — don't fail if cache is cold)
     const variableLabels: Map<string, string> = new Map();
     try {
       const meta = await variableCacheService.getVariablesByCode(
@@ -268,6 +313,7 @@ export const censusQueryData = tool('census_query_data', {
         geographyFips: input.geography_fips,
         ...(parentFips !== undefined && { parentFips }),
         ...(countyFips !== undefined && { countyFips }),
+        ...(Object.keys(predicates).length > 0 && { predicates }),
         dataset,
         year,
       },
@@ -276,9 +322,19 @@ export const censusQueryData = tool('census_query_data', {
 
     if (rows.length === 0) {
       // Only steer toward acs/acs5 from a dataset that actually covers less than it does.
-      const hint = dataset.startsWith('acs/acs1')
-        ? `ACS1 only covers geographies with 65,000+ population — switch to dataset "acs/acs5" for smaller geographies, or confirm the FIPS codes with census_resolve_geography.`
-        : `Confirm the FIPS codes exist in ${dataset} (${year}) — census_resolve_geography returns them for a place name. If the level itself is in doubt, call census_list_geographies.`;
+      // Predicates can empty a result on their own — ecnbasic publishes nothing at county level
+      // until an industry is named, and an unknown value is a 204 — so they take priority.
+      const predicateHint = describeEmptyPredicatedResult(
+        unfiltered,
+        Object.keys(predicates),
+        dataset,
+        year,
+      );
+      const hint = predicateHint
+        ? `${predicateHint} Otherwise confirm the FIPS codes with census_resolve_geography.`
+        : dataset.startsWith('acs/acs1')
+          ? `ACS1 only covers geographies with 65,000+ population — switch to dataset "acs/acs5" for smaller geographies, or confirm the FIPS codes with census_resolve_geography.`
+          : `Confirm the FIPS codes exist in ${dataset} (${year}) — census_resolve_geography returns them for a place name. If the level itself is in doubt, call census_list_geographies.`;
       throw ctx.fail(
         'no_data',
         `No data returned for ${input.geography_level} in ${dataset} (${year}).`,
@@ -322,6 +378,9 @@ export const censusQueryData = tool('census_query_data', {
     });
 
     ctx.enrich({ totalRows: enrichedRows.length, dataset, year });
+    if (unfiltered.length > 0) {
+      ctx.enrich.notice(describeUnsetPredicates(unfiltered, dataset, year));
+    }
 
     return { rows: enrichedRows };
   },

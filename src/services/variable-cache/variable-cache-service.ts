@@ -8,7 +8,7 @@ import type { Context } from '@cyanheads/mcp-ts-core';
 import { notFound, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import { fetchWithTimeout, type RequestContext, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getDiscoveryConfig } from '@/config/server-config.js';
-import type { CensusVariable, RawVariablesJson } from './types.js';
+import type { CensusVariable, PredicateCheck, RawVariablesJson, UnsetPredicate } from './types.js';
 
 const CENSUS_API_BASE = 'https://api.census.gov/data';
 
@@ -22,6 +22,9 @@ export const KNOWN_DATASETS = new Set([
   'pep/charv',
   'dec/pl',
   'dec/ddhca',
+  'cbp',
+  'ecnbasic',
+  'nonemp',
 ]);
 
 /** Map of dataset to latest available year (as of implementation). */
@@ -34,7 +37,85 @@ export const DATASET_LATEST_YEARS: Record<string, number> = {
   'pep/charv': 2023,
   'dec/pl': 2020,
   'dec/ddhca': 2020,
+  cbp: 2023,
+  ecnbasic: 2022,
+  nonemp: 2023,
 };
+
+/**
+ * True for the ACS dataset family, the only family where the `E` estimate / `M` margin-of-error
+ * suffix convention holds. ACS omits its `M` codes from variables.json but serves them from the
+ * data API, so they are inferred; other families use `E`-final codes for unrelated fields
+ * (`ecnbasic` `INVTOTE`, `cbp` `STATE`) that have no margin of error at all.
+ */
+export function isAcsDataset(dataset: string): boolean {
+  return dataset.startsWith('acs/');
+}
+
+/**
+ * Required predicates that carry no subject-matter choice. `GEOCOMP` selects a geography's
+ * component and defaults to the whole geography, and every Census dataset declares it — listing
+ * it beside real filter dimensions like `NAICS2017` would bury the ones that change the answer.
+ */
+const NON_FILTERING_PREDICATES = new Set(['GEOCOMP']);
+
+/** Join codes into readable prose: `A`, `A and B`, `A, B, and C`. */
+function listCodes(codes: string[]): string {
+  if (codes.length <= 1) return codes[0] ?? '';
+  if (codes.length === 2) return `${codes[0]} and ${codes[1]}`;
+  return `${codes.slice(0, -1).join(', ')}, and ${codes.at(-1)}`;
+}
+
+/**
+ * Word the warning that a query left filter dimensions unset. Both data tools share it so the
+ * two cannot drift into warning about the same silent default with different force.
+ *
+ * The default the Census API substitutes is not one shape: `cbp` defaults `NAICS2017` to the
+ * all-industries total, while `pep/charv` defaults `YEAR` to a single vintage (2020) and returns
+ * a row per matching combination. Calling every default an all-category total would be wrong for
+ * the second kind, so the warning says only what holds for both — the value is scoped by
+ * something the caller did not choose.
+ */
+export function describeUnsetPredicates(
+  unset: UnsetPredicate[],
+  dataset: string,
+  year: number,
+): string {
+  const named = unset.map((p) => `${p.code} (${p.label})`).join(', ');
+  const example = unset[0]?.code ?? '';
+  return `${dataset} (${year}) filters on dimensions this query left unset: ${named}. The Census API applied its own default to each — an all-categories total for some dimensions, one fixed category for others — so no value here is scoped to a category this query chose, and one geography can come back on more than one row. Set them explicitly to control what the numbers cover, e.g. {"${example}": "<code>"}.`;
+}
+
+/**
+ * Word why a predicated query came back empty, for the `no_data` recovery hint. Covers both
+ * causes: a dimension left unset (`ecnbasic` publishes nothing below the national level until an
+ * industry is named) and a supplied value that does not exist (an unknown `NAICS2017` value is a
+ * `204`, not a `400`). Returns `''` when neither applies, so the caller falls back to its own
+ * dataset-aware hint.
+ */
+export function describeEmptyPredicatedResult(
+  unset: UnsetPredicate[],
+  supplied: string[],
+  dataset: string,
+  year: number,
+): string {
+  const parts: string[] = [];
+
+  if (unset.length > 0) {
+    const codes = unset.map((p) => p.code);
+    parts.push(
+      `${dataset} (${year}) may publish nothing at this level until ${listCodes(codes)} ${unset.length === 1 ? 'is' : 'are'} set — add predicates, e.g. {"${codes[0]}": "<code>"}.`,
+    );
+  }
+
+  if (supplied.length > 0) {
+    parts.push(
+      `A predicate value that does not exist in ${dataset} (${year}) also returns nothing rather than an error, so check the ${listCodes(supplied)} ${supplied.length === 1 ? 'value' : 'values'} this query sent.`,
+    );
+  }
+
+  return parts.join(' ');
+}
 
 interface CacheEntry {
   fetchedAt: number;
@@ -120,6 +201,31 @@ export class VariableCacheService {
     return results;
   }
 
+  /**
+   * Check a caller's predicate map against the dataset's own variables.json.
+   *
+   * Census datasets mark some variables `required`, but the API does not enforce them: a query
+   * that omits one succeeds and silently returns the aggregate across that whole dimension. A
+   * `cbp` establishment count without `NAICS2017` is every industry, not the one that was asked
+   * for. Reporting the unset dimensions is the only way a caller can tell those apart.
+   */
+  async checkPredicates(
+    params: { dataset: string; year: number; supplied: string[] },
+    ctx: Context,
+  ): Promise<PredicateCheck> {
+    const variables = await this.getVariables(params.dataset, params.year, ctx);
+    const supplied = new Set(params.supplied);
+
+    const unset: UnsetPredicate[] = [];
+    for (const variable of variables.values()) {
+      if (!variable.required || NON_FILTERING_PREDICATES.has(variable.code)) continue;
+      if (!supplied.has(variable.code)) unset.push({ code: variable.code, label: variable.label });
+    }
+    unset.sort((a, b) => a.code.localeCompare(b.code));
+
+    return { unset, unknown: params.supplied.filter((code) => !variables.has(code)) };
+  }
+
   /** Validate that a dataset code is known. */
   validateDataset(dataset: string): void {
     if (!KNOWN_DATASETS.has(dataset)) {
@@ -193,6 +299,9 @@ export class VariableCacheService {
 
     const variables = new Map<string, CensusVariable>();
     const rawVars = raw.variables ?? {};
+    // The E/M suffix convention is an ACS table convention, not a Census-wide one — inferring
+    // it elsewhere invents codes the dataset does not have.
+    const acsFamily = isAcsDataset(dataset);
 
     for (const [code, entry] of Object.entries(rawVars)) {
       if (code === 'for' || code === 'in' || code === 'ucgid') continue;
@@ -205,19 +314,22 @@ export class VariableCacheService {
       };
 
       if (entry.universe) variable.universe = entry.universe;
+      if (entry.required != null) variable.required = true;
 
-      // Infer E↔M sibling codes by suffix pattern. Census variables.json omits M-suffix
-      // (MOE) variables, but the pattern is reliable: B*E estimates always have a B*M
-      // counterpart accessible via the data API. Check rawVars first (some datasets do
+      // Infer E↔M sibling codes by suffix pattern. ACS variables.json omits M-suffix
+      // (MOE) variables, but within ACS the pattern is reliable: B*E estimates always have a
+      // B*M counterpart accessible via the data API. Check rawVars first (some datasets do
       // include M codes), then fall back to pattern-based inference for E-suffix codes.
-      if (code.endsWith('M')) {
-        const estimateCode = `${code.slice(0, -1)}E`;
-        if (rawVars[estimateCode]) variable.estimateCode = estimateCode;
-      } else if (code.endsWith('E')) {
-        const moeCode = `${code.slice(0, -1)}M`;
-        // Set moeCode regardless of whether the M code appears in variables.json —
-        // M-suffix variables work in census_query_data even though they aren't listed.
-        variable.moeCode = moeCode;
+      if (acsFamily) {
+        if (code.endsWith('M')) {
+          const estimateCode = `${code.slice(0, -1)}E`;
+          if (rawVars[estimateCode]) variable.estimateCode = estimateCode;
+        } else if (code.endsWith('E')) {
+          const moeCode = `${code.slice(0, -1)}M`;
+          // Set moeCode regardless of whether the M code appears in variables.json —
+          // M-suffix variables work in census_query_data even though they aren't listed.
+          variable.moeCode = moeCode;
+        }
       }
 
       variables.set(code, variable);

@@ -9,6 +9,8 @@ import { getDiscoveryConfig } from '@/config/server-config.js';
 import { getCensusApiService } from '@/services/census-api/census-api-service.js';
 import {
   DATASET_LATEST_YEARS,
+  describeEmptyPredicatedResult,
+  describeUnsetPredicates,
   getVariableCacheService,
   KNOWN_DATASETS,
 } from '@/services/variable-cache/variable-cache-service.js';
@@ -16,13 +18,13 @@ import {
 export const censusCompareGeographies = tool('census_compare_geographies', {
   title: 'Compare Census Geographies',
   description:
-    'Compare one or more variables across multiple geographies at the same level — all counties in a state, all states nationally, or a named set of specific geographies. Results are sorted and ranked. Covers queries like "rank states by poverty rate", "compare median income across WA counties", or "which census tracts in King County have the highest renter rate." Omit within to compare all geographies nationally at the level. Suppressed values are decoded to human-readable labels rather than passed through as raw negative sentinels.',
+    'Compare one or more variables across multiple geographies at the same level — all counties in a state, all states nationally, or a named set of specific geographies. Results are sorted and ranked. Covers queries like "rank states by poverty rate", "compare median income across WA counties", or "which census tracts in King County have the highest renter rate." Omit within to compare all geographies nationally at the level. Suppressed values are decoded to human-readable labels rather than passed through as raw negative sentinels. On the business datasets (cbp, ecnbasic, nonemp) and pep/charv, use predicates to rank within one industry, size class, or demographic dimension — a comparison that omits them ranks on the total across every category, which the response notice names.',
   annotations: { readOnlyHint: true, openWorldHint: false },
   input: z.object({
     variables: z
       .array(z.string())
       .describe(
-        'Variable codes to compare (e.g., ["B17001_002E", "B17001_001E"]). Include MOE counterparts (M suffix) for reliability context.',
+        'Variable codes to compare (e.g., ["B17001_002E", "B17001_001E"]). On ACS datasets, add the margin-of-error counterpart of a code (same code, E suffix swapped for M) for reliability context. Other dataset families (pep, dec, cbp, ecnbasic, nonemp) publish no margins of error.',
       ),
     geography_level: z
       .string()
@@ -46,6 +48,12 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
       .optional()
       .describe(
         'Optional list of specific geographies to include; only these are returned. Prefer full GEOIDs — the level concatenated with its parents, e.g. "53033" for King County WA and "06037" for Los Angeles County CA — which are nationally unique and so work across states. Bare level codes ("033") are also accepted but match that code in every state unless within scopes them to one. A GEOID is easiest taken from the geography_geoid field of a census_query_data or census_compare_geographies row; from census_resolve_geography, concatenate state_fips, then county_fips when it is present, then fips_summary. Entries that match nothing, and bare codes that match more than one state, are named in the response notice.',
+      ),
+    predicates: z
+      .record(z.string(), z.string())
+      .optional()
+      .describe(
+        'Filter values keyed by variable code, applied to every geography in the comparison — e.g. {"NAICS2017": "5112"} to rank counties by their software-publisher establishment count in cbp. The business datasets (cbp, ecnbasic, nonemp) and pep/charv declare filter dimensions such as industry (NAICS2017/NAICS2022), legal form (LFO), size class (EMPSZES/RCPSZES), tax status (TAXSTAT), operation type (TYPOP), sex (SEX), and age (AGE). Leaving one unset is not an error: the Census API ranks on the total across every category of that dimension, so a ranking of all industries comes back looking like the industry-specific one. Any dimension left unset is named in the response notice. Code names vary by dataset and vintage — cbp 2023 uses NAICS2017 while nonemp 2023 uses NAICS2022 — so read them from the notice or from census_search_variables. NAICS values are standard North American Industry Classification System codes at any depth (51 information, 5112 software publishers); the other dimensions use short Census category codes documented with the dataset.',
       ),
     dataset: z
       .string()
@@ -121,7 +129,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
       .string()
       .optional()
       .describe(
-        'Guidance when results were truncated, when geographies entries matched no row, or when a bare level code matched more than one state — how to narrow scope, raise the limit, or correct the FIPS codes.',
+        'Guidance when results were truncated, when geographies entries matched no row, when a bare level code matched more than one state, or when the dataset declares filter dimensions the query left unset — how to narrow scope, raise the limit, correct the FIPS codes, or add the predicates that make the ranking specific rather than an all-categories total.',
       ),
   },
 
@@ -159,6 +167,13 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
       when: 'One or more variable codes are not found in this dataset and year.',
       recovery:
         'Use census_search_variables or census_get_variable to confirm codes for this dataset and year.',
+    },
+    {
+      reason: 'predicate_not_supported',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A key in predicates is not a variable in this dataset and year.',
+      recovery:
+        'Remove the unrecognized key. Call census_search_variables on this dataset and year for the codes it does define — predicate names are vintage-specific, so NAICS2017 and NAICS2022 belong to different years.',
     },
     {
       reason: 'no_data',
@@ -257,8 +272,32 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
       );
     }
 
-    // Fetch variable labels for enrichment (best-effort)
     const variableCacheService = getVariableCacheService();
+
+    // Reject unknown predicate keys before spending the call — the Census API answers them with
+    // a 400 whose surfaced message names only the request URL, never which key it rejected.
+    const predicates = input.predicates ?? {};
+    const predicateCheck = await variableCacheService.checkPredicates(
+      { dataset, year, supplied: Object.keys(predicates) },
+      ctx,
+    );
+
+    if (predicateCheck.unknown.length > 0) {
+      throw ctx.fail(
+        'predicate_not_supported',
+        `${predicateCheck.unknown.join(', ')} ${predicateCheck.unknown.length === 1 ? 'is not a variable' : 'are not variables'} in ${dataset} (${year}).`,
+        {
+          dataset,
+          year,
+          unknownPredicates: predicateCheck.unknown,
+          ...ctx.recoveryFor('predicate_not_supported'),
+        },
+      );
+    }
+
+    const unfiltered = predicateCheck.unset;
+
+    // Fetch variable labels for enrichment (best-effort)
     const variableLabels: Map<string, string> = new Map();
     try {
       const meta = await variableCacheService.getVariablesByCode(
@@ -281,6 +320,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
         geographyFips,
         ...(parentFips !== undefined && { parentFips }),
         ...(countyFips !== undefined && { countyFips }),
+        ...(Object.keys(predicates).length > 0 && { predicates }),
         dataset,
         year,
       },
@@ -289,9 +329,19 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
 
     if (rows.length === 0) {
       // Only steer toward acs/acs5 from a dataset that actually covers less than it does.
-      const hint = dataset.startsWith('acs/acs1')
-        ? `ACS1 only covers geographies with 65,000+ population — switch to dataset "acs/acs5" for smaller geographies, or confirm the level with census_list_geographies.`
-        : `Confirm ${input.geography_level} is populated in ${dataset} (${year}) with census_list_geographies, and that within names a valid state FIPS.`;
+      // Predicates can empty a result on their own — ecnbasic publishes nothing at county level
+      // until an industry is named, and an unknown value is a 204 — so they take priority.
+      const predicateHint = describeEmptyPredicatedResult(
+        unfiltered,
+        Object.keys(predicates),
+        dataset,
+        year,
+      );
+      const hint = predicateHint
+        ? `${predicateHint} Otherwise confirm the level with census_list_geographies.`
+        : dataset.startsWith('acs/acs1')
+          ? `ACS1 only covers geographies with 65,000+ population — switch to dataset "acs/acs5" for smaller geographies, or confirm the level with census_list_geographies.`
+          : `Confirm ${input.geography_level} is populated in ${dataset} (${year}) with census_list_geographies, and that within names a valid state FIPS.`;
       throw ctx.fail(
         'no_data',
         `No geographies returned for ${input.geography_level} in ${dataset} (${year}).`,
@@ -396,6 +446,11 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
     ctx.enrich({ totalCount, truncated, sortVariable: sortBy, dataset, year });
 
     const notices: string[] = [];
+    // Lead with the unfiltered-dimension warning: it says the ranking answers a different
+    // question, which outranks advice about how much of that ranking was shown.
+    if (unfiltered.length > 0) {
+      notices.push(describeUnsetPredicates(unfiltered, dataset, year));
+    }
     if (truncated) {
       notices.push(
         `Results truncated — ${totalCount - sliced.length} more geographies not shown. Increase the limit parameter or use within to narrow the scope.`,

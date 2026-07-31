@@ -17,8 +17,31 @@ export interface CensusVariable {
   moeCode?: string;
   /** Predicate type (e.g., "int", "string", "float"). */
   predicateType: string;
+  /**
+   * True when variables.json marks the variable `required` — a filter dimension the Census
+   * API applies its own default to when a query omits it, rather than rejecting the query.
+   */
+  required?: boolean;
   /** Universe the variable applies to (e.g., "Households"). */
   universe?: string;
+}
+
+/** A filter dimension the dataset declares required and the query did not set. */
+export interface UnsetPredicate {
+  code: string;
+  label: string;
+}
+
+/** Outcome of checking a caller's predicate map against a dataset's own variables.json. */
+export interface PredicateCheck {
+  /** Supplied predicate codes that are not variables in this dataset+year. */
+  unknown: string[];
+  /**
+   * Required predicates the caller left unset. The Census API substitutes its own default for
+   * each, without an error — an all-categories total for some dimensions (`cbp` `NAICS2017`),
+   * one fixed category for others (`pep/charv` `YEAR`).
+   */
+  unset: UnsetPredicate[];
 }
 
 /** Raw variables.json structure from Census API. */
@@ -34,5 +57,7 @@ export interface RawVariableEntry {
   label: string;
   limit?: number;
   predicateType?: string;
+  /** Present (as "default displayed") when the API defaults this dimension instead of erroring. */
+  required?: string;
   universe?: string;
 }

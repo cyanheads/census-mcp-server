@@ -29,6 +29,63 @@ describe('censusListDatasets', () => {
     expect(acs5?.available_years.length).toBeGreaterThan(0);
   });
 
+  it.each([
+    ['cbp', 2023, 'NAICS2017'],
+    ['ecnbasic', 2022, 'NAICS2022'],
+    ['nonemp', 2023, 'NAICS2022'],
+  ])(
+    'catalogs %s with its latest year and required industry predicate',
+    (id, latestYear, naics) => {
+      const ctx = createMockContext();
+      const result = censusListDatasets.handler(censusListDatasets.input.parse({}), ctx);
+      const entry = result.datasets.find((d) => d.dataset_id === id);
+
+      expect(entry).toBeDefined();
+      expect(Math.max(...(entry?.available_years ?? []))).toBe(latestYear);
+      expect(entry?.description).toContain(naics);
+    },
+  );
+
+  /**
+   * These datasets publish CBSA, CSA, and economic-place levels that census_resolve_geography
+   * cannot resolve a name to, so the catalog has to say which levels are actually reachable.
+   */
+  it.each(['cbp', 'ecnbasic', 'nonemp'])(
+    'tells a caller which %s geography levels census_resolve_geography reaches',
+    (id) => {
+      const ctx = createMockContext();
+      const result = censusListDatasets.handler(censusListDatasets.input.parse({}), ctx);
+      const entry = result.datasets.find((d) => d.dataset_id === id);
+
+      expect(entry?.description).toContain('census_resolve_geography');
+      expect(entry?.description).toContain('state and county');
+    },
+  );
+
+  /**
+   * Every query sends NAME in get=, and the older business vintages reject it with a 400 — cbp
+   * before 2012, nonemp 2008 through 2011. Advertising them sends a caller at a guaranteed error.
+   */
+  it.each([
+    ['cbp', [2004, 2008, 2011]],
+    ['nonemp', [2008, 2009, 2010, 2011]],
+  ])('leaves the %s vintages that reject the NAME column out of the catalog', (id, rejected) => {
+    const ctx = createMockContext();
+    const result = censusListDatasets.handler(censusListDatasets.input.parse({}), ctx);
+    const years = result.datasets.find((d) => d.dataset_id === id)?.available_years ?? [];
+
+    for (const year of rejected) expect(years).not.toContain(year);
+    expect(years).toContain(2012);
+  });
+
+  it('keeps the catalog in step with the dataset codes the tools accept', async () => {
+    const { KNOWN_DATASETS } = await import('@/services/variable-cache/variable-cache-service.js');
+    const ctx = createMockContext();
+    const result = censusListDatasets.handler(censusListDatasets.input.parse({}), ctx);
+
+    expect(new Set(result.datasets.map((d) => d.dataset_id))).toEqual(KNOWN_DATASETS);
+  });
+
   it('filters by keyword matching name or description', () => {
     const ctx = createMockContext();
     const input = censusListDatasets.input.parse({ filter: 'Decennial' });

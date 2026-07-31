@@ -14,7 +14,7 @@ import {
 export const censusGetVariable = tool('census_get_variable', {
   title: 'Get Census Variable Metadata',
   description:
-    'Fetch full metadata for one or more Census variable codes — label, concept group, predicate type, universe, and margin-of-error sibling references. Use to confirm a variable code before building a query, or to look up what a known code means. Returns estimate_code and moe_code sibling references where applicable so you can request both without a separate search.',
+    'Fetch full metadata for one or more Census variable codes — label, concept group, predicate type, universe, and margin-of-error sibling references. Use to confirm a variable code before building a query, or to look up what a known code means. On ACS datasets it returns estimate_code and moe_code sibling references so you can request both without a separate search; other dataset families publish no margins of error and carry neither field. It also resolves predicate codes such as NAICS2017 or SEX, confirming a filter dimension exists in a dataset before a query uses it.',
   annotations: { readOnlyHint: true, openWorldHint: false },
   input: z.object({
     variables: z
@@ -51,12 +51,14 @@ export const censusGetVariable = tool('census_get_variable', {
             estimate_code: z
               .string()
               .optional()
-              .describe('Estimate sibling variable code when this is a margin-of-error variable.'),
+              .describe(
+                'Estimate sibling variable code when this is a margin-of-error variable. ACS datasets only — no other family publishes margins of error.',
+              ),
             moe_code: z
               .string()
               .optional()
               .describe(
-                'Margin-of-error sibling code when this is an estimate variable. Include both in census_query_data for complete data.',
+                'Margin-of-error sibling code when this is an estimate variable. Include both in census_query_data for complete data. ACS datasets only — on other families an E-final code is an ordinary code with no margin-of-error sibling, so the field is absent.',
               ),
           })
           .describe('Full metadata for a single Census variable.'),

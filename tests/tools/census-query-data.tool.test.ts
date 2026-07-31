@@ -12,9 +12,10 @@ vi.mock('@/services/census-api/census-api-service.js', () => ({
   getCensusApiService: vi.fn(),
 }));
 
-vi.mock('@/services/variable-cache/variable-cache-service.js', () => ({
-  DATASET_LATEST_YEARS: { 'acs/acs5': 2024 },
-  KNOWN_DATASETS: new Set(['acs/acs5', 'acs/acs1', 'acs/acs5/profile', 'dec/pl']),
+vi.mock('@/services/variable-cache/variable-cache-service.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/services/variable-cache/variable-cache-service.js')>()),
+  DATASET_LATEST_YEARS: { 'acs/acs5': 2024, cbp: 2023 },
+  KNOWN_DATASETS: new Set(['acs/acs5', 'acs/acs1', 'acs/acs5/profile', 'dec/pl', 'cbp']),
   getVariableCacheService: vi.fn(),
 }));
 
@@ -30,6 +31,7 @@ vi.mock('@/config/server-config.js', () => ({
 const mockQueryData = vi.fn();
 const mockCheckGeography = vi.fn();
 const mockGetVariablesByCode = vi.fn();
+const mockCheckPredicates = vi.fn();
 
 beforeEach(async () => {
   vi.clearAllMocks();
@@ -48,7 +50,11 @@ beforeEach(async () => {
   );
   vi.mocked(getVariableCacheService).mockReturnValue({
     getVariablesByCode: mockGetVariablesByCode,
+    checkPredicates: mockCheckPredicates,
   } as never);
+
+  // Default: the dataset declares no filter dimensions, so nothing is unset or unknown.
+  mockCheckPredicates.mockResolvedValue({ unset: [], unknown: [] });
 
   // Default: label enrichment returns the code as label (best-effort)
   mockGetVariablesByCode.mockResolvedValue([]);
@@ -426,6 +432,191 @@ describe('censusQueryData', () => {
     expect(vars.B19013_001E?.suppression_reason).toContain('geography too small');
   });
 
+  it('forwards predicates to the api service', async () => {
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'King County, Washington',
+        geographyFips: '033',
+        geographyGeoid: '53033',
+        variables: { ESTAB: { estimate: 577, label: 'ESTAB', suppressed: false } },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['ESTAB'],
+      geography_level: 'county',
+      geography_fips: '033',
+      parent_fips: '53',
+      dataset: 'cbp',
+      predicates: { NAICS2017: '5112' },
+    });
+    await censusQueryData.handler(input, ctx);
+
+    expect(mockQueryData).toHaveBeenCalledWith(
+      expect.objectContaining({ predicates: { NAICS2017: '5112' } }),
+      expect.anything(),
+    );
+    expect(mockCheckPredicates).toHaveBeenCalledWith(
+      expect.objectContaining({ dataset: 'cbp', supplied: ['NAICS2017'] }),
+      expect.anything(),
+    );
+  });
+
+  it('omits predicates from the api service call when none were supplied', async () => {
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'California',
+        geographyFips: '06',
+        geographyGeoid: '06',
+        variables: { B01001_001E: { estimate: 39000000, label: 'B01001_001E', suppressed: false } },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['B01001_001E'],
+      geography_level: 'state',
+      geography_fips: '06',
+    });
+    await censusQueryData.handler(input, ctx);
+
+    expect(mockQueryData.mock.calls[0]?.[0]).not.toHaveProperty('predicates');
+  });
+
+  /**
+   * The Census API answers a query that omits a required predicate with the aggregate across
+   * that whole dimension, not an error — so the notice is the only signal that the number
+   * answers a broader question than the one asked.
+   */
+  it('warns that unset filter dimensions leave the values scoped by an API default', async () => {
+    mockCheckPredicates.mockResolvedValue({
+      unset: [
+        { code: 'LFO', label: 'Legal form of organization code' },
+        { code: 'NAICS2017', label: '2017 NAICS code' },
+      ],
+      unknown: [],
+    });
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'King County, Washington',
+        geographyFips: '033',
+        geographyGeoid: '53033',
+        variables: { ESTAB: { estimate: 70376, label: 'ESTAB', suppressed: false } },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['ESTAB'],
+      geography_level: 'county',
+      geography_fips: '033',
+      parent_fips: '53',
+      dataset: 'cbp',
+    });
+    await censusQueryData.handler(input, ctx);
+
+    const notice = getEnrichment(ctx).notice as string;
+    expect(notice).toContain('NAICS2017 (2017 NAICS code)');
+    expect(notice).toContain('LFO (Legal form of organization code)');
+    expect(notice).toContain('scoped to a category this query chose');
+  });
+
+  it('emits no notice when every filter dimension is set', async () => {
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'King County, Washington',
+        geographyFips: '033',
+        geographyGeoid: '53033',
+        variables: { ESTAB: { estimate: 577, label: 'ESTAB', suppressed: false } },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['ESTAB'],
+      geography_level: 'county',
+      geography_fips: '033',
+      parent_fips: '53',
+      dataset: 'cbp',
+      predicates: { NAICS2017: '5112' },
+    });
+    await censusQueryData.handler(input, ctx);
+
+    expect(getEnrichment(ctx).notice).toBeUndefined();
+  });
+
+  it('throws predicate_not_supported before querying for an unrecognized predicate key', async () => {
+    mockCheckPredicates.mockResolvedValue({ unset: [], unknown: ['BOGUSKEY'] });
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['ESTAB'],
+      geography_level: 'county',
+      geography_fips: '033',
+      parent_fips: '53',
+      dataset: 'cbp',
+      predicates: { BOGUSKEY: '1' },
+    });
+    await expect(censusQueryData.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'predicate_not_supported', unknownPredicates: ['BOGUSKEY'] },
+    });
+    expect(mockQueryData).not.toHaveBeenCalled();
+  });
+
+  /**
+   * ecnbasic publishes nothing below the national level until an industry is named, so an
+   * empty result there is a missing predicate rather than a bad FIPS code.
+   */
+  it('no_data recovery names the unset predicates when the dataset has any', async () => {
+    mockCheckPredicates.mockResolvedValue({
+      unset: [{ code: 'NAICS2022', label: '2022 NAICS code' }],
+      unknown: [],
+    });
+    mockQueryData.mockResolvedValue([]);
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['ESTAB'],
+      geography_level: 'county',
+      geography_fips: '033',
+      parent_fips: '53',
+      dataset: 'cbp',
+    });
+    await expect(censusQueryData.handler(input, ctx)).rejects.toMatchObject({
+      data: {
+        reason: 'no_data',
+        recovery: { hint: expect.stringContaining('NAICS2022') },
+      },
+    });
+  });
+
+  /**
+   * The Census API answers an unknown predicate *value* with 204, not 400, so a fully-predicated
+   * query that comes back empty is as likely a bad value as a bad FIPS code.
+   */
+  it('no_data recovery points at the supplied predicate values as well', async () => {
+    mockCheckPredicates.mockResolvedValue({ unset: [], unknown: [] });
+    mockQueryData.mockResolvedValue([]);
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['ESTAB'],
+      geography_level: 'county',
+      geography_fips: '033',
+      parent_fips: '53',
+      dataset: 'cbp',
+      predicates: { NAICS2017: 'ZZZZ' },
+    });
+    await expect(censusQueryData.handler(input, ctx)).rejects.toMatchObject({
+      data: {
+        reason: 'no_data',
+        recovery: { hint: expect.stringContaining('NAICS2017 value') },
+      },
+    });
+  });
+
   it('formats output with geography names, FIPS, and variable values', () => {
     const output = {
       rows: [
@@ -536,6 +727,7 @@ describe('censusQueryData', () => {
     );
     vi.mocked(getVariableCacheService).mockReturnValue({
       getVariablesByCode: vi.fn().mockRejectedValue(new Error('cache cold')),
+      checkPredicates: mockCheckPredicates,
     } as never);
 
     mockQueryData.mockResolvedValue([

@@ -12,9 +12,10 @@ vi.mock('@/services/census-api/census-api-service.js', () => ({
   getCensusApiService: vi.fn(),
 }));
 
-vi.mock('@/services/variable-cache/variable-cache-service.js', () => ({
-  DATASET_LATEST_YEARS: { 'acs/acs5': 2024 },
-  KNOWN_DATASETS: new Set(['acs/acs5', 'acs/acs1', 'acs/acs5/profile', 'dec/pl']),
+vi.mock('@/services/variable-cache/variable-cache-service.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/services/variable-cache/variable-cache-service.js')>()),
+  DATASET_LATEST_YEARS: { 'acs/acs5': 2024, cbp: 2023 },
+  KNOWN_DATASETS: new Set(['acs/acs5', 'acs/acs1', 'acs/acs5/profile', 'dec/pl', 'cbp']),
   getVariableCacheService: vi.fn(),
 }));
 
@@ -30,6 +31,7 @@ vi.mock('@/config/server-config.js', () => ({
 const mockQueryData = vi.fn();
 const mockCheckGeography = vi.fn();
 const mockGetVariablesByCode = vi.fn();
+const mockCheckPredicates = vi.fn();
 
 beforeEach(async () => {
   vi.clearAllMocks();
@@ -48,7 +50,11 @@ beforeEach(async () => {
   );
   vi.mocked(getVariableCacheService).mockReturnValue({
     getVariablesByCode: mockGetVariablesByCode,
+    checkPredicates: mockCheckPredicates,
   } as never);
+
+  // Default: the dataset declares no filter dimensions, so nothing is unset or unknown.
+  mockCheckPredicates.mockResolvedValue({ unset: [], unknown: [] });
 
   // Default: label enrichment best-effort (returns nothing — codes used as labels)
   mockGetVariablesByCode.mockResolvedValue([]);
@@ -660,6 +666,7 @@ describe('censusCompareGeographies', () => {
     );
     vi.mocked(getVariableCacheService).mockReturnValue({
       getVariablesByCode: vi.fn().mockRejectedValue(new Error('cache cold')),
+      checkPredicates: mockCheckPredicates,
     } as never);
 
     mockQueryData.mockResolvedValue([
@@ -767,5 +774,119 @@ describe('censusCompareGeographies', () => {
     expect(text).toContain('53033');
     expect(text).toContain('B19013_001E');
     expect(text).toContain('105,000');
+  });
+});
+
+describe('censusCompareGeographies — predicates', () => {
+  const cbpRows = [
+    {
+      geographyName: 'King County, Washington',
+      geographyFips: '033',
+      geographyGeoid: '53033',
+      variables: { ESTAB: { estimate: 577, label: 'ESTAB', suppressed: false } },
+    },
+  ];
+
+  it('forwards predicates to the api service', async () => {
+    mockQueryData.mockResolvedValue(cbpRows);
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['ESTAB'],
+      geography_level: 'county',
+      within: '53',
+      dataset: 'cbp',
+      predicates: { NAICS2017: '5112' },
+    });
+    await censusCompareGeographies.handler(input, ctx);
+
+    expect(mockQueryData).toHaveBeenCalledWith(
+      expect.objectContaining({ predicates: { NAICS2017: '5112' } }),
+      expect.anything(),
+    );
+  });
+
+  it('omits predicates from the api service call when none were supplied', async () => {
+    mockQueryData.mockResolvedValue(cbpRows);
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['ESTAB'],
+      geography_level: 'county',
+      within: '53',
+      dataset: 'cbp',
+    });
+    await censusCompareGeographies.handler(input, ctx);
+
+    expect(mockQueryData.mock.calls[0]?.[0]).not.toHaveProperty('predicates');
+  });
+
+  /**
+   * A ranking built on an unset dimension ranks every category combined, which answers a
+   * different question than the one the caller asked — that outranks truncation advice.
+   */
+  it('leads the notice with the unset filter dimensions, ahead of the truncation advice', async () => {
+    mockCheckPredicates.mockResolvedValue({
+      unset: [{ code: 'NAICS2017', label: '2017 NAICS code' }],
+      unknown: [],
+    });
+    mockQueryData.mockResolvedValue([
+      ...cbpRows,
+      {
+        geographyName: 'Pierce County, Washington',
+        geographyFips: '053',
+        geographyGeoid: '53053',
+        variables: { ESTAB: { estimate: 120, label: 'ESTAB', suppressed: false } },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['ESTAB'],
+      geography_level: 'county',
+      within: '53',
+      dataset: 'cbp',
+      limit: 1,
+    });
+    await censusCompareGeographies.handler(input, ctx);
+
+    const notice = getEnrichment(ctx).notice as string;
+    expect(notice).toContain('NAICS2017 (2017 NAICS code)');
+    expect(notice).toContain('scoped to a category this query chose');
+    expect(notice.indexOf('NAICS2017')).toBeLessThan(notice.indexOf('Results truncated'));
+  });
+
+  it('emits no notice when every filter dimension is set', async () => {
+    mockQueryData.mockResolvedValue(cbpRows);
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['ESTAB'],
+      geography_level: 'county',
+      within: '53',
+      dataset: 'cbp',
+      predicates: { NAICS2017: '5112' },
+    });
+    await censusCompareGeographies.handler(input, ctx);
+
+    expect(getEnrichment(ctx).notice).toBeUndefined();
+  });
+
+  it('throws predicate_not_supported before querying for an unrecognized predicate key', async () => {
+    mockCheckPredicates.mockResolvedValue({ unset: [], unknown: ['NAICS2022'] });
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['ESTAB'],
+      geography_level: 'county',
+      within: '53',
+      dataset: 'cbp',
+      predicates: { NAICS2022: '5112' },
+    });
+    await expect(censusCompareGeographies.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'predicate_not_supported', unknownPredicates: ['NAICS2022'] },
+    });
+    expect(mockQueryData).not.toHaveBeenCalled();
   });
 });

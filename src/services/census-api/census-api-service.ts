@@ -8,6 +8,7 @@ import type { Context } from '@cyanheads/mcp-ts-core';
 import { McpError, serviceUnavailable, unauthorized } from '@cyanheads/mcp-ts-core/errors';
 import { fetchWithTimeout, type RequestContext, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getDiscoveryConfig, getServerConfig } from '@/config/server-config.js';
+import { isAcsDataset } from '@/services/variable-cache/variable-cache-service.js';
 import type {
   CensusDataRow,
   CensusGeographyLevel,
@@ -41,6 +42,12 @@ export class CensusApiService {
       parentFips?: string;
       /** County FIPS code — required when querying tracts or block groups within a specific county. */
       countyFips?: string;
+      /**
+       * Dataset-specific filter values sent as extra query parameters, keyed by variable code
+       * (e.g. `{ NAICS2017: '5112' }`). Omitting one the dataset requires is not an error
+       * upstream — the API returns the aggregate across that dimension instead.
+       */
+      predicates?: Record<string, string>;
       dataset: string;
       year: number;
     },
@@ -60,7 +67,12 @@ export class CensusApiService {
       }
     }
 
-    const url = `${CENSUS_API_BASE}/${params.year}/${params.dataset}?get=${encodeURIComponent(varList)}&for=${encodeURIComponent(forClause)}${inClause}&key=${censusApiKey}`;
+    const predicateKeys = Object.keys(params.predicates ?? {});
+    const predicateClause = Object.entries(params.predicates ?? {})
+      .map(([key, value]) => `&${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
+      .join('');
+
+    const url = `${CENSUS_API_BASE}/${params.year}/${params.dataset}?get=${encodeURIComponent(varList)}&for=${encodeURIComponent(forClause)}${inClause}${predicateClause}&key=${censusApiKey}`;
 
     ctx.log.debug('Census API query', {
       dataset: params.dataset,
@@ -68,6 +80,7 @@ export class CensusApiService {
       variables: params.variables,
       geographyLevel: params.geographyLevel,
       geographyFips: params.geographyFips,
+      predicates: predicateKeys,
     });
 
     const raw = await withRetry(
@@ -119,7 +132,14 @@ export class CensusApiService {
       },
     );
 
-    return this.parseResponse(raw, params.variables, params.geographyLevel, ctx);
+    return this.parseResponse(
+      raw,
+      params.variables,
+      params.geographyLevel,
+      params.dataset,
+      predicateKeys,
+      ctx,
+    );
   }
 
   /**
@@ -255,6 +275,8 @@ export class CensusApiService {
     raw: CensusRawResponse,
     requestedVariables: string[],
     geographyLevel: string,
+    dataset: string,
+    predicateKeys: string[],
     ctx: Context,
   ): CensusDataRow[] {
     if (raw.length < 1) return [];
@@ -267,12 +289,13 @@ export class CensusApiService {
     const geoIdx = headers.findIndex((h) => h.toLowerCase() === geoTarget);
 
     // The Census API appends one column per geography level in the resolved hierarchy —
-    // a county query returns state + county, a tract query state + county + tract. Every
-    // header that is neither NAME nor a requested variable is one of those columns, and
-    // concatenating them in order composes the full GEOID.
-    const requested = new Set(requestedVariables);
+    // a county query returns state + county, a tract query state + county + tract. It also
+    // echoes back every predicate that was filtered on. Once NAME, the requested variables,
+    // and those echoed predicates are excluded, what remains is the geography hierarchy, and
+    // concatenating it in order composes the full GEOID.
+    const nonGeoColumns = new Set([...requestedVariables, ...predicateKeys]);
     const geoColumnIdxs = headers.flatMap((header, idx) =>
-      header !== 'NAME' && !requested.has(header) ? [idx] : [],
+      header !== 'NAME' && !nonGeoColumns.has(header) ? [idx] : [],
     );
     const variableIdxs = requestedVariables
       .map((code) => [code, headers.indexOf(code)] as const)
@@ -303,13 +326,18 @@ export class CensusApiService {
         };
       }
 
-      for (const varCode of requestedVariables) {
-        if (varCode.endsWith('E')) {
-          const moeCode = `${varCode.slice(0, -1)}M`;
-          const est = variables[varCode];
-          const moe = variables[moeCode];
-          if (est && moe) {
-            est.moe = moe.estimate;
+      // Pair each requested estimate with its margin of error. Only ACS uses the E/M suffix
+      // for that relationship — elsewhere an E-final code is just a code, so pairing two of
+      // them would attach a margin of error to a value that has none.
+      if (isAcsDataset(dataset)) {
+        for (const varCode of requestedVariables) {
+          if (varCode.endsWith('E')) {
+            const moeCode = `${varCode.slice(0, -1)}M`;
+            const est = variables[varCode];
+            const moe = variables[moeCode];
+            if (est && moe) {
+              est.moe = moe.estimate;
+            }
           }
         }
       }

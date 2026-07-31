@@ -151,6 +151,35 @@ describe('CensusApiService.parseResponse — GEOID composition', () => {
     expect(rows[0]?.variables.B19013_001E?.moe).toBe(1808);
   });
 
+  /**
+   * The Census API echoes every predicate it filtered on back as its own column, positioned
+   * between the requested variables and the geography hierarchy. Treating those as geography
+   * columns would splice industry and size codes into the GEOID.
+   */
+  it('excludes echoed predicate columns from the composed GEOID', async () => {
+    queue([
+      ['NAME', 'ESTAB', 'NAICS2017', 'LFO', 'EMPSZES', 'state', 'county'],
+      ['King County, Washington', '577', '5112', '001', '001', '53', '033'],
+    ]);
+
+    const rows = await service.queryData(
+      {
+        variables: ['ESTAB'],
+        geographyLevel: 'county',
+        geographyFips: '033',
+        parentFips: '53',
+        predicates: { NAICS2017: '5112', LFO: '001', EMPSZES: '001' },
+        dataset: 'cbp',
+        year: 2023,
+      },
+      createMockContext(),
+    );
+
+    expect(rows[0]?.geographyGeoid).toBe('53033');
+    expect(rows[0]?.geographyFips).toBe('033');
+    expect(rows[0]?.variables.ESTAB?.estimate).toBe(577);
+  });
+
   it('matches the geography column however the caller cased the level name', async () => {
     queue([
       ['NAME', 'B19013_001E', 'state', 'county'],
@@ -175,6 +204,113 @@ describe('CensusApiService.parseResponse — GEOID composition', () => {
     expect(rows[0]?.variables.B19013_001E?.suppressed).toBe(true);
     expect(rows[0]?.variables.B19013_001E?.estimate).toBeNull();
     expect(rows[0]?.variables.B19013_001E?.suppressionReason).toContain('Not available');
+  });
+});
+
+describe('CensusApiService.queryData — predicates', () => {
+  it('appends each predicate to the request URL as its own query parameter', async () => {
+    queue([
+      ['NAME', 'ESTAB', 'NAICS2017', 'state', 'county'],
+      ['King County, Washington', '577', '5112', '53', '033'],
+    ]);
+
+    await service.queryData(
+      {
+        variables: ['ESTAB'],
+        geographyLevel: 'county',
+        geographyFips: '033',
+        parentFips: '53',
+        predicates: { NAICS2017: '5112' },
+        dataset: 'cbp',
+        year: 2023,
+      },
+      createMockContext(),
+    );
+
+    expect(requestedUrls[0]).toContain('&NAICS2017=5112');
+    expect(requestedUrls[0]).toContain('for=county%3A033');
+  });
+
+  it('percent-encodes a predicate value so it cannot inject another parameter', async () => {
+    queue([
+      ['NAME', 'ESTAB', 'state'],
+      ['Washington', '1', '53'],
+    ]);
+
+    await service.queryData(
+      {
+        variables: ['ESTAB'],
+        geographyLevel: 'state',
+        geographyFips: '53',
+        predicates: { NAICS2017: '51&key=stolen' },
+        dataset: 'cbp',
+        year: 2023,
+      },
+      createMockContext(),
+    );
+
+    expect(requestedUrls[0]).toContain('&NAICS2017=51%26key%3Dstolen');
+    expect(requestedUrls[0]?.match(/[?&]key=/g)).toHaveLength(1);
+  });
+
+  it('sends no predicate parameters when none were supplied', async () => {
+    queue([
+      ['NAME', 'B19013_001E', 'state'],
+      ['Washington', '95000', '53'],
+    ]);
+
+    await query('state', { geographyFips: '53' });
+
+    expect(requestedUrls[0]).not.toContain('&NAICS');
+  });
+});
+
+describe('CensusApiService.parseResponse — margin-of-error pairing', () => {
+  it('pairs a requested E value with its requested M value on ACS', async () => {
+    queue([
+      ['NAME', 'B19013_001E', 'B19013_001M', 'state'],
+      ['Washington', '95000', '812', '53'],
+    ]);
+
+    const rows = await service.queryData(
+      {
+        variables: ['B19013_001E', 'B19013_001M'],
+        geographyLevel: 'state',
+        geographyFips: '53',
+        dataset: 'acs/acs5',
+        year: 2024,
+      },
+      createMockContext(),
+    );
+
+    expect(rows[0]?.variables.B19013_001E?.moe).toBe(812);
+  });
+
+  /**
+   * Outside ACS the E/M suffix carries no estimate/margin relationship, so two codes that
+   * happen to share a stem are unrelated variables — pairing them would report a margin of
+   * error on a value that has none.
+   */
+  it('leaves two same-stem codes unpaired outside ACS', async () => {
+    queue([
+      ['NAME', 'INVTOTE', 'INVTOTM', 'state'],
+      ['Washington', '5000', '7000', '53'],
+    ]);
+
+    const rows = await service.queryData(
+      {
+        variables: ['INVTOTE', 'INVTOTM'],
+        geographyLevel: 'state',
+        geographyFips: '53',
+        dataset: 'ecnbasic',
+        year: 2022,
+      },
+      createMockContext(),
+    );
+
+    expect(rows[0]?.variables.INVTOTE?.moe).toBeUndefined();
+    expect(rows[0]?.variables.INVTOTE?.estimate).toBe(5000);
+    expect(rows[0]?.variables.INVTOTM?.estimate).toBe(7000);
   });
 });
 

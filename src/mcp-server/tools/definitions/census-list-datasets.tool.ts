@@ -73,12 +73,36 @@ const DATASETS = [
     description: 'Detailed demographic and housing characteristics from the Decennial Census.',
     availableYears: [2020],
   },
+  {
+    datasetId: 'cbp',
+    name: 'County Business Patterns',
+    description:
+      'Annual establishment counts, employment, and payroll for employer businesses, broken out by industry. Queries must set the predicates NAICS2017 (industry; vintages before 2017 use NAICS2012), LFO (legal form of organization), and EMPSZES (employment size class) — omitting one returns the total across every category of it rather than an error. Geography levels are us, state, county, metropolitan/micropolitan statistical area, combined statistical area, congressional district, and zip code; census_resolve_geography reaches only the state and county levels of that set. The Census API publishes vintages back to 1986, but only those listed here accept the NAME column every query here requests.',
+    availableYears: [2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023],
+  },
+  {
+    datasetId: 'ecnbasic',
+    name: 'Economic Census',
+    description:
+      'Industry statistics collected every five years — establishments, revenue, payroll, and employment by industry. Queries must set the predicates NAICS2022 (industry; NAICS2017 in the 2017 vintage), TAXSTAT (tax status), and TYPOP (type of operation); below the national level the data is often published only once an industry is named, so an unset NAICS returns nothing at all. Geography levels are us, region, state, county, consolidated city, metropolitan/micropolitan statistical area, metropolitan division, combined statistical area, and economic place; census_resolve_geography reaches only the state and county levels of that set.',
+    availableYears: [2012, 2017, 2022],
+  },
+  {
+    datasetId: 'nonemp',
+    name: 'Nonemployer Statistics',
+    description:
+      'Businesses with no paid employees — sole proprietors, self-employed, and other single-person operations that County Business Patterns excludes. Queries must set the predicates NAICS2022 (industry; earlier vintages use the NAICS revision of their year), LFO (legal form of organization), and RCPSZES (receipts size class) — omitting one returns the total across every category of it rather than an error. Geography levels are us, state, county, metropolitan/micropolitan statistical area, and combined statistical area; census_resolve_geography reaches only the state and county levels of that set. The 2008 through 2011 vintages exist upstream but reject the NAME column every query here requests, so they are not listed.',
+    availableYears: [
+      1997, 1998, 1999, 2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2012, 2013, 2014, 2015,
+      2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023,
+    ],
+  },
 ];
 
 export const censusListDatasets = tool('census_list_datasets', {
   title: 'List Census Datasets',
   description:
-    'Browse available Census Bureau datasets with their supported vintage years. Use as the starting point when the right dataset is unknown — ACS5, ACS1, population estimates, and decennial census serve different use cases. Pass the dataset_id value to the dataset parameter in other census tools.',
+    'Browse available Census Bureau datasets with their supported vintage years. Use as the starting point when the right dataset is unknown — ACS5, ACS1, population estimates, decennial census, and the business datasets (County Business Patterns, Economic Census, Nonemployer Statistics) serve different use cases. Pass the dataset_id value to the dataset parameter in other census tools. Each description names the predicates a dataset requires and the geography levels it publishes, both of which vary by dataset.',
   annotations: { readOnlyHint: true, openWorldHint: false },
   input: z.object({
     filter: z

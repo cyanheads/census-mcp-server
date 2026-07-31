@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.13-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/census-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/census-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/census-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.1.14-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/census-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/census-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/census-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -33,20 +33,21 @@
 
 | Tool | Description |
 |:-----|:------------|
-| `census_list_datasets` | Browse available Census Bureau datasets (ACS5, ACS1, Population Estimates, Decennial) with vintage years and dataset codes. |
+| `census_list_datasets` | Browse available Census Bureau datasets (ACS5, ACS1, Population Estimates, Decennial, County Business Patterns, Economic Census, Nonemployer Statistics) with vintage years and dataset codes. |
 | `census_list_geographies` | List the geography levels supported by a dataset and year, with parent requirements and example FIPS values. |
-| `census_search_variables` | Keyword search across variable labels and concept groups. Returns estimate and margin-of-error codes together. |
+| `census_search_variables` | Keyword search across variable labels and concept groups. On ACS, returns estimate and margin-of-error codes together. |
 | `census_get_variable` | Fetch full metadata for one or more variable codes — label, concept, predicate type, universe, MOE sibling. |
 | `census_resolve_geography` | Convert place names (e.g., "King County, WA") or street addresses to Census FIPS identifiers via TIGERweb and Census Geocoder. |
-| `census_query_data` | Query a Census dataset for variables at a specific geography. Returns estimates with MOE, suppression codes resolved to readable reasons. |
-| `census_compare_geographies` | Rank and compare variables across multiple geographies — all counties in a state, all states nationally, or a named set. Sorted table output. |
+| `census_query_data` | Query a Census dataset for variables at a specific geography. Returns estimates with MOE, suppression codes resolved to readable reasons, and predicate filtering for the business datasets. |
+| `census_compare_geographies` | Rank and compare variables across multiple geographies — all counties in a state, all states nationally, or a named set. Sorted table output, with the same predicate filtering. |
 
 ### `census_list_datasets`
 
 Browse available Census Bureau datasets.
 
 - Returns dataset codes, names, descriptions, and available vintage years
-- Covers ACS5, ACS5 Data Profiles, ACS5 Subject Tables, ACS1, ACS1 Data Profiles, Population Estimates, Decennial Redistricting (P.L. 94-171), and Decennial DHC
+- Covers ACS5, ACS5 Data Profiles, ACS5 Subject Tables, ACS1, ACS1 Data Profiles, Population Estimates, Decennial Redistricting (P.L. 94-171), Decennial DHC, County Business Patterns (`cbp`), Economic Census (`ecnbasic`), and Nonemployer Statistics (`nonemp`)
+- Each description names the filter predicates the dataset requires and the geography levels it publishes — both vary by dataset
 - Accepts an optional keyword filter
 - Dataset codes (e.g., `acs/acs5`) are the values to pass to other tools
 
@@ -57,7 +58,8 @@ Browse available Census Bureau datasets.
 Search Census variables by keyword.
 
 - Full-text search across label and concept fields with relevance scoring (exact concept match > label match > partial)
-- Returns estimate (E suffix) and margin-of-error (M suffix) codes together so both can be requested in one query
+- On ACS datasets, returns estimate (E suffix) and margin-of-error (M suffix) codes together so both can be requested in one query — no other family publishes margins of error, and an E-final code there is an ordinary code
+- Also surfaces the predicate codes a dataset filters on, such as `NAICS2017` in `cbp`
 - Configurable limit (default 20, max 100); `total_matches` indicates how many matched before the limit
 - Cache-backed: variables.json is fetched once per dataset+year with a configurable TTL (default 24h)
 
@@ -85,6 +87,7 @@ Query a Census dataset for one or more variables at a specific geography.
 - The level and its required parents are checked against the dataset's own geography metadata before the query runs, so a missing `parent_fips` returns `parent_required` naming what to add rather than an upstream 400
 - Each row carries both `geography_fips` (bare level code, round-trips back into this tool) and `geography_geoid` (level plus parents, nationally unique)
 - A query that matches nothing returns `no_data` with dataset-aware recovery, not a retried upstream error
+- Optional `predicates` map for the datasets that filter on one — `{"NAICS2017": "5112"}` narrows a `cbp` count to software publishers. Keys are validated against the dataset's own variables before the query; dimensions left unset are named in a notice, because the Census API answers an omitted one with its own default rather than an error
 - Suppression codes (geography too small, data not collected, etc.) resolved to human-readable reasons
 - Variable labels enriched from cache and surfaced alongside estimates
 - Requires `CENSUS_API_KEY`
@@ -100,6 +103,7 @@ Rank and compare variables across multiple geographies.
 - Optional `geographies` list to filter to specific geographies — full GEOIDs (`"53033"`, `"06037"`) work across states; bare level codes (`"033"`) need `within` to disambiguate. Entries matching no row, and bare codes that matched more than one state, are named in a notice
 - Same pre-query level and parent validation as `census_query_data`, reported against `within` / `within_county`
 - Configurable sort variable, direction, and limit (default 50, max 500)
+- Same `predicates` map as `census_query_data`, applied to every geography — without it a business-dataset ranking ranks on the all-categories total, which the notice names
 - Suppressed values sorted to end of results and labeled rather than passed through as negative sentinels
 - Requires `CENSUS_API_KEY`
 

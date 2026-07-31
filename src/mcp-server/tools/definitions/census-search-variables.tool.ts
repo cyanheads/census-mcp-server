@@ -14,7 +14,7 @@ import {
 export const censusSearchVariables = tool('census_search_variables', {
   title: 'Search Census Variables',
   description:
-    'Search Census variables by keyword across variable labels and concept groups. Returns variable codes with human-readable labels — use this to go from a concept like "median household income" to the variable code B19013_001E needed for data queries. Returns both estimate (E suffix) and margin-of-error (M suffix) codes so you can request both. When total_matches exceeds the limit, narrow the query to see more specific results.',
+    'Search Census variables by keyword across variable labels and concept groups. Returns variable codes with human-readable labels — use this to go from a concept like "median household income" to the variable code B19013_001E needed for data queries. On ACS datasets it returns both estimate (E suffix) and margin-of-error (M suffix) codes so you can request both; other dataset families publish no margins of error. Also use it to find the predicate codes a dataset filters on, such as NAICS2017 in cbp. When total_matches exceeds the limit, narrow the query to see more specific results.',
   annotations: { readOnlyHint: true, openWorldHint: false },
   input: z.object({
     query: z
@@ -60,19 +60,19 @@ export const censusSearchVariables = tool('census_search_variables', {
               .string()
               .optional()
               .describe(
-                'Corresponding estimate variable code when this is a margin-of-error variable.',
+                'Corresponding estimate variable code when this is a margin-of-error variable. ACS datasets only — no other family publishes margins of error.',
               ),
             moe_code: z
               .string()
               .optional()
               .describe(
-                'Corresponding margin-of-error variable code when this is an estimate variable. Request both estimate and MOE in census_query_data for complete data.',
+                'Corresponding margin-of-error variable code when this is an estimate variable. Request both estimate and MOE in census_query_data for complete data. ACS datasets only — on other families an E-final code is an ordinary code with no margin-of-error sibling, so the field is absent.',
               ),
           })
           .describe('A single matching Census variable entry.'),
       )
       .describe(
-        'Matching variables sorted by relevance. Variable codes ending in E are estimates; M are margins of error.',
+        'Matching variables sorted by relevance. On ACS datasets, codes ending in E are estimates and M are their margins of error; on other datasets the suffix carries no such meaning.',
       ),
   }),
 

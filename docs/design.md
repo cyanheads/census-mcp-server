@@ -26,7 +26,7 @@ No prompts. The server is data-oriented; the tool descriptions carry sufficient 
 
 ## Overview
 
-census-mcp-server provides access to US Census Bureau demographic, economic, and housing data via the Census Bureau Data API (`https://api.census.gov/data`). It exposes four core dataset families — ACS 5-Year, ACS 1-Year, Population Estimates, and Decennial Census — through a tool surface that abstracts the Census API's most significant usability barriers: opaque variable codes and FIPS geography requirements.
+census-mcp-server provides access to US Census Bureau demographic, economic, and housing data via the Census Bureau Data API (`https://api.census.gov/data`). It exposes five core dataset families — ACS 5-Year, ACS 1-Year, Population Estimates, Decennial Census, and the business datasets (County Business Patterns, Economic Census, Nonemployer Statistics) — through a tool surface that abstracts the Census API's most significant usability barriers: opaque variable codes and FIPS geography requirements.
 
 The primary design challenge is the variable system. The ACS5 2024 dataset alone has 28,475 variables with codes like `B19013_001E`. An agent can't know that `B19013_001E` is median household income without discovery tooling. The tool surface puts variable search first, makes it fast, and allows agents to confirm codes before querying.
 
@@ -42,8 +42,8 @@ Target users: agents doing demographic research, policy analysis, market sizing,
 - TIGERweb and Census Geocoder endpoints used for geography resolution — no API key required for these
 - Rate limits: documented as 500 req/day without key (now moot — key required), higher with key; no hard-coded per-minute cap documented
 - Read-only server — no write operations exist in the Census API
-- Core datasets in scope: ACS 5-Year (`acs/acs5`), ACS 1-Year (`acs/acs1`), Population Estimates (`pep/charv`), Decennial 2020 (`dec/pl`, `dec/ddhca`)
-- Latest vintages as of implementation: ACS5 2024, ACS1 2024, PEP 2023
+- Core datasets in scope: ACS 5-Year (`acs/acs5`), ACS 1-Year (`acs/acs1`), Population Estimates (`pep/charv`), Decennial 2020 (`dec/pl`, `dec/ddhca`), County Business Patterns (`cbp`), Economic Census (`ecnbasic`), Nonemployer Statistics (`nonemp`)
+- Latest vintages as of implementation: ACS5 2024, ACS1 2024, PEP 2023, CBP 2023, Economic Census 2022, Nonemployer 2023
 - ACS5 sub-tables in scope: detailed tables (`acs5`), data profiles (`acs5/profile`), subject tables (`acs5/subject`) — profiles cover ~80% of common queries with simpler DP-prefix codes
 - Variable search operates client-side against the variables.json endpoint (28K+ variables, cached) — no Census search API exists
 - Geography resolution uses TIGERweb MapServer REST API for named places, and Census Geocoder for address-to-geography lookup
@@ -212,6 +212,7 @@ Each step is independently testable. Steps 5–6 can be tested without a Census 
 - `geography_fips: string` — FIPS code for the target geography at the requested level (e.g., `"033"` for a county, `"*"` for all geographies at that level within the parent). Use `census_resolve_geography` to obtain this value.
 - `parent_fips?: string` — FIPS of the parent geography when the level requires one (e.g., state FIPS `"53"` when querying counties within WA). Required for sub-state levels. `census_resolve_geography` returns this as `state_fips`.
 - `county_fips?: string` — county FIPS when querying tracts or block groups inside one county (e.g., `"033"` for King County), alongside `parent_fips`. `census_resolve_geography` returns this as `county_fips`.
+- `predicates?: Record<string, string>` — dataset-specific filter values keyed by variable code (e.g., `{ "NAICS2017": "5112" }`), appended to the request URL as extra query parameters. See "Predicate filtering" below.
 - `dataset?: string` — dataset to query (default: `"acs/acs5"`). Use `census_list_datasets` for valid values.
 - `year?: number` — vintage year (default: latest available for the dataset)
 
@@ -225,6 +226,7 @@ Each row carries two identifiers because they serve different purposes. `geograp
 - `geography_not_supported` (InvalidParams) — the requested geography level does not exist in this dataset and year. Thrown before the data query, from the dataset's own geography metadata; the error carries the levels the dataset does have. Recovery: call `census_list_geographies` to see supported levels.
 - `parent_required` (InvalidParams) — the geography level requires a parent the request did not supply (e.g., tract requires a state, block group a state and a county). Thrown before the data query, from the same metadata; the error names the missing parents and the recovery hint names the input to add. A `*` target relaxes the innermost required parent, which is why a nationwide `county` query needs no `parent_fips` while a tract query does. A missing parent this tool has no input for (a single block group needs its tract) is reported as such: the hint offers `geography_fips: "*"` when the wildcard would drop that parent, and otherwise says the level is out of reach.
 - `no_data` (NotFound) — the query returned no rows. The Census API answers a well-formed but empty query with `204 No Content`, which is read as zero rows here rather than an unparseable response. Recovery is dataset-aware: on ACS1 it points at the 65K population floor and suggests `acs/acs5`; on any other dataset it points at confirming the FIPS codes and level, without suggesting a switch to the dataset already in use.
+- `predicate_not_supported` (InvalidParams) — a key in `predicates` is not a variable in this dataset+year. Validated against the cached `variables.json` before the data query, because the Census API's own rejection surfaces as a `400` naming the request URL and nothing about which key was wrong.
 - `too_many_variables` (InvalidParams) — more than 50 variable codes requested. Recovery: split into multiple calls.
 - `upstream_error` (ServiceUnavailable, retryable) — Census API returned an error or was unreachable. Recovery: retry; if persistent, the API may be down.
 
@@ -242,6 +244,7 @@ Each row carries two identifiers because they serve different purposes. `geograp
 - `within?: string` — FIPS of the parent geography to constrain results (e.g., state FIPS `"53"` to compare counties within WA only). Omit to compare all geographies at the level nationally. Use `census_resolve_geography` to get the FIPS.
 - `within_county?: string` — county FIPS to constrain a tract or block-group comparison to one county inside `within` (e.g., `"033"`). `census_resolve_geography` returns this as `county_fips`.
 - `geographies?: string[]` — optional list of specific geographies to include; when provided, only these are returned. Omit to return all geographies at the level within `within` (or nationally). An entry matches a row's full GEOID (`"53033"` King County WA, `"06037"` Los Angeles County CA) or its bare level code (`"033"`). Prefer GEOIDs: they are nationally unique, so a list may span states, whereas a bare code matches that code in every state unless `within` scopes the comparison. A GEOID is easiest taken from a row's own `geography_geoid`; from `census_resolve_geography`, concatenate `state_fips`, then `county_fips` when present, then `fips_summary` — a tract GEOID is state + county + tract, not state + tract. Entries that match no row, and bare codes that matched more than one state, are named in the response notice; a list that matches nothing at all throws `no_data` rather than returning an empty ranking.
+- `predicates?: Record<string, string>` — dataset-specific filter values keyed by variable code, applied to every geography in the comparison. See "Predicate filtering" below.
 - `dataset?: string` — dataset to query (default: `"acs/acs5"`)
 - `year?: number` — vintage year (default: latest available)
 - `sort_by?: string` — variable code to sort by (default: first variable in the list)
@@ -255,6 +258,7 @@ Each row carries two identifiers because they serve different purposes. `geograp
 - `geography_not_supported` (InvalidParams) — the geography level does not exist in this dataset+year. Thrown before the data query, from the dataset's own geography metadata. Recovery: call `census_list_geographies`.
 - `parent_required` (InvalidParams) — the level requires a parent the request did not supply. Thrown before the data query; the message names the missing parent levels and the recovery hint names `within` or `within_county`.
 - `variable_not_found` (InvalidParams) — one or more variable codes invalid for this dataset+year.
+- `predicate_not_supported` (InvalidParams) — a key in `predicates` is not a variable in this dataset+year, validated before the data query.
 - `no_data` (NotFound) — no geographies returned, or the `geographies` list matched no row. Recovery is dataset-aware on the first case (ACS1 gets the 65K population floor and an `acs/acs5` suggestion; other datasets get level and FIPS verification) and names the unmatched entries on the second.
 - Extraneous parents are not pre-validated: passing `within` for a level that has no state parent (a national ZCTA or urban-area comparison) still reaches the Census API and surfaces its `400`.
 - `upstream_error` (ServiceUnavailable, retryable) — Census API unreachable or returned an error.
@@ -296,6 +300,26 @@ ACS5 has four sub-table types. Data profiles (`acs5/profile`, DP-prefix codes li
 ### Why `census_compare_geographies` instead of multiple `census_query_data` calls?
 
 The comparison workflow — ranking states by poverty rate, comparing counties on median income — is a very common pattern that requires querying one variable across many geographies. A single `census_query_data` call with `geography_fips: "*"` returns all geographies at a level; `census_compare_geographies` generalizes this pattern and adds sorting, labeling, and truncation with counts so the agent gets a ranked table rather than raw rows. It's implemented as fan-out across `census_query_data` internally when multi-dataset comparison is needed, or a single wildcard query when all geographies are within one dataset.
+
+### Margin-of-error inference is scoped to the ACS family
+
+`variables.json` omits ACS's `M`-suffix margin-of-error codes even though the data API serves them, so the variable cache infers each `B…E` estimate's `B…M` sibling and synthesizes an entry for it. That `E`/`M` pairing is an ACS table convention, not a Census-wide one: `pep/charv` has `UNIVERSE`, `AGE`, and `MEDAGE`, `ecnbasic` has `INVTOTE` and `INVWIPE`, and `cbp` has `STATE` — ordinary codes that happen to end in `E` and have no margin of error at all. Applied to those families the inference invented codes (`UNIVERSM`, `INVTOTM`, `STATM`) that do not exist upstream, and `census_get_variable` resolved them to fabricated "Margin of Error — …" entries instead of reporting `variable_not_found`.
+
+Both the inference and the synthesis are gated on `isAcsDataset()` (a `acs/` dataset prefix). `CensusApiService.parseResponse` carries the same gate when it pairs a requested `E` value with a requested `M` value into `.moe`. That path never fabricated anything — it only pairs codes the caller explicitly requested, and no non-ACS dataset in the registry currently has both a `<stem>E` and a `<stem>M` variable for it to mispair. It is gated anyway so the two services tell one story about where the convention holds, rather than the cache reporting no margin-of-error relationship while a query attaches one.
+
+### Predicate filtering: a generic map, with unset dimensions reported rather than guessed
+
+Several datasets mark variables `required` in `variables.json` — `NAICS2017`/`NAICS2022`, `LFO`, `EMPSZES`, `RCPSZES`, `TAXSTAT`, `TYPOP` on the business datasets, and `SEX`, `AGE`, `POPGROUP`, `HISP`, `YEAR` on `pep/charv`. The Census API does not enforce them. A query that omits one succeeds and substitutes the API's own default for that dimension: `cbp` establishments in King County is 70,376 with no `NAICS2017` and 577 with `NAICS2017=5112`. Registering the business datasets without a way to send these would answer "how many software companies are in King County" with the all-industries total.
+
+`predicates` is a `Record<string, string>` on both data tools rather than dataset-aware named parameters (`naics`, `size_class`) because the codes are vintage-specific, not just dataset-specific — `cbp` 2023 takes `NAICS2017` while `cbp` 2012 takes `NAICS2012`, and `nonemp` 2023 takes `NAICS2022`. Named parameters would need a hand-maintained dataset × year × parameter mapping that drifts, and would add seven dead optional fields to every ACS query. The map is validated against the dataset's own cached `variables.json` instead, so it stays correct across vintages with no table to maintain.
+
+An unset required predicate is reported through `ctx.enrich.notice()`, not thrown as an error. Erroring was rejected because it is unrecoverable for most of these dimensions: `variables.json` publishes a value list for `NAICS*` and `POPGROUP` only, so a caller told to supply `LFO` and `EMPSZES` has no way to learn what they accept. It would also break every existing `pep/charv` and `dec/ddhca` query, which is the only form those datasets are reachable in today. The notice reaches both `structuredContent` and `content[]`, attached to the number itself, and names each unset dimension with its label.
+
+What the notice does *not* say is that the value is an all-categories total, because the substituted default is not one shape. `cbp` defaults `NAICS2017` to `00`, the all-industries total. `pep/charv` defaults `YEAR` to 2020 and returns one row per matching combination, so an unfiltered `POP` query against the 2023 vintage yields two King County rows — that year's estimates base and estimate — rather than a sum across 2020–2023. Calling both an aggregate would misreport the second, so the wording says only what holds for both: the API supplied the default, so no value is scoped to a category the query chose.
+
+`GEOCOMP` is excluded from the report: every Census dataset declares it — checked across all eleven registered dataset and year pairs — its default is the whole geography, and listing it beside real filter dimensions on every ACS query would train readers to skip the notice.
+
+An unknown predicate *key* is an error (`predicate_not_supported`), validated client-side, because that case is both unambiguous and fully recoverable. The Census API does reject it with a `400`, but the message that reaches the caller carries only the request URL and the status — never which key was wrong. An unknown predicate *value* is not rejected at all: it comes back as `204 No Content`, indistinguishable from a geography with no data, which is why the `no_data` recovery hint names the supplied predicates alongside the unset ones.
 
 ### Variable search is client-side, not a Census API feature
 
@@ -400,3 +424,7 @@ GET https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/State_County/M
 - **Margin of error is not a guarantee.** ACS data is survey-based. MOE values can be larger than the estimate for small geographies or rare populations. The server returns MOE columns alongside estimates but doesn't validate statistical reliability.
 - **50-variable limit per request.** The Census API caps `get=` at 50 variables per request. `census_query_data` enforces this and will error with guidance if exceeded. Requesting all demographics for a geography requires multiple calls.
 - **No historical ACS1 for 2020.** ACS1 2020 was not released due to COVID-19 data collection disruptions. Querying 2020 ACS1 returns no data.
+- **Margins of error exist only on ACS.** `pep`, `dec`, `cbp`, `ecnbasic`, and `nonemp` publish none, so `moe_code`/`estimate_code` are absent there and query rows carry no `moe`. A code ending in `E` in those datasets is an ordinary code, not an estimate with an `M` sibling.
+- **Predicate values are not discoverable through the tool surface.** `census_search_variables` finds the predicate *codes* a dataset filters on, but `variables.json` publishes a value list for `NAICS*` and `POPGROUP` only — and those run to ~6,700 and ~5,500 entries. For `LFO`, `EMPSZES`, `RCPSZES`, `TAXSTAT`, `TYPOP`, `SEX`, and `AGE` the accepted values come from Census documentation, not from any endpoint this server reads.
+- **Business datasets are reachable only at the geography levels `census_resolve_geography` supports.** All three publish CBSA and CSA; `cbp` adds congressional district and ZIP code; `ecnbasic` adds region, metropolitan division, consolidated city, and economic place. No tool here resolves a name to any of them. State and county resolve normally; the rest need a GEOID the caller already holds.
+- **Business-dataset vintages predate the query shape.** Every query sends `NAME` in `get=`, and the older vintages reject it with a `400` — `cbp` before 2012, and `nonemp` 2008 through 2011. Those years exist upstream but are omitted from `census_list_datasets` rather than advertised and then failing. `cbp` vintages before 2017 also take `NAICS2012` rather than `NAICS2017`, and `nonemp` runs back through `NAICS1997`; the predicate check reads each vintage's own `variables.json`, so the right code name is reported at runtime.

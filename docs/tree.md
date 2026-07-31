@@ -1,6 +1,6 @@
 # census-mcp-server - Directory Structure
 
-Generated on: 2026-07-31 19:13:24
+Generated on: 2026-07-31 20:27:19
 
 ```text
 census-mcp-server/
@@ -23,6 +23,7 @@ census-mcp-server/
 │   └── settings.json
 ├── changelog/
 │   ├── 0.1.x/
+│   ├── 0.2.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md

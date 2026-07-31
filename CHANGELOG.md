@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.0](changelog/0.2.x/0.2.0.md) — 2026-07-31
+
+census_resolve_geography now resolves metro/micro and combined statistical areas plus consolidated cities (#22), and takes a county_fips input to pin an ambiguous tract to one county (#20)
+
 ## [0.1.14](changelog/0.1.x/0.1.14.md) — 2026-07-31
 
 Added County Business Patterns, Economic Census, and Nonemployer Statistics with predicate filtering (#9), and fixed census_search_variables/census_get_variable fabricating margin-of-error codes on non-ACS datasets (#17)

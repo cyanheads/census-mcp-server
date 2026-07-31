@@ -1,6 +1,6 @@
 # census-mcp-server - Directory Structure
 
-Generated on: 2026-07-31 20:27:19
+Generated on: 2026-07-31 21:40:08
 
 ```text
 census-mcp-server/
@@ -24,6 +24,7 @@ census-mcp-server/
 ├── changelog/
 │   ├── 0.1.x/
 │   ├── 0.2.x/
+│   ├── 0.3.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -143,6 +144,7 @@ census-mcp-server/
 │   │           ├── census-get-variable.tool.ts
 │   │           ├── census-list-datasets.tool.ts
 │   │           ├── census-list-geographies.tool.ts
+│   │           ├── census-list-predicate-values.tool.ts
 │   │           ├── census-query-data.tool.ts
 │   │           ├── census-resolve-geography.tool.ts
 │   │           ├── census-search-variables.tool.ts
@@ -173,6 +175,7 @@ census-mcp-server/
 │       ├── census-get-variable.tool.test.ts
 │       ├── census-list-datasets.tool.test.ts
 │       ├── census-list-geographies.tool.test.ts
+│       ├── census-list-predicate-values.tool.test.ts
 │       ├── census-query-data.tool.test.ts
 │       ├── census-resolve-geography.tool.test.ts
 │       └── census-search-variables.tool.test.ts

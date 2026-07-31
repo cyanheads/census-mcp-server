@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-07-31
+
+Added census_list_predicate_values to discover filter-dimension codes (#23), plus fixes for a raw 400 on an unaccepted parent (#21), silent no_data on an unpadded FIPS code (#25), and dec/ddhca/ecnbasic returning one category as if it were a total (#24)
+
 ## [0.2.0](changelog/0.2.x/0.2.0.md) — 2026-07-31
 
 census_resolve_geography now resolves metro/micro and combined statistical areas plus consolidated cities (#22), and takes a county_fips input to pin an ambiguous tract to one county (#20)

@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.13](changelog/0.1.x/0.1.13.md) — 2026-07-31
+
+census_query_data/census_compare_geographies: fixed cross-geography filtering with a new geography_geoid field (#16), and a geography level missing a required parent now fails before the query with an actionable error instead of a raw upstream 400 (#19)
+
 ## [0.1.12](changelog/0.1.x/0.1.12.md) — 2026-07-31
 
 census_resolve_geography auto-detects place/state before defaulting to county, fixing wrong-place results (#15) and blank-state ambiguous_name candidates (#18); mcp-ts-core ^0.10.9 → ^0.11.0 maintenance

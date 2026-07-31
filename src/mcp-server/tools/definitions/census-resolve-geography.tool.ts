@@ -10,7 +10,7 @@ import { getGeographyService } from '@/services/geography/geography-service.js';
 export const censusResolveGeography = tool('census_resolve_geography', {
   title: 'Resolve Census Geography',
   description:
-    'Resolve a place name or street address to Census FIPS identifiers (state, county, tract codes). Converts names like "King County, WA" or "Seattle, WA" to the FIPS codes required by census_query_data and census_compare_geographies. Use before querying when you have a place name rather than raw FIPS codes — state_fips maps to parent_fips and fips_summary maps to geography_fips in downstream tools.',
+    'Resolve a place name or street address to Census FIPS identifiers (state, county, place, tract codes). Converts names like "King County, WA" or "Seattle, WA" to the FIPS codes required by census_query_data and census_compare_geographies. Use before querying when you have a place name rather than raw FIPS codes — state_fips maps to parent_fips and fips_summary maps to geography_fips in downstream tools.',
   annotations: { readOnlyHint: true, openWorldHint: false },
   input: z.object({
     name: z
@@ -22,7 +22,7 @@ export const censusResolveGeography = tool('census_resolve_geography', {
       .enum(['state', 'county', 'place', 'tract'])
       .optional()
       .describe(
-        'Expected geography type to resolve to. Optional — auto-detected from the name when omitted (county if "County"/"Borough"/"Parish" appears, state for two-letter abbreviations).',
+        'Geography level to resolve to. Optional — auto-detected when omitted: state for a two-letter abbreviation or a spelled-out state name, county when the name contains "County"/"Borough"/"Parish", tract when it contains "Tract", otherwise place with a fallback to county. Set it explicitly to override — "New York" auto-detects as the state, so New York City needs "place".',
       ),
   }),
   output: z.object({
@@ -44,7 +44,9 @@ export const censusResolveGeography = tool('census_resolve_geography', {
     tract_fips: z
       .string()
       .optional()
-      .describe('6-digit census tract FIPS code when resolved from a street address.'),
+      .describe(
+        '6-digit census tract FIPS code when the resolved geography is a tract — from a street address, or from a tract name.',
+      ),
     place_fips: z
       .string()
       .optional()
@@ -60,16 +62,16 @@ export const censusResolveGeography = tool('census_resolve_geography', {
     {
       reason: 'no_match',
       code: JsonRpcErrorCode.NotFound,
-      when: 'Place name not recognized or no matching geography found.',
+      when: 'Place name not recognized at any geography level tried for it.',
       recovery:
-        'Include the state abbreviation (e.g., "King County, WA"), use a full address, or verify the spelling.',
+        'Check the spelling, set geography_type to search a different level (state, county, place, tract), or pass a full street address.',
     },
     {
       reason: 'ambiguous_name',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Name matched multiple geographies across different states.',
+      when: 'Name matched more than one geography.',
       recovery:
-        'Re-call with a more specific name that includes the state abbreviation or full state name.',
+        'Pick one of the candidates in the error — each carries its state abbreviation and FIPS codes.',
     },
     {
       reason: 'resolution_unavailable',

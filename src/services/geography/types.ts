@@ -3,14 +3,17 @@
  * @module services/geography/types
  */
 
+/** Census geography level a name can resolve to — one TIGERweb layer each. */
+export type GeographyType = 'state' | 'county' | 'place' | 'tract';
+
 /** Resolved geography with FIPS identifiers. */
 export interface ResolvedGeography {
   /** 3-digit county FIPS code (when applicable). */
   countyFips?: string;
   /** Pre-formatted FIPS value ready to pass as geography_fips to census_query_data. */
   fipsSummary: string;
-  /** Geography type (state, county, place, tract). */
-  geographyType: string;
+  /** Geography level the name resolved to. */
+  geographyType: GeographyType;
   /** Canonical name of the resolved geography. */
   name: string;
   /** Place FIPS code (when applicable). */
@@ -25,6 +28,8 @@ export interface ResolvedGeography {
 export interface TigerwebFeature {
   attributes: {
     NAME: string;
+    /** Unqualified name — "Seattle" for NAME "Seattle city", "King" for "King County". */
+    BASENAME?: string;
     STATE: string;
     COUNTY?: string;
     PLACE?: string;

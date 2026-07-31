@@ -183,17 +183,19 @@ Each step is independently testable. Steps 5–6 can be tested without a Census 
 
 ### `census_resolve_geography`
 
-**Description:** Resolve a place name to Census FIPS identifiers (state, county, tract codes). Converts "King County, WA" or "Seattle, WA" to the FIPS codes required by `census_query_data` and `census_compare_geographies`. Also accepts street addresses for tract-level resolution. Returns the FIPS values directly ready to pass to other tools.
+**Description:** Resolve a place name to Census FIPS identifiers (state, county, place, tract codes). Converts "King County, WA" or "Seattle, WA" to the FIPS codes required by `census_query_data` and `census_compare_geographies`. Also accepts street addresses for tract-level resolution. Returns the FIPS values directly ready to pass to other tools.
 
 **Input:**
 - `name: string` — place name (e.g., "King County, WA", "Seattle, WA") or street address (e.g., "1600 Pennsylvania Ave NW, Washington, DC 20500")
-- `geography_type?: string` — expected geography type to resolve to: `"state"`, `"county"`, `"place"`, `"tract"` (default: auto-detect from name)
+- `geography_type?: string` — geography level to resolve to: `"state"`, `"county"`, `"place"`, `"tract"` (default: auto-detect from name)
+
+**Auto-detection:** a two-letter abbreviation or a spelled-out state name (matched against the whole input, so "West Virginia University" is not a state) resolves at the state layer; `"County"`/`"Borough"`/`"Parish"` at the county layer; `"Tract"` at the tract layer. Everything else is tried at the place layer and falls back to county when the place layer has no row. Rows whose name is exactly the queried term win over longer `LIKE` matches, so "Kansas City, MO" resolves to Kansas City rather than North Kansas City. Whatever survives that filter must be a single row to resolve — two or more are distinct real geographies (bare "Boston" matches towns in IN, GA, and MA), so they come back as `ambiguous_name` rather than a coin flip. `"New York"` is a standing ambiguity — it is both the state name and the Census place name for New York City, so auto-detection resolves the state and the city needs `geography_type: "place"`.
 
 **Output:** `{ name, geography_type, state_fips, county_fips?, tract_fips?, place_fips?, fips_summary }`. `fips_summary` is a pre-formatted string ready to use as `geography_fips` in `census_query_data` (e.g., `"033"` for a county, with `state_fips: "53"` as the parent). Always includes `state_fips` — the parent geography required by most sub-state queries.
 
 **Errors:**
-- `no_match` (NotFound) — place name not found. Recovery: try a more specific name (include state abbreviation), use a full address, or try a different spelling.
-- `ambiguous_name` (InvalidParams) — name matches multiple geographies. Response includes a list of candidates with state context — re-call with a more specific name.
+- `no_match` (NotFound) — no layer in the chain had a row for the name. Recovery names the state when the input already carried one; otherwise it asks for a state abbreviation, an explicit `geography_type`, or a full street address.
+- `ambiguous_name` (ValidationError) — more than one geography matched. `candidates[]` carries `{ name, geographyType, stateFips, stateAbbr, countyFips?, tractFips? }` and the recovery hint lists them ready to re-query. Only the state layer returns `STUSAB`, so the abbreviation is derived by reversing the state FIPS table. Tract candidates repeat the same name within a state, so they are separated by county and the hint hands over `county_fips` for `census_query_data` instead of a re-query.
 - `resolution_unavailable` (ServiceUnavailable, retryable) — TIGERweb or geocoder endpoint unreachable. Recovery: retry; both endpoints are free-tier with no auth requirements.
 
 **Annotations:** `readOnlyHint: true`, `openWorldHint: false`

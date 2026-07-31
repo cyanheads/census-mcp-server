@@ -67,10 +67,11 @@ Search Census variables by keyword.
 
 Convert place names and addresses to Census FIPS identifiers.
 
-- Named places (e.g., "King County, WA", "California") resolved via TIGERweb MapServer
+- Named places (e.g., "King County, WA", "Seattle, WA", "California") resolved via TIGERweb MapServer
 - Street addresses resolved to tract level via Census Geocoder
-- Auto-detects geography type from the name; accepts explicit `geography_type` override
-- Detects ambiguous names (multiple states) and returns candidates with recovery hints
+- Auto-detects the geography level — state for an abbreviation or spelled-out state name, county for "County"/"Borough"/"Parish", tract for "Tract", otherwise place falling back to county; `geography_type` overrides it
+- Prefers an exactly-named match, so "Kansas City, MO" does not resolve to North Kansas City
+- Never picks between matches: anything still matching more than one geography comes back as `ambiguous_name` with every candidate and its state abbreviation
 - Returns `state_fips` (→ `parent_fips`) and `fips_summary` (→ `geography_fips`) ready to pass to other tools
 
 ---

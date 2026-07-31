@@ -57,7 +57,7 @@ const DATASETS = [
     datasetId: 'pep/charv',
     name: 'Population Estimates Program',
     description:
-      'Annual population estimates between decennial censuses, including age, sex, race, and Hispanic origin characteristics. Filters on SEX, AGE, HISP, POPGROUP, and YEAR; the first four default to their all-categories total, but YEAR defaults to a single vintage and returns more than one row per geography, so set it explicitly to pin the year. census_list_predicate_values enumerates the codes each dimension takes.',
+      'Annual population estimates between decennial censuses, including age, sex, race, and Hispanic origin characteristics. Filters on SEX, AGE, HISP, POPGROUP, and YEAR; the first four default to their all-categories total, but YEAR defaults to 2020, so set it explicitly to get the year you want. Separate from the filters, 2020 carries two records per geography — an April 1 estimates base and a July 1 estimate — so a query that pins neither returns two rows with different numbers. MONTH is what separates them, and each row carries it: pass predicates {"MONTH": "7"} for the July estimate or "4" for the April base. census_list_predicate_values enumerates the codes each dimension takes.',
     availableYears: [2020, 2021, 2022, 2023],
   },
   {

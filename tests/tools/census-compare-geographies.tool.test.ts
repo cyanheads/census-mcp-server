@@ -15,8 +15,15 @@ vi.mock('@/services/census-api/census-api-service.js', async (importOriginal) =>
 
 vi.mock('@/services/variable-cache/variable-cache-service.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/services/variable-cache/variable-cache-service.js')>()),
-  DATASET_LATEST_YEARS: { 'acs/acs5': 2024, cbp: 2023 },
-  KNOWN_DATASETS: new Set(['acs/acs5', 'acs/acs1', 'acs/acs5/profile', 'dec/pl', 'cbp']),
+  DATASET_LATEST_YEARS: { 'acs/acs5': 2024, cbp: 2023, 'pep/charv': 2023 },
+  KNOWN_DATASETS: new Set([
+    'acs/acs5',
+    'acs/acs1',
+    'acs/acs5/profile',
+    'dec/pl',
+    'cbp',
+    'pep/charv',
+  ]),
   getVariableCacheService: vi.fn(),
 }));
 
@@ -33,6 +40,7 @@ const mockQueryData = vi.fn();
 const mockCheckGeography = vi.fn();
 const mockGetVariablesByCode = vi.fn();
 const mockCheckPredicates = vi.fn();
+const mockGetRecordDimensions = vi.fn();
 
 beforeEach(async () => {
   vi.clearAllMocks();
@@ -52,10 +60,14 @@ beforeEach(async () => {
   vi.mocked(getVariableCacheService).mockReturnValue({
     getVariablesByCode: mockGetVariablesByCode,
     checkPredicates: mockCheckPredicates,
+    getRecordDimensions: mockGetRecordDimensions,
   } as never);
 
   // Default: the dataset declares no filter dimensions, so nothing is unset or unknown.
   mockCheckPredicates.mockResolvedValue({ unset: [], unknown: [] });
+
+  // Default: the dataset publishes one row per geography, so nothing separates records.
+  mockGetRecordDimensions.mockResolvedValue([]);
 
   // Default: label enrichment best-effort (returns nothing — codes used as labels)
   mockGetVariablesByCode.mockResolvedValue([]);
@@ -720,6 +732,7 @@ describe('censusCompareGeographies', () => {
     vi.mocked(getVariableCacheService).mockReturnValue({
       getVariablesByCode: vi.fn().mockRejectedValue(new Error('cache cold')),
       checkPredicates: mockCheckPredicates,
+      getRecordDimensions: mockGetRecordDimensions,
     } as never);
 
     mockQueryData.mockResolvedValue([
@@ -1130,5 +1143,158 @@ describe('censusCompareGeographies — applied filter defaults', () => {
     const blocks = censusCompareGeographies.format!(output);
     const text = (blocks[0] as { type: string; text: string }).text;
     expect(text).toContain('NAICS2017 = Total for all sectors');
+  });
+});
+
+/**
+ * A rank is a statement about one geography. When `pep/charv` returns its April base and its July
+ * estimate and neither is pinned, every geography occupies two ranks with two different values —
+ * a ranking that cannot be read correctly however the rows are labelled.
+ */
+describe('censusCompareGeographies — datasets that publish several records per geography', () => {
+  const duplicated = [
+    {
+      geographyName: 'Washington',
+      geographyFips: '53',
+      geographyGeoid: '53',
+      variables: { POP: { estimate: 7705267, label: 'POP', suppressed: false } },
+      record: { MONTH: { code: '4', label: 'April' } },
+    },
+    {
+      geographyName: 'Washington',
+      geographyFips: '53',
+      geographyGeoid: '53',
+      variables: { POP: { estimate: 7724566, label: 'POP', suppressed: false } },
+      record: { MONTH: { code: '7', label: 'July' } },
+    },
+    {
+      geographyName: 'Oregon',
+      geographyFips: '41',
+      geographyGeoid: '41',
+      variables: { POP: { estimate: 4241500, label: 'POP', suppressed: false } },
+      record: { MONTH: { code: '4', label: 'April' } },
+    },
+    {
+      geographyName: 'Oregon',
+      geographyFips: '41',
+      geographyGeoid: '41',
+      variables: { POP: { estimate: 4237256, label: 'POP', suppressed: false } },
+      record: { MONTH: { code: '7', label: 'July' } },
+    },
+  ];
+
+  const charvInput = (overrides: Record<string, unknown> = {}) =>
+    censusCompareGeographies.input.parse({
+      variables: ['POP'],
+      geography_level: 'state',
+      dataset: 'pep/charv',
+      ...overrides,
+    });
+
+  beforeEach(() => {
+    mockGetRecordDimensions.mockResolvedValue([
+      { code: 'MONTH', label: 'Vintage Month', labelAttribute: 'MONTH_DESC' },
+    ]);
+  });
+
+  it('refuses to rank when each geography came back more than once', async () => {
+    mockQueryData.mockResolvedValue(duplicated);
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    await expect(censusCompareGeographies.handler(charvInput(), ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'ambiguous_rows', rowsPerGeography: 2 },
+    });
+  });
+
+  it('names the column that separates the records and the value that pins one', async () => {
+    mockQueryData.mockResolvedValue(duplicated);
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const error = await censusCompareGeographies
+      .handler(charvInput(), ctx)
+      .catch((err: { data: { recovery: { hint: string } } }) => err);
+    const hint = (error as { data: { recovery: { hint: string } } }).data.recovery.hint;
+
+    expect(hint).toContain('MONTH');
+    expect(hint).toContain('"4" (April)');
+    expect(hint).toContain('{"MONTH": "7"}');
+  });
+
+  it('ranks each geography once when the record is pinned', async () => {
+    mockQueryData.mockResolvedValue(duplicated.filter((row) => row.record.MONTH.code === '7'));
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const result = await censusCompareGeographies.handler(
+      charvInput({ predicates: { MONTH: '7' } }),
+      ctx,
+    );
+
+    expect(result.rows.map((row) => row.geography_geoid)).toEqual(['53', '41']);
+    expect(result.rows[0]?.record).toEqual({ MONTH: { code: '7', label: 'July' } });
+    expect(new Set(result.rows.map((row) => row.geography_geoid)).size).toBe(result.rows.length);
+    // Without the record columns on the request the rows come back unlabelled, and the refusal
+    // above degrades to naming nothing the caller can pin.
+    expect(mockQueryData).toHaveBeenCalledWith(
+      expect.objectContaining({ recordColumns: { MONTH: 'MONTH_DESC' } }),
+      expect.anything(),
+    );
+  });
+
+  /**
+   * A pinned ranking is a ranking of one record, and the row it came from is the only thing that
+   * says which. Clients that read content[] rather than structuredContent see the rendered text
+   * alone, so a heading without the record is a rank whose provenance is missing there.
+   */
+  it('format names the record the ranking is over', () => {
+    const blocks = censusCompareGeographies.format!({
+      rows: [
+        {
+          geography_name: 'Washington',
+          geography_fips: '53',
+          geography_geoid: '53',
+          variables: { POP: { estimate: 7724566, label: 'POP', suppressed: false } },
+          record: { MONTH: { code: '7', label: 'July' } },
+          rank: 1,
+        },
+      ],
+    });
+    const text = (blocks[0] as { type: string; text: string }).text;
+
+    expect(text).toContain('1. Washington — MONTH 7 (July)');
+  });
+
+  /**
+   * The guard keys on the GEOID, which is what makes a row unique nationally. Keying on the bare
+   * level code would read two same-numbered counties in different states as one duplicated
+   * geography and fail a legitimate nationwide comparison.
+   */
+  it('does not mistake the same level code in two states for a duplicate', async () => {
+    mockGetRecordDimensions.mockResolvedValue([]);
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'King County, Washington',
+        geographyFips: '033',
+        geographyGeoid: '53033',
+        variables: { B19013_001E: { estimate: 105000, label: 'Income', suppressed: false } },
+      },
+      {
+        geographyName: 'Cook County, Illinois',
+        geographyFips: '033',
+        geographyGeoid: '17033',
+        variables: { B19013_001E: { estimate: 78000, label: 'Income', suppressed: false } },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const result = await censusCompareGeographies.handler(
+      censusCompareGeographies.input.parse({
+        variables: ['B19013_001E'],
+        geography_level: 'county',
+      }),
+      ctx,
+    );
+
+    expect(result.rows).toHaveLength(2);
   });
 });

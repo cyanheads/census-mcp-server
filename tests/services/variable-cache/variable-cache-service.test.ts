@@ -396,6 +396,137 @@ describe('VariableCacheService — filter dimension metadata', () => {
   });
 });
 
+/**
+ * A trimmed pep/charv variables.json carrying the two shapes #27 turns on: MONTH is not required
+ * and publishes MONTH_DESC, so it labels which record a row is; YEAR is required and publishes no
+ * attribute at all, so naming it in `get=` enumerates every vintage instead of echoing one.
+ */
+const charvRecordVariablesJson = {
+  variables: {
+    POP: {
+      label: 'Population Estimate',
+      concept: 'Population Estimates',
+      predicateType: 'int',
+      group: 'PEP_ALLDATA',
+    },
+    MEDAGE: {
+      label: 'Median Age',
+      concept: 'Population Estimates',
+      predicateType: 'float',
+      group: 'PEP_ALLDATA',
+    },
+    MONTH: {
+      label: 'Vintage Month',
+      predicateType: 'string',
+      attributes: 'MONTH_DESC',
+      group: 'PEP_ALLDATA',
+    },
+    UNIVERSE: {
+      label: 'Universe',
+      predicateType: 'string',
+      attributes: 'UNIVERSE_DESC',
+      group: 'PEP_ALLDATA',
+    },
+    YEAR: {
+      label: 'Vintage Year',
+      required: 'default displayed',
+      predicateType: 'string',
+      group: 'PEP_ALLDATA',
+    },
+    POPGROUP: {
+      label: 'Population Group',
+      required: 'default displayed',
+      predicateType: 'string',
+      attributes: 'POPGROUP_LABEL',
+      group: 'PEP_ALLDATA',
+    },
+    SUMLEVEL: { label: 'Summary Level code', predicateType: 'string', group: 'N/A' },
+  },
+};
+
+describe('VariableCacheService.getRecordDimensions', () => {
+  /**
+   * `pep/charv` returns an April estimates-base row and a July estimate row for one geography.
+   * MONTH is what separates them; a query that does not request it gets two rows that differ only
+   * in the number.
+   *
+   * The dimensions the dataset marks required are excluded even when they publish a label
+   * attribute of their own. Those are not what splits the rows — the API applies one default to
+   * them — and naming a required dimension's bare code in `get=` flips it from applying that
+   * default to enumerating every category of it, which is thousands of rows for one geography.
+   */
+  it('finds the column that separates records and leaves the defaulted dimensions alone', async () => {
+    queue(charvRecordVariablesJson);
+
+    const dimensions = await service.getRecordDimensions('pep/charv', 2023, createMockContext());
+
+    expect(dimensions).toEqual([
+      { code: 'MONTH', label: 'Vintage Month', labelAttribute: 'MONTH_DESC' },
+      { code: 'UNIVERSE', label: 'Universe', labelAttribute: 'UNIVERSE_DESC' },
+    ]);
+  });
+
+  it('finds none on a dataset that returns one row per geography', async () => {
+    queue(cbpVariablesJson);
+
+    const dimensions = await service.getRecordDimensions('cbp', 2023, createMockContext());
+
+    expect(dimensions).toEqual([]);
+  });
+});
+
+describe('VariableCacheService.findPublicationProbe', () => {
+  /**
+   * A wildcard group-by only reads the data file when a measure is in `get=`, and how many codes
+   * come back depends on which table that measure belongs to: on dec/ddhca the total-population
+   * table publishes far more population groups than the sex-by-age tables do. The coarsest table
+   * gives the widest set, and cell count is what identifies it.
+   */
+  it('picks a measure from the coarsest table', async () => {
+    queue({
+      variables: {
+        T01001_001N: { label: 'Total', predicateType: 'int', group: 'T01001' },
+        T02003_001N: { label: 'Total', predicateType: 'int', group: 'T02003' },
+        T02003_002N: { label: 'Male', predicateType: 'int', group: 'T02003' },
+        T02003_003N: { label: 'Female', predicateType: 'int', group: 'T02003' },
+        POPGROUP: {
+          label: 'Race/Ethnic Group',
+          required: 'default displayed',
+          predicateType: 'string',
+          group: 'T01001,T02003',
+        },
+        SUMLEVEL: { label: 'Summary Level code', predicateType: 'string', group: 'N/A' },
+      },
+    });
+
+    const probe = await service.findPublicationProbe('dec/ddhca', 2020, createMockContext());
+
+    expect(probe).toBe('T01001_001N');
+  });
+
+  /**
+   * Geography and metadata columns are answerable from the dataset's own dictionary, so naming
+   * one leaves the wildcard reporting every declared code as if the dataset published it.
+   */
+  it('finds no probe when the dataset publishes no measure column', async () => {
+    queue({
+      variables: {
+        SUMLEVEL: { label: 'Summary Level code', predicateType: 'string', group: 'N/A' },
+        NAICS2002: {
+          label: 'NAICS code',
+          required: 'default displayed',
+          predicateType: 'string',
+          group: 'N/A',
+        },
+      },
+    });
+
+    const probe = await service.findPublicationProbe('nonemp', 2007, createMockContext());
+
+    expect(probe).toBeUndefined();
+  });
+});
+
 describe('describeUnsetPredicates', () => {
   it('names each dimension with its label and says the API supplied the default', () => {
     const text = describeUnsetPredicates(
@@ -469,8 +600,9 @@ describe('describeUnsetPredicates', () => {
   });
 
   /**
-   * Only some defaults are an all-categories total. `pep/charv` defaults `YEAR` to 2020 and
-   * returns a row per matching combination, so a blanket "this is the total" would misreport it.
+   * Only some defaults are an all-categories total. `pep/charv` defaults `YEAR` to 2020, so a
+   * blanket "this is the total" would misreport it. Several rows for one geography is a separate
+   * matter with its own wording — this warning stays about what a default covers.
    */
   it('does not claim the values are a total across every category', () => {
     const text = describeUnsetPredicates(
@@ -481,7 +613,6 @@ describe('describeUnsetPredicates', () => {
 
     expect(text).not.toMatch(/total across all categories/);
     expect(text).toContain('one ordinary category on others');
-    expect(text).toContain('more than one row');
   });
 
   /**

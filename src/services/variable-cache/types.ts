@@ -11,6 +11,13 @@ export interface CensusVariable {
   concept: string;
   /** Corresponding estimate variable code when this is a MOE variable. */
   estimateCode?: string;
+  /**
+   * Table the variable belongs to, as variables.json names it (e.g. "T01001" on `dec/ddhca`,
+   * "CB2300CBP" on `cbp`), or `"N/A"` for the geography and metadata columns that belong to no
+   * table. Which table a query reads decides how many of a dimension's codes come back, so this
+   * is what picks the probe variable in `findPublicationProbe`.
+   */
+  group?: string;
   /** Human-readable label (e.g., "Estimate!!Median household income in the past 12 months"). */
   label: string;
   /**
@@ -43,6 +50,24 @@ export interface UnsetPredicate {
   label: string;
   /** Attribute column that echoes back the label of the default the API applied, when published. */
   labelAttribute?: string;
+}
+
+/**
+ * A column that separates several records for one geography. Unlike a filter dimension the
+ * dataset marks required, the Census API neither defaults it nor rejects a query that omits it:
+ * it simply returns every record. `pep/charv` publishes one record per reference date, so a
+ * query that pins no date gets an April estimates-base row and a July estimate row for the same
+ * geography, carrying different numbers and nothing else to tell them apart.
+ *
+ * Recognized from variables.json rather than a per-dataset list: a variable the dataset does not
+ * mark required, that carries its own `_LABEL` or `_DESC` attribute, is a labelled category the
+ * rows vary over. Requesting it echoes each row's own value without changing which rows come back.
+ */
+export interface RecordDimension {
+  code: string;
+  label: string;
+  /** Attribute column carrying the human-readable value for this row (e.g. "MONTH_DESC"). */
+  labelAttribute: string;
 }
 
 /** Outcome of checking a caller's predicate map against a dataset's own variables.json. */

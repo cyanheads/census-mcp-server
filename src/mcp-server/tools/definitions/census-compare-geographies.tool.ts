@@ -6,20 +6,26 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getDiscoveryConfig } from '@/config/server-config.js';
-import { getCensusApiService, padFips } from '@/services/census-api/census-api-service.js';
+import {
+  getCensusApiService,
+  observeRecordValues,
+  padFips,
+} from '@/services/census-api/census-api-service.js';
 import {
   DATASET_LATEST_YEARS,
   defaultLabelColumnsFor,
+  describeAmbiguousRows,
   describeEmptyPredicatedResult,
   describeUnsetPredicates,
   getVariableCacheService,
   KNOWN_DATASETS,
+  recordLabelColumnsFor,
 } from '@/services/variable-cache/variable-cache-service.js';
 
 export const censusCompareGeographies = tool('census_compare_geographies', {
   title: 'Compare Census Geographies',
   description:
-    'Compare one or more variables across multiple geographies at the same level — all counties in a state, all states nationally, or a named set of specific geographies. Results are sorted and ranked. Covers queries like "rank states by poverty rate", "compare median income across WA counties", or "which census tracts in King County have the highest renter rate." Omit within to compare all geographies nationally at the level. Suppressed values are decoded to human-readable labels rather than passed through as raw negative sentinels. On the business datasets (cbp, ecnbasic, nonemp), pep/charv, and dec/ddhca, use predicates to rank within one industry, size class, or population group — a comparison that omits one ranks on a default the Census API picks, which is an all-categories total on some dimensions and a single category on others. Each row names the defaults that were applied in applied_filters, and census_list_predicate_values enumerates the codes a dimension accepts.',
+    'Compare one or more variables across multiple geographies at the same level — all counties in a state, all states nationally, or a named set of specific geographies. Results are sorted and ranked. Covers queries like "rank states by poverty rate", "compare median income across WA counties", or "which census tracts in King County have the highest renter rate." Omit within to compare all geographies nationally at the level. Suppressed values are decoded to human-readable labels rather than passed through as raw negative sentinels. On the business datasets (cbp, ecnbasic, nonemp), pep/charv, and dec/ddhca, use predicates to rank within one industry, size class, or population group — a comparison that omits one ranks on a default the Census API picks, which is an all-categories total on some dimensions and a single category on others. Each row names the defaults that were applied in applied_filters, and census_list_predicate_values enumerates the codes a dimension accepts. A dataset that publishes several records per geography cannot be ranked until one is pinned: pep/charv publishes an April estimates base and a July estimate, so a comparison that pins neither fails with ambiguous_rows rather than giving every geography two ranks — pass predicates {"MONTH": "7"} for the July estimate.',
   annotations: { readOnlyHint: true, openWorldHint: false },
   input: z.object({
     variables: z
@@ -124,6 +130,13 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
               .describe(
                 'Filter dimensions the comparison left unset, mapped to the label of the default the Census API applied (e.g. {"POPGROUP": "European alone"}). Present only on datasets that declare filter dimensions. The label is what tells an all-categories total apart from one ordinary category, so a ranking whose rows carry "European alone" ranks that group rather than total population. Set the dimension in predicates to choose it yourself.',
               ),
+            record: z
+              .object({})
+              .passthrough()
+              .optional()
+              .describe(
+                'Which record the ranking is over, for a dataset that publishes more than one per geography — keyed by the column that separates them, each value carrying a code and a label (e.g. {"MONTH": {"code": "7", "label": "July"}}). Present on every row whenever the dataset publishes such a column, whether predicates pinned it or another predicate narrowed the result to one record per geography. A comparison that would put each geography on several rows fails with ambiguous_rows instead of ranking it, so a ranking that returned at all is a ranking of the single record named here. Absent on the datasets that publish one record per geography.',
+              ),
             rank: z
               .number()
               .describe(
@@ -201,6 +214,13 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
       when: 'A key in predicates is not a variable in this dataset and year.',
       recovery:
         'Remove the unrecognized key. Call census_search_variables on this dataset and year for the codes it does define — predicate names are vintage-specific, so NAICS2017 and NAICS2022 belong to different years.',
+    },
+    {
+      reason: 'ambiguous_rows',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The dataset publishes several records per geography and the comparison pinned none of them, so every geography would occupy several ranks with different values.',
+      recovery:
+        'Add the record column named in the error to predicates to pin one record — on pep/charv that is MONTH, where "7" selects the July estimate and "4" the April estimates base. census_query_data returns every record for a single geography if you need to see them first.',
     },
     {
       reason: 'no_data',
@@ -352,6 +372,11 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
     const unfiltered = predicateCheck.unset;
     const defaultLabelColumns = defaultLabelColumnsFor(unfiltered);
 
+    // A dataset that publishes several records per geography answers with one row each. The
+    // columns that separate them are requested so an ambiguous ranking can name what to pin.
+    const recordDimensions = await variableCacheService.getRecordDimensions(dataset, year, ctx);
+    const recordColumns = recordLabelColumnsFor(recordDimensions);
+
     // Fetch variable labels for enrichment (best-effort)
     const variableLabels: Map<string, string> = new Map();
     try {
@@ -377,6 +402,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
         ...(countyFips !== undefined && { countyFips }),
         ...(Object.keys(predicates).length > 0 && { predicates }),
         ...(Object.keys(defaultLabelColumns).length > 0 && { defaultLabelColumns }),
+        ...(Object.keys(recordColumns).length > 0 && { recordColumns }),
         dataset,
         year,
       },
@@ -406,6 +432,31 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
           year,
           geographyLevel: input.geography_level,
           recovery: { hint },
+        },
+      );
+    }
+
+    // A rank is a statement about one geography. When the dataset publishes several records per
+    // geography and the query pinned none, every geography occupies several ranks with several
+    // different values — a ranking that cannot be read correctly, whatever the rows are labelled
+    // with. Refusing it and naming what to pin is the only answer that is not misleading.
+    const rowsPerGeography = new Map<string, number>();
+    for (const row of rows) {
+      rowsPerGeography.set(row.geographyGeoid, (rowsPerGeography.get(row.geographyGeoid) ?? 0) + 1);
+    }
+    const maxRowsPerGeography = Math.max(...rowsPerGeography.values());
+    if (maxRowsPerGeography > 1) {
+      const observed = observeRecordValues(rows);
+      throw ctx.fail(
+        'ambiguous_rows',
+        `${dataset} (${year}) returned ${maxRowsPerGeography} rows for each ${input.geography_level}, so a ranking would list every one of them more than once with different values.`,
+        {
+          dataset,
+          year,
+          geographyLevel: input.geography_level,
+          rowsPerGeography: maxRowsPerGeography,
+          recordValues: observed,
+          recovery: { hint: describeAmbiguousRows(dataset, year, maxRowsPerGeography, observed) },
         },
       );
     }
@@ -496,6 +547,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
         geography_geoid: row.geographyGeoid,
         variables: enrichedVariables,
         ...(row.appliedFilters && { applied_filters: row.appliedFilters }),
+        ...(row.record && { record: row.record }),
         rank: idx + 1,
       };
     });
@@ -535,7 +587,17 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
     const lines: string[] = [`## Geography Comparison\n`];
 
     for (const row of result.rows) {
-      lines.push(`### ${row.rank}. ${row.geography_name}`);
+      const record = Object.entries(row.record ?? {}) as Array<
+        [string, { code: string; label: string }]
+      >;
+      // A ranking on a dataset that publishes several records per geography is a ranking of one
+      // of them. Without the record on the heading, content[] readers see a bare rank and cannot
+      // tell which record the numbers came from.
+      const recordSuffix =
+        record.length > 0
+          ? ` — ${record.map(([code, value]) => `${code} ${value.code} (${value.label})`).join(' · ')}`
+          : '';
+      lines.push(`### ${row.rank}. ${row.geography_name}${recordSuffix}`);
       lines.push(`**FIPS:** \`${row.geography_fips}\` · **GEOID:** \`${row.geography_geoid}\``);
       for (const [code, rawVal] of Object.entries(row.variables)) {
         const val = rawVal as {

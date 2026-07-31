@@ -8,7 +8,13 @@ import type { Context } from '@cyanheads/mcp-ts-core';
 import { notFound, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import { fetchWithTimeout, type RequestContext, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getDiscoveryConfig } from '@/config/server-config.js';
-import type { CensusVariable, PredicateCheck, RawVariablesJson, UnsetPredicate } from './types.js';
+import type {
+  CensusVariable,
+  PredicateCheck,
+  RawVariablesJson,
+  RecordDimension,
+  UnsetPredicate,
+} from './types.js';
 
 const CENSUS_API_BASE = 'https://api.census.gov/data';
 
@@ -80,6 +86,78 @@ export function defaultLabelColumnsFor(unset: UnsetPredicate[]): Record<string, 
   );
 }
 
+/** Map each record dimension to the attribute column carrying its per-row label. */
+export function recordLabelColumnsFor(dimensions: RecordDimension[]): Record<string, string> {
+  return Object.fromEntries(dimensions.map((d) => [d.code, d.labelAttribute]));
+}
+
+/**
+ * The record columns that actually split the response, with the predicate a caller pins one with.
+ * A column that took a single value labelled the rows without separating them, so naming it as a
+ * cause would send the caller to a predicate that changes nothing. Returns `undefined` when no
+ * column took more than one value, which is the caller's cue that the split is unexplained.
+ */
+function splittingRecordColumns(
+  observed: Record<string, Array<{ code: string; label: string }>>,
+):
+  | { entries: Array<[string, Array<{ code: string; label: string }>]>; example: string }
+  | undefined {
+  const entries = Object.entries(observed).filter(([, values]) => values.length > 1);
+  const first = entries[0];
+  if (!first) return;
+  return { entries, example: `{"${first[0]}": "${first[1].at(-1)?.code ?? ''}"}` };
+}
+
+/**
+ * Word the warning that one geography came back on several rows. Each is a separate record the
+ * dataset publishes, not a repeat of the same number, so reading either one as "the" answer picks
+ * a record the query never asked for. The values observed in the response are what a caller pins
+ * the record with.
+ */
+export function describeRecordRows(
+  dataset: string,
+  year: number,
+  rowsPerGeography: number,
+  observed: Record<string, Array<{ code: string; label: string }>>,
+): string {
+  const splitting = splittingRecordColumns(observed);
+  if (!splitting) {
+    return `${dataset} (${year}) returned ${rowsPerGeography} rows for a single geography and nothing in the response separates them. Set the dataset's filter dimensions explicitly in predicates to pin one — census_list_predicate_values enumerates the codes each one accepts.`;
+  }
+  const named = splitting.entries
+    .map(
+      ([code, values]) =>
+        `${code} separates them, taking ${values.map((v) => `"${v.code}" (${v.label})`).join(' and ')}`,
+    )
+    .join('; ');
+  return `Each geography came back on ${rowsPerGeography} rows, one per record ${dataset} (${year}) publishes for it, and the record field on each row says which: ${named}. The numbers differ between them, so pick the record you want rather than the first row — add it to predicates, e.g. ${splitting.example}.`;
+}
+
+/**
+ * Word the failure that a comparison came back with several rows per geography. A rank is a
+ * statement about one geography, so a ranking that lists the same one twice with two different
+ * numbers is wrong however the rows are labelled — the fix is to pin the record, and the values
+ * observed in the response are what the caller pins it to.
+ */
+export function describeAmbiguousRows(
+  dataset: string,
+  year: number,
+  rowsPerGeography: number,
+  observed: Record<string, Array<{ code: string; label: string }>>,
+): string {
+  const splitting = splittingRecordColumns(observed);
+  if (!splitting) {
+    return `${dataset} (${year}) returned ${rowsPerGeography} rows for a single geography, so a rank cannot identify which one it refers to. Set the dataset's filter dimensions explicitly in predicates — census_list_predicate_values enumerates the codes each one accepts — or query one geography at a time with census_query_data.`;
+  }
+  const named = splitting.entries
+    .map(
+      ([code, values]) =>
+        `${code} took ${values.map((v) => `"${v.code}" (${v.label})`).join(' and ')}`,
+    )
+    .join('; ');
+  return `${dataset} (${year}) publishes several records per geography and this comparison pinned none of them, so every geography came back on ${rowsPerGeography} rows with different values: ${named}. Add the one you want to predicates, e.g. ${splitting.example}. census_query_data returns every record for a single geography, each labelled, if you want to see them side by side first.`;
+}
+
 /**
  * Word the warning that a query left filter dimensions unset. Both data tools share it so the
  * two cannot drift into warning about the same silent default with different force.
@@ -113,7 +191,7 @@ export function describeUnsetPredicates(
     Object.keys(applied).length > 0
       ? ' The labels quoted above are repeated on every row under applied_filters, and reading them is what separates a value that is a total from one that is not: a default is the all-categories total on some dimensions and one ordinary category on others.'
       : ' A default is the all-categories total on some dimensions and one ordinary category on others, and nothing in the response says which this one is.';
-  return `${dataset} (${year}) filters on dimensions this query left unset: ${named}. The Census API applied its own default to each rather than rejecting the query.${echo} One geography can also come back on more than one row. Set a dimension explicitly to control what the numbers cover, e.g. {"${example}": "<code>"}; census_list_predicate_values enumerates the codes each one accepts.`;
+  return `${dataset} (${year}) filters on dimensions this query left unset: ${named}. The Census API applied its own default to each rather than rejecting the query.${echo} Set a dimension explicitly to control what the numbers cover, e.g. {"${example}": "<code>"}; census_list_predicate_values enumerates the codes each one accepts.`;
 }
 
 /**
@@ -285,6 +363,54 @@ export class VariableCacheService {
       .sort((a, b) => a.code.localeCompare(b.code));
   }
 
+  /**
+   * Columns a geography's rows vary over that the dataset does not mark required — the reason
+   * one geography can come back on more than one row. See `RecordDimension` for how they are
+   * recognized and why the shape is read off variables.json instead of a per-dataset list.
+   */
+  async getRecordDimensions(
+    dataset: string,
+    year: number,
+    ctx: Context,
+  ): Promise<RecordDimension[]> {
+    const variables = await this.getVariables(dataset, year, ctx);
+    return [...variables.values()]
+      .filter((v) => !v.required && v.labelAttribute)
+      .map((v) => ({ code: v.code, label: v.label, labelAttribute: v.labelAttribute as string }))
+      .sort((a, b) => a.code.localeCompare(b.code));
+  }
+
+  /**
+   * Pick the measure variable to probe with when checking which of a dimension's codes the
+   * dataset actually publishes rows for.
+   *
+   * A wildcard group-by answers from the dataset's published value map when every requested
+   * column can be served from metadata, and only reads the data file when a measure is among
+   * them — so which measure is requested decides the answer. Coverage is per table and nests:
+   * on `dec/ddhca` the total-population table publishes 2,996 population groups where the
+   * 23-category sex-by-age table publishes 551 of the same ones. The coarsest table therefore
+   * gives the widest set, and cell count is what says which table is coarsest.
+   */
+  async findPublicationProbe(
+    dataset: string,
+    year: number,
+    ctx: Context,
+  ): Promise<string | undefined> {
+    const variables = await this.getVariables(dataset, year, ctx);
+    const tables = new Map<string, string[]>();
+    for (const v of variables.values()) {
+      // Geography and metadata columns carry `group: "N/A"` and measure nothing.
+      if (v.required || v.predicateType !== 'int' || !v.group || v.group === 'N/A') continue;
+      const members = tables.get(v.group) ?? [];
+      members.push(v.code);
+      tables.set(v.group, members);
+    }
+    const coarsest = [...tables.entries()].sort(
+      ([aName, aVars], [bName, bVars]) => aVars.length - bVars.length || aName.localeCompare(bName),
+    )[0];
+    return coarsest?.[1].sort()[0];
+  }
+
   /** Validate that a dataset code is known. */
   validateDataset(dataset: string): void {
     if (!KNOWN_DATASETS.has(dataset)) {
@@ -375,6 +501,7 @@ export class VariableCacheService {
       if (entry.universe) variable.universe = entry.universe;
       if (entry.required != null) variable.required = true;
       if (entry.values?.item) variable.values = entry.values.item;
+      if (entry.group) variable.group = entry.group;
 
       // `attributes` is a comma-separated list mixing flag columns with the label column
       // (e.g. "NAICS2017_F,NAICS2017_LABEL,NAICS2017_F") — only the label one is useful here.

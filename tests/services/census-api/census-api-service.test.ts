@@ -10,6 +10,7 @@ import {
   CensusApiService,
   getCensusApiService,
   initCensusApiService,
+  observeRecordValues,
   padFips,
 } from '@/services/census-api/census-api-service.js';
 
@@ -284,6 +285,116 @@ describe('CensusApiService.parseResponse — GEOID composition', () => {
     expect(rows[0]?.variables.B19013_001E?.suppressed).toBe(true);
     expect(rows[0]?.variables.B19013_001E?.estimate).toBeNull();
     expect(rows[0]?.variables.B19013_001E?.suppressionReason).toContain('Not available');
+  });
+});
+
+describe('CensusApiService.queryData — record columns', () => {
+  /**
+   * `pep/charv` publishes an April estimates base and a July estimate for every geography, so a
+   * query answers with two rows carrying different numbers. Requesting MONTH and its `_DESC` is
+   * what lets a caller tell which row is which; without them the two are identical apart from
+   * the value.
+   */
+  it('labels each row with the record it came from', async () => {
+    queue([
+      ['NAME', 'POP', 'MONTH', 'MONTH_DESC', 'state'],
+      ['Washington', '7705267', '4', 'April', '53'],
+      ['Washington', '7724566', '7', 'July', '53'],
+    ]);
+
+    const rows = await service.queryData(
+      {
+        variables: ['POP'],
+        geographyLevel: 'state',
+        geographyFips: '53',
+        recordColumns: { MONTH: 'MONTH_DESC' },
+        dataset: 'pep/charv',
+        year: 2023,
+      },
+      createMockContext(),
+    );
+
+    expect(rows).toHaveLength(2);
+    expect(rows[0]?.record).toEqual({ MONTH: { code: '4', label: 'April' } });
+    expect(rows[1]?.record).toEqual({ MONTH: { code: '7', label: 'July' } });
+    expect(rows[0]?.variables.POP?.estimate).toBe(7705267);
+    expect(rows[1]?.variables.POP?.estimate).toBe(7724566);
+    const getClause = requestedUrls[0]?.match(/[?&]get=([^&]*)/)?.[1] ?? '';
+    expect(decodeURIComponent(getClause)).toBe('NAME,POP,MONTH,MONTH_DESC');
+  });
+
+  /**
+   * The GEOID is composed from whatever columns are left once the requested ones are excluded, so
+   * a record column that is not excluded gets concatenated into it — "534" instead of "53", which
+   * then fails every downstream round-trip.
+   */
+  it('keeps record columns out of the composed GEOID', async () => {
+    queue([
+      ['NAME', 'POP', 'MONTH', 'MONTH_DESC', 'state', 'county'],
+      ['Adams County, Washington', '20609', '4', 'April', '53', '001'],
+    ]);
+
+    const rows = await service.queryData(
+      {
+        variables: ['POP'],
+        geographyLevel: 'county',
+        geographyFips: '*',
+        parentFips: '53',
+        recordColumns: { MONTH: 'MONTH_DESC' },
+        dataset: 'pep/charv',
+        year: 2023,
+      },
+      createMockContext(),
+    );
+
+    expect(rows[0]?.geographyGeoid).toBe('53001');
+    expect(rows[0]?.geographyFips).toBe('001');
+  });
+
+  it('carries no record on a dataset that returns one row per geography', async () => {
+    queue([
+      ['NAME', 'B19013_001E', 'state'],
+      ['Washington', '94605', '53'],
+    ]);
+
+    const rows = await query('state');
+
+    expect(rows[0]?.record).toBeUndefined();
+  });
+});
+
+describe('observeRecordValues', () => {
+  /**
+   * A column that took one value across the response separated nothing; only the ones that took
+   * several explain why a geography came back more than once, and their codes are what a caller
+   * pins the record with.
+   */
+  it('collects the distinct values each record column took', () => {
+    const observed = observeRecordValues([
+      {
+        geographyName: 'Washington',
+        geographyFips: '53',
+        geographyGeoid: '53',
+        variables: {},
+        record: { MONTH: { code: '7', label: 'July' }, UNIVERSE: { code: 'R', label: 'Resident' } },
+      },
+      {
+        geographyName: 'Washington',
+        geographyFips: '53',
+        geographyGeoid: '53',
+        variables: {},
+        record: {
+          MONTH: { code: '4', label: 'April' },
+          UNIVERSE: { code: 'R', label: 'Resident' },
+        },
+      },
+    ]);
+
+    expect(observed.MONTH).toEqual([
+      { code: '4', label: 'April' },
+      { code: '7', label: 'July' },
+    ]);
+    expect(observed.UNIVERSE).toEqual([{ code: 'R', label: 'Resident' }]);
   });
 });
 
@@ -656,6 +767,56 @@ describe('CensusApiService.fetchPredicateValues', () => {
     ]);
     expect(requestedUrls[0]).toContain('EMPSZES=*');
     expect(requestedUrls[0]).toContain('get=EMPSZES_LABEL');
+  });
+
+  /**
+   * A dimension's own label column is answerable from the dataset's published value map, so a
+   * label-only wildcard on dec/ddhca reports all 5,543 declared POPGROUP codes. Naming a measure
+   * instead forces the read against the data file, which answers with the ones it publishes.
+   */
+  it('requests the measure in place of the label column when one is given', async () => {
+    queue([
+      ['T01001_001N', 'POPGROUP', 'us'],
+      ['9653100', '1002', '1'],
+    ]);
+
+    await expect(
+      enumerate({
+        dataset: 'dec/ddhca',
+        year: 2020,
+        code: 'POPGROUP',
+        labelAttribute: 'POPGROUP_LABEL',
+        measure: 'T01001_001N',
+      }),
+    ).resolves.toEqual([{ code: '1002', label: '1002' }]);
+    expect(requestedUrls[0]).toContain('get=T01001_001N');
+    expect(requestedUrls[0]).not.toContain('POPGROUP_LABEL');
+  });
+
+  /**
+   * The checked and unchecked answers to the same dimension are different lists, so sharing one
+   * cache slot would serve whichever ran first to both callers.
+   */
+  it('caches the measure-backed enumeration separately from the label-backed one', async () => {
+    queue(
+      [
+        ['POPGROUP_LABEL', 'POPGROUP', 'us'],
+        ['Total population', '001', '1'],
+        ['European alone', '1002', '1'],
+      ],
+      [
+        ['T01001_001N', 'POPGROUP', 'us'],
+        ['9653100', '1002', '1'],
+      ],
+    );
+
+    const base = { dataset: 'dec/ddhca', year: 2020, code: 'POPGROUP' };
+    const declared = await enumerate({ ...base, labelAttribute: 'POPGROUP_LABEL' });
+    const published = await enumerate({ ...base, measure: 'T01001_001N' });
+
+    expect(declared.map((v) => v.code)).toEqual(['001', '1002']);
+    expect(published.map((v) => v.code)).toEqual(['1002']);
+    expect(requestedUrls).toHaveLength(2);
   });
 
   /** A wildcarded dimension repeats each code once per combination of the others. */

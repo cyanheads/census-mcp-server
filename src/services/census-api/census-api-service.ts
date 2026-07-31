@@ -35,6 +35,32 @@ export function padFips(value: string | undefined, width: number): string | unde
   return trimmed === '*' ? trimmed : trimmed.padStart(width, '0');
 }
 
+/**
+ * The distinct values each record column took across a response, keyed by column code. A column
+ * that took one value did not split anything; one that took several is why a geography came back
+ * on several rows, and its codes are what a caller pins the record with.
+ */
+export function observeRecordValues(
+  rows: CensusDataRow[],
+): Record<string, Array<{ code: string; label: string }>> {
+  const observed = new Map<string, Map<string, string>>();
+  for (const row of rows) {
+    for (const [column, value] of Object.entries(row.record ?? {})) {
+      const values = observed.get(column) ?? new Map<string, string>();
+      values.set(value.code, value.label);
+      observed.set(column, values);
+    }
+  }
+  return Object.fromEntries(
+    [...observed].map(([column, values]) => [
+      column,
+      [...values]
+        .map(([code, label]) => ({ code, label }))
+        .sort((a, b) => a.code.localeCompare(b.code)),
+    ]),
+  );
+}
+
 interface GeographyLevelsCacheEntry {
   fetchedAt: number;
   levels: CensusGeographyLevel[];
@@ -78,6 +104,14 @@ export class CensusApiService {
        * would flip the API from applying one default to enumerating every category.
        */
       defaultLabelColumns?: Record<string, string>;
+      /**
+       * Columns that separate several records for one geography, keyed by column code
+       * (e.g. `{ MONTH: 'MONTH_DESC' }`). Both the code and its label column are requested,
+       * so each row carries the value that identifies it and the code to pin it with. Unlike
+       * a required filter dimension, naming one of these in `get=` does not change which rows
+       * come back — the API was already returning them all.
+       */
+      recordColumns?: Record<string, string>;
       dataset: string;
       year: number;
     },
@@ -86,7 +120,13 @@ export class CensusApiService {
     const { censusApiKey } = getServerConfig();
 
     const defaultLabelColumns = params.defaultLabelColumns ?? {};
-    const varList = ['NAME', ...params.variables, ...Object.values(defaultLabelColumns)].join(',');
+    const recordColumns = params.recordColumns ?? {};
+    const varList = [
+      'NAME',
+      ...params.variables,
+      ...Object.values(defaultLabelColumns),
+      ...Object.entries(recordColumns).flat(),
+    ].join(',');
     const forClause = `${params.geographyLevel}:${params.geographyFips}`;
 
     // Build compound in= clause: county FIPS requires state FIPS as the outer scope.
@@ -170,6 +210,7 @@ export class CensusApiService {
       params.dataset,
       predicateKeys,
       defaultLabelColumns,
+      recordColumns,
       ctx,
     );
   }
@@ -325,6 +366,11 @@ export class CensusApiService {
    * The scope matters: on `ecnbasic` the codes `TAXSTAT` and `TYPOP` take are published per
    * industry, so an unscoped call returns only the all-establishments row and a `naicsScope`
    * is what makes the enumeration useful — and complete only for that industry.
+   *
+   * What lands in `get=` decides what the wildcard answers from. A dimension's own label column
+   * can be served from the dataset's published value map, so on `dec/ddhca` a label-only request
+   * hands back all 5,543 declared `POPGROUP` codes; naming a `measure` instead forces the read
+   * against the data file, which answers with the 2,996 the dataset publishes rows for.
    */
   async fetchPredicateValues(
     params: {
@@ -334,6 +380,12 @@ export class CensusApiService {
       code: string;
       /** Attribute column carrying each code's label (e.g. "EMPSZES_LABEL"), when published. */
       labelAttribute?: string;
+      /**
+       * Measure variable to request instead of the label column, forcing the enumeration to
+       * read the data file. Codes come back unlabelled, so this is for checking which codes the
+       * dataset publishes rather than for building a list to show.
+       */
+      measure?: string;
       /** NAICS dimension code and industry value to scope the enumeration by. */
       naicsScope?: { code: string; value: string };
     },
@@ -344,7 +396,7 @@ export class CensusApiService {
     const scopeKey = params.naicsScope
       ? `${params.naicsScope.code}=${params.naicsScope.value}`
       : '';
-    const cacheKey = `${params.dataset}|${params.year}|${params.code}|${scopeKey}`;
+    const cacheKey = `${params.dataset}|${params.year}|${params.code}|${scopeKey}|${params.measure ?? ''}`;
     const cached = this.predicateValuesCache.get(cacheKey);
     if (cached && Date.now() - cached.fetchedAt < ttlMs) {
       ctx.log.debug('Predicate values cache hit', { dataset: params.dataset, code: params.code });
@@ -354,7 +406,8 @@ export class CensusApiService {
     const scopeClause = params.naicsScope
       ? `&${encodeURIComponent(params.naicsScope.code)}=${encodeURIComponent(params.naicsScope.value)}`
       : '';
-    const url = `${CENSUS_API_BASE}/${params.year}/${params.dataset}?get=${encodeURIComponent(params.labelAttribute ?? params.code)}&${encodeURIComponent(params.code)}=*${scopeClause}&for=us:1&key=${censusApiKey}`;
+    const getColumn = params.measure ?? params.labelAttribute ?? params.code;
+    const url = `${CENSUS_API_BASE}/${params.year}/${params.dataset}?get=${encodeURIComponent(getColumn)}&${encodeURIComponent(params.code)}=*${scopeClause}&for=us:1&key=${censusApiKey}`;
 
     ctx.log.debug('Enumerating predicate values', {
       dataset: params.dataset,
@@ -433,6 +486,7 @@ export class CensusApiService {
     dataset: string,
     predicateKeys: string[],
     defaultLabelColumns: Record<string, string>,
+    recordColumns: Record<string, string>,
     ctx: Context,
   ): CensusDataRow[] {
     if (raw.length < 1) return [];
@@ -453,6 +507,7 @@ export class CensusApiService {
       ...requestedVariables,
       ...predicateKeys,
       ...Object.values(defaultLabelColumns),
+      ...Object.entries(recordColumns).flat(),
     ]);
     const geoColumnIdxs = headers.flatMap((header, idx) =>
       header !== 'NAME' && !nonGeoColumns.has(header) ? [idx] : [],
@@ -463,6 +518,9 @@ export class CensusApiService {
     const appliedFilterIdxs = Object.entries(defaultLabelColumns)
       .map(([code, column]) => [code, headers.indexOf(column)] as const)
       .filter(([, idx]) => idx >= 0);
+    const recordIdxs = Object.entries(recordColumns)
+      .map(([code, column]) => [code, headers.indexOf(code), headers.indexOf(column)] as const)
+      .filter(([, codeIdx]) => codeIdx >= 0);
 
     const rows: CensusDataRow[] = [];
 
@@ -511,12 +569,19 @@ export class CensusApiService {
         if (label) appliedFilters[code] = label;
       }
 
+      const record: Record<string, { code: string; label: string }> = {};
+      for (const [code, codeIdx, labelIdx] of recordIdxs) {
+        const value = row[codeIdx];
+        if (value) record[code] = { code: value, label: (labelIdx >= 0 && row[labelIdx]) || value };
+      }
+
       rows.push({
         geographyName,
         geographyFips,
         geographyGeoid,
         variables,
         ...(Object.keys(appliedFilters).length > 0 && { appliedFilters }),
+        ...(Object.keys(record).length > 0 && { record }),
       });
     }
 

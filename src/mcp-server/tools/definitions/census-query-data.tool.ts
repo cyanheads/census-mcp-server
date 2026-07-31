@@ -6,20 +6,26 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, validationError } from '@cyanheads/mcp-ts-core/errors';
 import { getDiscoveryConfig } from '@/config/server-config.js';
-import { getCensusApiService, padFips } from '@/services/census-api/census-api-service.js';
+import {
+  getCensusApiService,
+  observeRecordValues,
+  padFips,
+} from '@/services/census-api/census-api-service.js';
 import {
   DATASET_LATEST_YEARS,
   defaultLabelColumnsFor,
   describeEmptyPredicatedResult,
+  describeRecordRows,
   describeUnsetPredicates,
   getVariableCacheService,
   KNOWN_DATASETS,
+  recordLabelColumnsFor,
 } from '@/services/variable-cache/variable-cache-service.js';
 
 export const censusQueryData = tool('census_query_data', {
   title: 'Query Census Data',
   description:
-    'Query a Census dataset for one or more variables at a specific geography. Accepts FIPS codes for the target geography — use census_resolve_geography to convert place names to FIPS when needed. On ACS datasets, labeled estimates and margin-of-error values are returned together. Suppression codes (geography too small, data not collected) are decoded into human-readable reasons rather than passed through as raw negative numbers. Pass geography_fips as "*" to return all geographies at the level within the parent. On the business datasets (cbp, ecnbasic, nonemp), pep/charv, and dec/ddhca, use predicates to filter by industry, size class, or population group — a query that omits one is answered with a default the Census API picks, which is an all-categories total on some dimensions and a single category on others. Each row names the defaults that were applied in applied_filters, and census_list_predicate_values enumerates the codes a dimension accepts.',
+    'Query a Census dataset for one or more variables at a specific geography. Accepts FIPS codes for the target geography — use census_resolve_geography to convert place names to FIPS when needed. On ACS datasets, labeled estimates and margin-of-error values are returned together. Suppression codes (geography too small, data not collected) are decoded into human-readable reasons rather than passed through as raw negative numbers. Pass geography_fips as "*" to return all geographies at the level within the parent. On the business datasets (cbp, ecnbasic, nonemp), pep/charv, and dec/ddhca, use predicates to filter by industry, size class, or population group — a query that omits one is answered with a default the Census API picks, which is an all-categories total on some dimensions and a single category on others. Each row names the defaults that were applied in applied_filters, and census_list_predicate_values enumerates the codes a dimension accepts. One geography can also come back on more than one row: pep/charv publishes an April estimates base alongside its July estimate, and each row carries a record field saying which it is.',
   annotations: { readOnlyHint: true, openWorldHint: false },
   input: z.object({
     variables: z
@@ -109,6 +115,13 @@ export const censusQueryData = tool('census_query_data', {
               .describe(
                 'Filter dimensions the query left unset, mapped to the label of the default the Census API applied (e.g. {"POPGROUP": "European alone"}). Present only on datasets that declare filter dimensions. The label is what tells an all-categories total apart from one ordinary category — dec/ddhca defaults POPGROUP to a single population group, so a value carrying "European alone" is that group\'s count and not the geography\'s population. Set the dimension in predicates to choose it yourself.',
               ),
+            record: z
+              .object({})
+              .passthrough()
+              .optional()
+              .describe(
+                'Which record this row is, for a dataset that publishes more than one per geography — keyed by the column that separates them, each value carrying a code and a label (e.g. {"MONTH": {"code": "7", "label": "July"}}). pep/charv publishes an April estimates base and a July estimate, so one geography comes back on two rows whose numbers differ; this field is what says which is which. Pass the code back in predicates (e.g. {"MONTH": "7"}) to return that record alone. Absent on the datasets that return one row per geography.',
+              ),
           })
           .describe('Data for one geography — name, FIPS, and variable values.'),
       )
@@ -125,7 +138,7 @@ export const censusQueryData = tool('census_query_data', {
       .string()
       .optional()
       .describe(
-        'Warning that the dataset declares filter dimensions the query left unset, naming each one alongside the label of the default the Census API applied to it. That default is an all-categories total on some dimensions and one ordinary category on others, so the label is what says which.',
+        'Warning that the dataset declares filter dimensions the query left unset, naming each one alongside the label of the default the Census API applied to it. That default is an all-categories total on some dimensions and one ordinary category on others, so the label is what says which. Also carries the warning that a geography came back on more than one row, naming the column that separates the records and the values it took.',
       ),
   },
 
@@ -346,6 +359,12 @@ export const censusQueryData = tool('census_query_data', {
     const unfiltered = predicateCheck.unset;
     const defaultLabelColumns = defaultLabelColumnsFor(unfiltered);
 
+    // A dataset that publishes several records per geography answers with one row each. Requesting
+    // the columns that separate them is what makes a row attributable to a record rather than one
+    // of two identical-looking answers; it does not change which rows come back.
+    const recordDimensions = await variableCacheService.getRecordDimensions(dataset, year, ctx);
+    const recordColumns = recordLabelColumnsFor(recordDimensions);
+
     // Fetch variable labels for enrichment (best-effort — don't fail if cache is cold)
     const variableLabels: Map<string, string> = new Map();
     try {
@@ -371,6 +390,7 @@ export const censusQueryData = tool('census_query_data', {
         ...(countyFips !== undefined && { countyFips }),
         ...(Object.keys(predicates).length > 0 && { predicates }),
         ...(Object.keys(defaultLabelColumns).length > 0 && { defaultLabelColumns }),
+        ...(Object.keys(recordColumns).length > 0 && { recordColumns }),
         dataset,
         year,
       },
@@ -432,16 +452,32 @@ export const censusQueryData = tool('census_query_data', {
         geography_geoid: row.geographyGeoid,
         variables: enrichedVariables,
         ...(row.appliedFilters && { applied_filters: row.appliedFilters }),
+        ...(row.record && { record: row.record }),
       };
     });
 
     ctx.enrich({ totalRows: enrichedRows.length, dataset, year });
+
+    const notices: string[] = [];
     if (unfiltered.length > 0) {
       // The API applies the same default to every row, so the first one names them all.
-      ctx.enrich.notice(
+      notices.push(
         describeUnsetPredicates(unfiltered, dataset, year, rows[0]?.appliedFilters ?? {}),
       );
     }
+    // Several rows for one geography are several records, not several geographies. Reading one of
+    // them as the answer is wrong, so the response has to say a choice is being made.
+    const perGeography = new Map<string, number>();
+    for (const row of rows) {
+      perGeography.set(row.geographyGeoid, (perGeography.get(row.geographyGeoid) ?? 0) + 1);
+    }
+    const maxRowsPerGeography = Math.max(...perGeography.values());
+    if (maxRowsPerGeography > 1) {
+      notices.push(
+        describeRecordRows(dataset, year, maxRowsPerGeography, observeRecordValues(rows)),
+      );
+    }
+    if (notices.length > 0) ctx.enrich.notice(notices.join(' '));
 
     return { rows: enrichedRows };
   },
@@ -450,7 +486,16 @@ export const censusQueryData = tool('census_query_data', {
     const lines: string[] = [`## Census Data`, `**${result.rows.length} geography rows**\n`];
 
     for (const row of result.rows) {
-      lines.push(`### ${row.geography_name}`);
+      const record = Object.entries(row.record ?? {}) as Array<
+        [string, { code: string; label: string }]
+      >;
+      // Without the record on the heading, two rows for one geography render as the same heading
+      // twice with different numbers under it.
+      const recordSuffix =
+        record.length > 0
+          ? ` — ${record.map(([code, value]) => `${code} ${value.code} (${value.label})`).join(' · ')}`
+          : '';
+      lines.push(`### ${row.geography_name}${recordSuffix}`);
       lines.push(`**FIPS:** \`${row.geography_fips}\` · **GEOID:** \`${row.geography_geoid}\``);
       for (const [code, rawVal] of Object.entries(row.variables)) {
         const val = rawVal as {

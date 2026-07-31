@@ -26,6 +26,13 @@ export interface CensusDataRow {
   geographyGeoid: string;
   /** Human-readable geography name (e.g., "King County, Washington"). */
   geographyName: string;
+  /**
+   * Which record this row is, for a dataset that publishes more than one per geography, keyed by
+   * the column that separates them (e.g. `{ MONTH: { code: '7', label: 'July' } }`). The code is
+   * what pins the record when passed back in a predicates map. Absent on the datasets that
+   * return one row per geography.
+   */
+  record?: Record<string, { code: string; label: string }>;
   /** Map of variable code to parsed value entry. */
   variables: Record<string, CensusVariableValue>;
 }

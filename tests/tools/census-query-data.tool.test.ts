@@ -15,7 +15,7 @@ vi.mock('@/services/census-api/census-api-service.js', async (importOriginal) =>
 
 vi.mock('@/services/variable-cache/variable-cache-service.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/services/variable-cache/variable-cache-service.js')>()),
-  DATASET_LATEST_YEARS: { 'acs/acs5': 2024, cbp: 2023, 'dec/ddhca': 2020 },
+  DATASET_LATEST_YEARS: { 'acs/acs5': 2024, cbp: 2023, 'dec/ddhca': 2020, 'pep/charv': 2023 },
   KNOWN_DATASETS: new Set([
     'acs/acs5',
     'acs/acs1',
@@ -23,6 +23,7 @@ vi.mock('@/services/variable-cache/variable-cache-service.js', async (importOrig
     'dec/pl',
     'dec/ddhca',
     'cbp',
+    'pep/charv',
   ]),
   getVariableCacheService: vi.fn(),
 }));
@@ -40,6 +41,7 @@ const mockQueryData = vi.fn();
 const mockCheckGeography = vi.fn();
 const mockGetVariablesByCode = vi.fn();
 const mockCheckPredicates = vi.fn();
+const mockGetRecordDimensions = vi.fn();
 
 beforeEach(async () => {
   vi.clearAllMocks();
@@ -59,10 +61,14 @@ beforeEach(async () => {
   vi.mocked(getVariableCacheService).mockReturnValue({
     getVariablesByCode: mockGetVariablesByCode,
     checkPredicates: mockCheckPredicates,
+    getRecordDimensions: mockGetRecordDimensions,
   } as never);
 
   // Default: the dataset declares no filter dimensions, so nothing is unset or unknown.
   mockCheckPredicates.mockResolvedValue({ unset: [], unknown: [] });
+
+  // Default: the dataset publishes one row per geography, so nothing separates records.
+  mockGetRecordDimensions.mockResolvedValue([]);
 
   // Default: label enrichment returns the code as label (best-effort)
   mockGetVariablesByCode.mockResolvedValue([]);
@@ -1047,6 +1053,7 @@ describe('censusQueryData', () => {
     vi.mocked(getVariableCacheService).mockReturnValue({
       getVariablesByCode: vi.fn().mockRejectedValue(new Error('cache cold')),
       checkPredicates: mockCheckPredicates,
+      getRecordDimensions: mockGetRecordDimensions,
     } as never);
 
     mockQueryData.mockResolvedValue([
@@ -1210,5 +1217,109 @@ describe('censusQueryData', () => {
     const text = (blocks[0] as { type: string; text: string }).text;
     expect(text).toContain('King County');
     expect(text).toContain('Pierce County');
+  });
+});
+
+/**
+ * `pep/charv` publishes an April estimates base and a July estimate for every geography, so a
+ * query that pins neither answers with two rows sharing a GEOID, the same applied_filters, and
+ * different numbers. Which one a caller is reading has to be on the row.
+ */
+describe('censusQueryData — datasets that publish several records per geography', () => {
+  const charvRows = [
+    {
+      geographyName: 'Washington',
+      geographyFips: '53',
+      geographyGeoid: '53',
+      variables: { POP: { estimate: 7705267, label: 'POP', suppressed: false } },
+      appliedFilters: { POPGROUP: 'Total population' },
+      record: { MONTH: { code: '4', label: 'April' } },
+    },
+    {
+      geographyName: 'Washington',
+      geographyFips: '53',
+      geographyGeoid: '53',
+      variables: { POP: { estimate: 7724566, label: 'POP', suppressed: false } },
+      appliedFilters: { POPGROUP: 'Total population' },
+      record: { MONTH: { code: '7', label: 'July' } },
+    },
+  ];
+
+  const charvInput = (overrides: Record<string, unknown> = {}) =>
+    censusQueryData.input.parse({
+      variables: ['POP'],
+      geography_level: 'state',
+      geography_fips: '53',
+      dataset: 'pep/charv',
+      ...overrides,
+    });
+
+  beforeEach(() => {
+    mockGetRecordDimensions.mockResolvedValue([
+      { code: 'MONTH', label: 'Vintage Month', labelAttribute: 'MONTH_DESC' },
+    ]);
+  });
+
+  it('carries the record on every row so the two are not interchangeable', async () => {
+    mockQueryData.mockResolvedValue(charvRows);
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const result = await censusQueryData.handler(charvInput(), ctx);
+
+    expect(result.rows).toHaveLength(2);
+    expect(result.rows[0]?.record).toEqual({ MONTH: { code: '4', label: 'April' } });
+    expect(result.rows[1]?.record).toEqual({ MONTH: { code: '7', label: 'July' } });
+    expect(mockQueryData).toHaveBeenCalledWith(
+      expect.objectContaining({ recordColumns: { MONTH: 'MONTH_DESC' } }),
+      expect.anything(),
+    );
+  });
+
+  /**
+   * Reading the first row as the answer is the failure. The notice has to say a choice is being
+   * made, name what separates the rows, and give the value that pins one.
+   */
+  it('warns that a geography came back twice and names what pins one record', async () => {
+    mockQueryData.mockResolvedValue(charvRows);
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    await censusQueryData.handler(charvInput(), ctx);
+
+    const notice = getEnrichment(ctx).notice as string;
+    expect(notice).toContain('came back on 2 rows');
+    expect(notice).toContain('MONTH');
+    expect(notice).toContain('"4" (April)');
+    expect(notice).toContain('"7" (July)');
+    expect(notice).toContain('{"MONTH": "7"}');
+  });
+
+  it('drops the warning once the record is pinned', async () => {
+    mockQueryData.mockResolvedValue([charvRows[1]]);
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    await censusQueryData.handler(charvInput({ predicates: { MONTH: '7' } }), ctx);
+
+    expect(getEnrichment(ctx).notice ?? '').not.toContain('came back on');
+  });
+
+  /**
+   * Claude Desktop reads content[] rather than structuredContent, so a heading that repeats the
+   * geography name with a different number under it is the same ambiguity in the other surface.
+   */
+  it('format separates the two rows in the rendered text', () => {
+    const blocks = censusQueryData.format!({
+      rows: charvRows.map((row) => ({
+        geography_name: row.geographyName,
+        geography_fips: row.geographyFips,
+        geography_geoid: row.geographyGeoid,
+        variables: row.variables,
+        applied_filters: row.appliedFilters,
+        record: row.record,
+      })),
+    });
+    const text = (blocks[0] as { type: string; text: string }).text;
+
+    expect(text).toContain('Washington — MONTH 4 (April)');
+    expect(text).toContain('Washington — MONTH 7 (July)');
   });
 });

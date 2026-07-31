@@ -33,6 +33,7 @@ vi.mock('@/config/server-config.js', () => ({
 const mockFetchPredicateValues = vi.fn();
 const mockFindVariable = vi.fn();
 const mockGetFilterDimensions = vi.fn();
+const mockFindPublicationProbe = vi.fn();
 
 beforeEach(async () => {
   vi.clearAllMocks();
@@ -48,9 +49,12 @@ beforeEach(async () => {
   vi.mocked(getVariableCacheService).mockReturnValue({
     findVariable: mockFindVariable,
     getFilterDimensions: mockGetFilterDimensions,
+    findPublicationProbe: mockFindPublicationProbe,
   } as never);
 
   mockGetFilterDimensions.mockResolvedValue([]);
+  // Default: the dataset offers no measure column, so a value map is returned unchecked.
+  mockFindPublicationProbe.mockResolvedValue(undefined);
 });
 
 /** EMPSZES is the shape of every dimension the Census publishes no value list for. */
@@ -214,7 +218,10 @@ describe('censusListPredicateValues — dimensions with no published value list'
 });
 
 describe('censusListPredicateValues — dimensions with a published value list', () => {
-  it('reads the codes from the dataset dictionary without spending a data query', async () => {
+  /** The published set on dec/ddhca — 001 is declared but the dataset serves no rows for it. */
+  const publishedPopgroups = [{ code: '1002' }, { code: '2670' }];
+
+  it('returns the value map unchecked when the dataset offers no measure to check against', async () => {
     mockFindVariable.mockResolvedValue(popgroup);
 
     const ctx = createMockContext({ errors: censusListPredicateValues.errors });
@@ -224,8 +231,134 @@ describe('censusListPredicateValues — dimensions with a published value list',
     );
 
     expect(result.values.map((v) => v.code)).toEqual(['001', '1002', '2670']);
-    expect(getEnrichment(ctx).source).toBe('dataset_dictionary');
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.source).toBe('dataset_dictionary');
+    expect(enrichment.notice).toContain('confirm one with census_query_data');
     expect(mockFetchPredicateValues).not.toHaveBeenCalled();
+  });
+
+  /**
+   * A `values.item` map is a classification the Census shares across products, so it names codes
+   * the dataset serves nothing for — on dec/ddhca that includes 001 "Total population", which is
+   * the top hit for the obvious keyword and returns 204 at every geography. Handing it back is
+   * the exact failure this tool exists to prevent.
+   */
+  it('drops the codes the dataset publishes no rows for', async () => {
+    mockFindVariable.mockResolvedValue(popgroup);
+    mockFindPublicationProbe.mockResolvedValue('T01001_001N');
+    mockFetchPredicateValues.mockResolvedValue(publishedPopgroups);
+
+    const ctx = createMockContext({ errors: censusListPredicateValues.errors });
+    const result = await censusListPredicateValues.handler(
+      call({ predicate: 'POPGROUP', dataset: 'dec/ddhca' }),
+      ctx,
+    );
+
+    expect(result.values.map((v) => v.code)).toEqual(['1002', '2670']);
+    expect(mockFetchPredicateValues).toHaveBeenCalledWith(
+      expect.objectContaining({ code: 'POPGROUP', measure: 'T01001_001N' }),
+      expect.anything(),
+    );
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.source).toBe('dataset_dictionary_verified');
+    expect(enrichment.totalCount).toBe(2);
+    expect(enrichment.notice).toContain('declares 3 POPGROUP codes and publishes rows for 2');
+  });
+
+  /**
+   * The reported failure in full: a caller searching for the total finds a code named exactly
+   * that, queries it, and gets nothing back. Suppressing the code is only half an answer — the
+   * empty result has to say the code exists and is a dead end, or the caller retries the search.
+   */
+  it('names the withheld code when a keyword matched only unpublished ones', async () => {
+    mockFindVariable.mockResolvedValue(popgroup);
+    mockFindPublicationProbe.mockResolvedValue('T01001_001N');
+    mockFetchPredicateValues.mockResolvedValue(publishedPopgroups);
+
+    const ctx = createMockContext({ errors: censusListPredicateValues.errors });
+    const result = await censusListPredicateValues.handler(
+      call({ predicate: 'POPGROUP', dataset: 'dec/ddhca', query: 'total population' }),
+      ctx,
+    );
+
+    expect(result.values).toEqual([]);
+    const notice = getEnrichment(ctx).notice as string;
+    expect(notice).toContain('001 (Total population)');
+    expect(notice).toContain('publishes no rows for it at any geography');
+  });
+
+  /**
+   * On ecnbasic the codes TAXSTAT takes are published per industry — T and Y come back only under
+   * a NAICS scope. Checking against an unscoped query would withhold codes that do return rows.
+   */
+  it('leaves a per-industry dimension unchecked rather than withholding its codes', async () => {
+    mockFindVariable.mockResolvedValue({
+      code: 'TAXSTAT',
+      label: 'Tax status code',
+      concept: '',
+      predicateType: 'string',
+      required: true,
+      labelAttribute: 'TAXSTAT_LABEL',
+      values: { '00': 'All establishments', T: 'Subject to federal income tax' },
+    });
+    mockGetFilterDimensions.mockResolvedValue([
+      { code: 'NAICS2017', label: '2017 NAICS code', concept: '', predicateType: 'string' },
+      { code: 'TAXSTAT', label: 'Tax status code', concept: '', predicateType: 'string' },
+    ]);
+    mockFindPublicationProbe.mockResolvedValue('ASRET');
+
+    const ctx = createMockContext({ errors: censusListPredicateValues.errors });
+    const result = await censusListPredicateValues.handler(
+      call({ predicate: 'TAXSTAT', dataset: 'ecnbasic', year: 2017 }),
+      ctx,
+    );
+
+    expect(result.values.map((v) => v.code)).toEqual(['00', 'T']);
+    expect(mockFetchPredicateValues).not.toHaveBeenCalled();
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.source).toBe('dataset_dictionary');
+    expect(enrichment.notice).toContain('publishes TAXSTAT per industry');
+  });
+
+  /**
+   * The check is one live call on top of an answer the dictionary already holds. Losing it should
+   * cost the caller the guarantee and nothing else — a failed check that emptied the response
+   * would trade a list with dead codes in it for no list at all.
+   */
+  it('falls back to the unchecked value map when the check fails', async () => {
+    mockFindVariable.mockResolvedValue(popgroup);
+    mockFindPublicationProbe.mockResolvedValue('T01001_001N');
+    mockFetchPredicateValues.mockRejectedValue(new Error('Census API unreachable'));
+
+    const ctx = createMockContext({ errors: censusListPredicateValues.errors });
+    const result = await censusListPredicateValues.handler(
+      call({ predicate: 'POPGROUP', dataset: 'dec/ddhca' }),
+      ctx,
+    );
+
+    expect(result.values.map((v) => v.code)).toEqual(['001', '1002', '2670']);
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.source).toBe('dataset_dictionary');
+    expect(enrichment.notice).toContain('was not possible on this call');
+  });
+
+  /**
+   * A check that comes back empty is the probe saying nothing, not the dimension having no codes.
+   * Trusting it would hide every code the dimension takes behind one bad answer.
+   */
+  it('keeps the value map when the check comes back empty', async () => {
+    mockFindVariable.mockResolvedValue(popgroup);
+    mockFindPublicationProbe.mockResolvedValue('T01001_001N');
+    mockFetchPredicateValues.mockResolvedValue([]);
+
+    const ctx = createMockContext({ errors: censusListPredicateValues.errors });
+    const result = await censusListPredicateValues.handler(
+      call({ predicate: 'POPGROUP', dataset: 'dec/ddhca' }),
+      ctx,
+    );
+
+    expect(result.values.map((v) => v.code)).toEqual(['001', '1002', '2670']);
+    expect(getEnrichment(ctx).source).toBe('dataset_dictionary');
   });
 
   /**

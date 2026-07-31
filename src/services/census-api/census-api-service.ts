@@ -130,14 +130,13 @@ export class CensusApiService {
         try {
           response = await fetchWithTimeout(url, 10_000, ctx as unknown as RequestContext, {
             signal: ctx.signal,
+            // A 404 here is an expected outcome, not a fault — log it at debug.
+            expectedStatuses: [404],
           });
         } catch (err) {
           // 404 means the year has no data for this dataset — return empty so the handler
           // can throw year_not_available instead of a generic upstream error.
-          if (
-            err instanceof McpError &&
-            (err.data as { statusCode?: number })?.statusCode === 404
-          ) {
+          if (err instanceof McpError && (err.data as { status?: number })?.status === 404) {
             return [];
           }
           throw err;

@@ -12,6 +12,7 @@
 | `census_query_data` | Query a Census dataset for one or more variables at a specific geography. Requires FIPS codes for the target geography — use `census_resolve_geography` first to convert place names. Returns labeled estimates with margin-of-error columns alongside each estimate. | `variables[]`, `geography_level`, `geography_fips`, `parent_fips`, `dataset`, `year` | `readOnlyHint: true`, `openWorldHint: false` | `missing_api_key` (Unauthorized), `variable_not_found` (InvalidParams), `geography_not_supported` (InvalidParams), `parent_required` (InvalidParams), `no_data` (NotFound), `too_many_variables` (InvalidParams), `upstream_error` (ServiceUnavailable, retryable) |
 | `census_list_geographies` | List the geography levels available for a dataset and year — which levels (county, tract, block group, etc.) are supported and what parent geographies are required. | `dataset`, `year` | `readOnlyHint: true`, `openWorldHint: false` | `dataset_not_found` (NotFound), `year_not_available` (InvalidParams) |
 | `census_list_datasets` | Browse available Census datasets with vintages. Returns dataset codes, descriptions, and available years — the starting point for exploring what data exists. | `filter` | `readOnlyHint: true`, `openWorldHint: false` | none (static metadata) |
+| `census_list_predicate_values` | List the codes a Census filter dimension accepts, so a `predicates` map can be written without guessing. Routes to the dataset's published value list when it has one (NAICS, POPGROUP), otherwise enumerates against the live data endpoint. Answers the question left open when `census_query_data` or `census_compare_geographies` reports a dimension was left unset. | `predicate`, `dataset`, `year`, `query`, `within_naics`, `limit` | `readOnlyHint: true`, `openWorldHint: false` | `dataset_not_found` (NotFound), `predicate_not_supported` (NotFound), `not_a_filter_dimension` (ValidationError), `no_values` (NotFound), `upstream_error` (ServiceUnavailable, retryable) |
 | `census_compare_geographies` | Compare one or more variables across a set of geographies at the same level. Useful for "compare poverty rates across states" or "rank counties by median income." Returns a sorted table with all geographies and values. | `variables[]`, `geography_level`, `within`, `geographies`, `dataset`, `year`, `sort_by`, `sort_dir`, `limit` | `readOnlyHint: true`, `openWorldHint: false` | `missing_api_key` (Unauthorized), `geography_not_supported` (InvalidParams), `parent_required` (InvalidParams), `variable_not_found` (InvalidParams), `no_data` (NotFound), `upstream_error` (ServiceUnavailable, retryable) |
 
 ### Resources
@@ -55,6 +56,7 @@ Target users: agents doing demographic research, policy analysis, market sizing,
 | Noun | Operations |
 |:-----|:-----------|
 | Variable | search by keyword, get metadata by code(s), resolve human concept → codes |
+| Predicate | list the codes a filter dimension accepts, from the dataset dictionary or a live query |
 | Dataset | list available, list vintages, get geography levels for a dataset |
 | Geography | resolve name/address → FIPS, list hierarchy levels |
 | Data | query by variable + geography + year, compare across multiple geographies |
@@ -65,8 +67,8 @@ Target users: agents doing demographic research, policy analysis, market sizing,
 
 | Service | Wraps | Used By |
 |:--------|:------|:--------|
-| `CensusApiService` | Census Data API (`api.census.gov/data`) | `census_query_data`, variable endpoints |
-| `VariableCacheService` | Variables.json endpoints (per dataset + year) | `census_search_variables`, `census_get_variable` |
+| `CensusApiService` | Census Data API (`api.census.gov/data`) | `census_query_data`, `census_list_predicate_values`, variable endpoints |
+| `VariableCacheService` | Variables.json endpoints (per dataset + year) | `census_search_variables`, `census_get_variable`, `census_list_predicate_values` |
 | `GeographyService` | TIGERweb MapServer REST, Census Geocoder | `census_resolve_geography` |
 
 ### Service notes
@@ -100,6 +102,7 @@ Target users: agents doing demographic research, policy analysis, market sizing,
 7. `census_resolve_geography` (geographic resolution)
 8. `census_query_data` (core data query, uses all three services)
 9. `census_compare_geographies` (builds on `census_query_data` with multi-geography fan-out)
+10. `census_list_predicate_values` (enumerates the codes a `predicates` dimension accepts, from the variable cache's dataset dictionary or a live group-by query)
 
 Each step is independently testable. Steps 5–6 can be tested without a Census API key using the public metadata endpoints.
 
@@ -136,6 +139,31 @@ Each step is independently testable. Steps 5–6 can be tested without a Census 
 **Errors:**
 - `dataset_not_found` (NotFound) — unrecognized dataset code. Recovery: call `census_list_datasets` to find valid codes.
 - `year_not_available` (InvalidParams) — dataset exists but the requested year has no data. Recovery: check `available_years` from `census_list_datasets`.
+
+**Annotations:** `readOnlyHint: true`, `openWorldHint: false`
+
+---
+
+### `census_list_predicate_values`
+
+**Description:** List the codes a Census filter dimension accepts, so a `predicates` map can be written without guessing. Answers the question left open when `census_query_data` or `census_compare_geographies` reports that a dimension was left unset. Which route a dimension takes depends on the vintage: NAICS and POPGROUP always publish a value list in the dataset dictionary; on the current vintages EMPSZES, LFO, RCPSZES, TAXSTAT, and TYPOP publish none and are enumerated against the live data endpoint instead. The dictionary lists run to thousands of codes and are best narrowed with `query`.
+
+**Input:**
+- `predicate: string` — filter dimension code to enumerate (e.g., `"EMPSZES"`, `"LFO"`, `"POPGROUP"`, `"NAICS2017"`). Case-sensitive. The response notice of `census_query_data` names the dimensions a dataset declares, and `census_search_variables` finds them by keyword.
+- `dataset: string` — dataset the dimension belongs to (e.g., `"cbp"`, `"nonemp"`, `"ecnbasic"`, `"dec/ddhca"`, `"pep/charv"`). Use `census_list_datasets` to discover valid values. Dimension codes are vintage-specific, so dataset and year must match the query the values are for.
+- `year?: number` — vintage year (default: latest available for the dataset)
+- `query?: string` — keyword to narrow the list, matched case-insensitively against each code and label (e.g., `"software"` against `NAICS2017`, `"exempt"` against `TAXSTAT`). Omit to list from the start.
+- `within_naics?: string` — industry code to scope the enumeration by, for dimensions the Census publishes per industry — `ecnbasic`'s `TAXSTAT` and `TYPOP` return only the all-establishments row until a NAICS sector is named (e.g., `"62"` for Health Care, `"42"` for Wholesale Trade). Ignored for dimensions with a published value list. Get sector codes by calling this tool on the dataset's own NAICS dimension.
+- `limit?: number` — max codes to return (default: 50, max: 500)
+
+**Output:** `{ values: [{ code, label }], predicate, predicate_label, dataset, year }`. `values` is sorted by code; `code` is the value to send for this dimension in a `predicates` map, and `label` falls back to the code when the dataset publishes no label for it. Alongside the output, an enrichment block carries `totalCount` (codes matched before the limit), `truncated`, `source` (`"dataset_dictionary"` or `"live_query"`), and an optional `notice` explaining a truncated list, a keyword that matched no code, or that the codes returned are complete only for the industry passed in `within_naics`.
+
+**Errors:**
+- `dataset_not_found` (NotFound) — unrecognized dataset code. Recovery: call `census_list_datasets` to discover valid dataset codes.
+- `predicate_not_supported` (NotFound) — the predicate code is not a variable in this dataset and year. Recovery: call `census_search_variables` on this dataset and year for the codes it does define — dimension names are vintage-specific, so `NAICS2017` and `NAICS2022` belong to different years.
+- `not_a_filter_dimension` (ValidationError) — the code is not one of the dimensions the dataset filters on, so it takes no value list. Recovery: pass a dimension the dataset filters on. The response notice of `census_query_data` names every dimension a dataset declares, and `census_get_variable` confirms what a code is.
+- `no_values` (NotFound) — the dimension returned no codes for the scope requested. Recovery: drop `within_naics`, or try a broader industry code — a narrow leaf industry often publishes only the all-establishments row.
+- `upstream_error` (ServiceUnavailable, retryable) — Census API returned an error or was unreachable. Recovery: retry; if the error persists, the Census API may be temporarily unavailable.
 
 **Annotations:** `readOnlyHint: true`, `openWorldHint: false`
 
@@ -315,7 +343,7 @@ Several datasets mark variables `required` in `variables.json` — `NAICS2017`/`
 
 `predicates` is a `Record<string, string>` on both data tools rather than dataset-aware named parameters (`naics`, `size_class`) because the codes are vintage-specific, not just dataset-specific — `cbp` 2023 takes `NAICS2017` while `cbp` 2012 takes `NAICS2012`, and `nonemp` 2023 takes `NAICS2022`. Named parameters would need a hand-maintained dataset × year × parameter mapping that drifts, and would add seven dead optional fields to every ACS query. The map is validated against the dataset's own cached `variables.json` instead, so it stays correct across vintages with no table to maintain.
 
-An unset required predicate is reported through `ctx.enrich.notice()`, not thrown as an error. Erroring was rejected because it is unrecoverable for most of these dimensions: `variables.json` publishes a value list for `NAICS*` and `POPGROUP` only, so a caller told to supply `LFO` and `EMPSZES` has no way to learn what they accept. It would also break every existing `pep/charv` and `dec/ddhca` query, which is the only form those datasets are reachable in today. The notice reaches both `structuredContent` and `content[]`, attached to the number itself, and names each unset dimension with its label.
+An unset required predicate is reported through `ctx.enrich.notice()`, not thrown as an error. Erroring was rejected because it was unrecoverable for most of these dimensions: `variables.json` publishes a value list for `NAICS*` and `POPGROUP` only, so a caller told to supply `LFO` or `EMPSZES` had no endpoint to learn what they accepted — `census_list_predicate_values` now closes that gap by enumerating the rest against the live data endpoint. Erroring would also break every existing `pep/charv` and `dec/ddhca` query, which is the only form those datasets are reachable in today. The notice reaches both `structuredContent` and `content[]`, attached to the number itself, and names each unset dimension with its label.
 
 What the notice does *not* say is that the value is an all-categories total, because the substituted default is not one shape. `cbp` defaults `NAICS2017` to `00`, the all-industries total. `pep/charv` defaults `YEAR` to 2020 and returns one row per matching combination, so an unfiltered `POP` query against the 2023 vintage yields two King County rows — that year's estimates base and estimate — rather than a sum across 2020–2023. Calling both an aggregate would misreport the second, so the wording says only what holds for both: the API supplied the default, so no value is scoped to a category the query chose.
 
@@ -427,6 +455,5 @@ GET https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/State_County/M
 - **50-variable limit per request.** The Census API caps `get=` at 50 variables per request. `census_query_data` enforces this and will error with guidance if exceeded. Requesting all demographics for a geography requires multiple calls.
 - **No historical ACS1 for 2020.** ACS1 2020 was not released due to COVID-19 data collection disruptions. Querying 2020 ACS1 returns no data.
 - **Margins of error exist only on ACS.** `pep`, `dec`, `cbp`, `ecnbasic`, and `nonemp` publish none, so `moe_code`/`estimate_code` are absent there and query rows carry no `moe`. A code ending in `E` in those datasets is an ordinary code, not an estimate with an `M` sibling.
-- **Predicate values are not discoverable through the tool surface.** `census_search_variables` finds the predicate *codes* a dataset filters on, but `variables.json` publishes a value list for `NAICS*` and `POPGROUP` only — and those run to ~6,700 and ~5,500 entries. For `LFO`, `EMPSZES`, `RCPSZES`, `TAXSTAT`, `TYPOP`, `SEX`, and `AGE` the accepted values come from Census documentation, not from any endpoint this server reads.
 - **Some business-dataset geography levels have no name-to-code path.** State, county, CBSA, CSA, and consolidated city all resolve from a name. `cbp`'s congressional district and ZIP code, and `ecnbasic`'s region, metropolitan division, and economic place, do not — those need a code the caller already holds. `metropolitan division` is left out deliberately: its parent is the CBSA level, and `census_query_data` can only express `state` and `county` in its `in=` clause, so a resolved code would land on `parent_required` with no input able to satisfy it. `economic place` has no NAICS-free enumeration to resolve against at all.
 - **Business-dataset vintages predate the query shape.** Every query sends `NAME` in `get=`, and the older vintages reject it with a `400` — `cbp` before 2012, and `nonemp` 2008 through 2011. Those years exist upstream but are omitted from `census_list_datasets` rather than advertised and then failing. `cbp` vintages before 2017 also take `NAICS2012` rather than `NAICS2017`, and `nonemp` runs back through `NAICS1997`; the predicate check reads each vintage's own `variables.json`, so the right code name is reported at runtime.

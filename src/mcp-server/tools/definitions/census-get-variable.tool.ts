@@ -14,7 +14,7 @@ import {
 export const censusGetVariable = tool('census_get_variable', {
   title: 'Get Census Variable Metadata',
   description:
-    'Fetch full metadata for one or more Census variable codes — label, concept group, predicate type, universe, and margin-of-error sibling references. Use to confirm a variable code before building a query, or to look up what a known code means. On ACS datasets it returns estimate_code and moe_code sibling references so you can request both without a separate search; other dataset families publish no margins of error and carry neither field. It also resolves predicate codes such as NAICS2017 or SEX, confirming a filter dimension exists in a dataset before a query uses it.',
+    'Fetch full metadata for one or more Census variable codes — label, concept group, predicate type, universe, and margin-of-error sibling references. Use to confirm a variable code before building a query, or to look up what a known code means. On ACS datasets it returns estimate_code and moe_code sibling references so you can request both without a separate search; other dataset families publish no margins of error and carry neither field. It also resolves predicate codes such as NAICS2017 or SEX, confirming a filter dimension exists in a dataset before a query uses it — for the values a dimension accepts rather than the dimension itself, call census_list_predicate_values.',
   annotations: { readOnlyHint: true, openWorldHint: false },
   input: z.object({
     variables: z

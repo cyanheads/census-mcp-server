@@ -8,14 +8,22 @@ import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { censusQueryData } from '@/mcp-server/tools/definitions/census-query-data.tool.js';
 
-vi.mock('@/services/census-api/census-api-service.js', () => ({
+vi.mock('@/services/census-api/census-api-service.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/services/census-api/census-api-service.js')>()),
   getCensusApiService: vi.fn(),
 }));
 
 vi.mock('@/services/variable-cache/variable-cache-service.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/services/variable-cache/variable-cache-service.js')>()),
-  DATASET_LATEST_YEARS: { 'acs/acs5': 2024, cbp: 2023 },
-  KNOWN_DATASETS: new Set(['acs/acs5', 'acs/acs1', 'acs/acs5/profile', 'dec/pl', 'cbp']),
+  DATASET_LATEST_YEARS: { 'acs/acs5': 2024, cbp: 2023, 'dec/ddhca': 2020 },
+  KNOWN_DATASETS: new Set([
+    'acs/acs5',
+    'acs/acs1',
+    'acs/acs5/profile',
+    'dec/pl',
+    'dec/ddhca',
+    'cbp',
+  ]),
   getVariableCacheService: vi.fn(),
 }));
 
@@ -323,6 +331,61 @@ describe('censusQueryData', () => {
     });
   });
 
+  /**
+   * A parent the level does not name builds an `in=` clause the Census API answers with an
+   * untyped 400 carrying no reason and no recovery. The caller has to be told which of its own
+   * inputs to drop, and the query must not be spent finding out.
+   */
+  it('throws parent_not_accepted naming parent_fips as the input to drop', async () => {
+    mockCheckGeography.mockResolvedValue({
+      status: 'parent_not_accepted',
+      unacceptedParents: ['state'],
+      acceptedParents: [],
+    });
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'zip code tabulation area',
+      geography_fips: '98101',
+      parent_fips: '53',
+    });
+    await expect(censusQueryData.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: {
+        reason: 'parent_not_accepted',
+        unacceptedParents: ['state'],
+        recovery: { hint: expect.stringContaining('Drop parent_fips') },
+      },
+    });
+    expect(mockQueryData).not.toHaveBeenCalled();
+  });
+
+  it('parent_not_accepted names county_fips and the scope the level does take', async () => {
+    mockCheckGeography.mockResolvedValue({
+      status: 'parent_not_accepted',
+      unacceptedParents: ['county'],
+      acceptedParents: ['state'],
+    });
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'place',
+      geography_fips: '63000',
+      parent_fips: '53',
+      county_fips: '033',
+    });
+    await expect(censusQueryData.handler(input, ctx)).rejects.toMatchObject({
+      data: {
+        reason: 'parent_not_accepted',
+        acceptedParents: ['state'],
+        recovery: { hint: expect.stringContaining('Drop county_fips') },
+      },
+    });
+    expect(mockQueryData).not.toHaveBeenCalled();
+  });
+
   it('throws geography_not_supported before querying for a level the dataset lacks', async () => {
     mockCheckGeography.mockResolvedValue({
       status: 'level_not_supported',
@@ -519,7 +582,7 @@ describe('censusQueryData', () => {
     const notice = getEnrichment(ctx).notice as string;
     expect(notice).toContain('NAICS2017 (2017 NAICS code)');
     expect(notice).toContain('LFO (Legal form of organization code)');
-    expect(notice).toContain('scoped to a category this query chose');
+    expect(notice).toContain('applied its own default');
   });
 
   it('emits no notice when every filter dimension is set', async () => {
@@ -615,6 +678,262 @@ describe('censusQueryData', () => {
         recovery: { hint: expect.stringContaining('NAICS2017 value') },
       },
     });
+  });
+
+  /**
+   * The Census API matches FIPS literally, so `in=state:5` is a query that finds nothing while
+   * `in=state:05` returns Arkansas. census_resolve_geography already pads the codes it hands
+   * back; a caller who types the short form got a `no_data` blaming its geography codes.
+   */
+  it('pads a short state FIPS to the width the Census API matches on', async () => {
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'Garland County, Arkansas',
+        geographyFips: '051',
+        geographyGeoid: '05051',
+        variables: { B19013_001E: { estimate: 55409, label: 'B19013_001E', suppressed: false } },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'county',
+      geography_fips: '051',
+      parent_fips: '5',
+    });
+    const result = await censusQueryData.handler(input, ctx);
+
+    expect(mockQueryData).toHaveBeenCalledWith(
+      expect.objectContaining({ parentFips: '05' }),
+      expect.anything(),
+    );
+    expect(result.rows[0]?.geography_name).toBe('Garland County, Arkansas');
+  });
+
+  it('pads a short county FIPS to three digits', async () => {
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'Census Tract 1, Garland County, Arkansas',
+        geographyFips: '000100',
+        geographyGeoid: '05051000100',
+        variables: { B19013_001E: { estimate: 48000, label: 'B19013_001E', suppressed: false } },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'tract',
+      geography_fips: '000100',
+      parent_fips: '05',
+      county_fips: '51',
+    });
+    await censusQueryData.handler(input, ctx);
+
+    expect(mockQueryData).toHaveBeenCalledWith(
+      expect.objectContaining({ countyFips: '051' }),
+      expect.anything(),
+    );
+  });
+
+  it('reads a blank parent as omitted rather than padding it to zeros', async () => {
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'California',
+        geographyFips: '06',
+        geographyGeoid: '06',
+        variables: { B01001_001E: { estimate: 39000000, label: 'B01001_001E', suppressed: false } },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['B01001_001E'],
+      geography_level: 'state',
+      geography_fips: '06',
+      parent_fips: '',
+    });
+    await censusQueryData.handler(input, ctx);
+
+    expect(mockQueryData.mock.calls[0]?.[0]).not.toHaveProperty('parentFips');
+  });
+
+  /**
+   * `in=state:53 county:*` is the only hierarchy the Census API answers for every block group in
+   * a state — omitting county_fips is a 400, and a padded `00*` matches no county. So `*` has to
+   * clear the schema and reach the API as itself.
+   */
+  it('accepts a wildcard parent scope and sends it unpadded', async () => {
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'Block Group 1; Census Tract 9501; Adams County; Washington',
+        geographyFips: '1',
+        geographyGeoid: '5300195010011',
+        variables: { B01003_001E: { estimate: 832, label: 'B01003_001E', suppressed: false } },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['B01003_001E'],
+      geography_level: 'block group',
+      geography_fips: '*',
+      parent_fips: '53',
+      county_fips: '*',
+    });
+    await censusQueryData.handler(input, ctx);
+
+    expect(mockQueryData).toHaveBeenCalledWith(
+      expect.objectContaining({ parentFips: '53', countyFips: '*' }),
+      expect.anything(),
+    );
+  });
+
+  it('rejects a non-numeric parent at the schema boundary', () => {
+    expect(
+      censusQueryData.input.safeParse({
+        variables: ['B19013_001E'],
+        geography_level: 'county',
+        geography_fips: '051',
+        parent_fips: 'WA',
+      }).success,
+    ).toBe(false);
+    expect(
+      censusQueryData.input.safeParse({
+        variables: ['B19013_001E'],
+        geography_level: 'tract',
+        geography_fips: '000100',
+        parent_fips: '05',
+        county_fips: '0510',
+      }).success,
+    ).toBe(false);
+  });
+
+  /**
+   * geography_fips takes its width from geography_level and also accepts `*`, so it has no
+   * single width to pad to and is passed through exactly as given.
+   */
+  it('passes geography_fips through unpadded', async () => {
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'Somewhere',
+        geographyFips: '51',
+        geographyGeoid: '0551',
+        variables: { B19013_001E: { estimate: 1, label: 'B19013_001E', suppressed: false } },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'county',
+      geography_fips: '51',
+      parent_fips: '05',
+    });
+    await censusQueryData.handler(input, ctx);
+
+    expect(mockQueryData).toHaveBeenCalledWith(
+      expect.objectContaining({ geographyFips: '51' }),
+      expect.anything(),
+    );
+  });
+
+  it('no_data recovery names the literal FIPS width instead of only doubting the codes', async () => {
+    mockQueryData.mockResolvedValue([]);
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'county',
+      geography_fips: '51',
+      parent_fips: '05',
+    });
+    await expect(censusQueryData.handler(input, ctx)).rejects.toMatchObject({
+      data: { recovery: { hint: expect.stringContaining('"051", not "51"') } },
+    });
+  });
+
+  /**
+   * dec/ddhca answers a query that omits POPGROUP with one population group's count rather than
+   * a total, and no POPGROUP code means "all groups". The applied label is the only thing that
+   * keeps 9,653,100 from reading as California's population.
+   */
+  it('requests the label attribute of each unset dimension and echoes it per row', async () => {
+    mockCheckPredicates.mockResolvedValue({
+      unset: [{ code: 'POPGROUP', label: 'Race/Ethnic Group', labelAttribute: 'POPGROUP_LABEL' }],
+      unknown: [],
+    });
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'California',
+        geographyFips: '06',
+        geographyGeoid: '06',
+        variables: { T01001_001N: { estimate: 9653100, label: 'T01001_001N', suppressed: false } },
+        appliedFilters: { POPGROUP: 'European alone' },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['T01001_001N'],
+      geography_level: 'state',
+      geography_fips: '06',
+      dataset: 'dec/ddhca',
+    });
+    const result = await censusQueryData.handler(input, ctx);
+
+    expect(mockQueryData).toHaveBeenCalledWith(
+      expect.objectContaining({ defaultLabelColumns: { POPGROUP: 'POPGROUP_LABEL' } }),
+      expect.anything(),
+    );
+    expect(result.rows[0]?.applied_filters).toEqual({ POPGROUP: 'European alone' });
+    expect(getEnrichment(ctx).notice).toContain('"European alone"');
+  });
+
+  it('asks for no label column for a dimension that publishes none', async () => {
+    mockCheckPredicates.mockResolvedValue({
+      unset: [{ code: 'YEAR', label: 'Vintage Year' }],
+      unknown: [],
+    });
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'Washington',
+        geographyFips: '53',
+        geographyGeoid: '53',
+        variables: { POP: { estimate: 7705267, label: 'POP', suppressed: false } },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['POP'],
+      geography_level: 'state',
+      geography_fips: '53',
+    });
+    const result = await censusQueryData.handler(input, ctx);
+
+    expect(mockQueryData.mock.calls[0]?.[0]).not.toHaveProperty('defaultLabelColumns');
+    expect(result.rows[0]?.applied_filters).toBeUndefined();
+  });
+
+  it('format shows the applied filter defaults beside the value', () => {
+    const output = {
+      rows: [
+        {
+          geography_name: 'California',
+          geography_fips: '06',
+          geography_geoid: '06',
+          variables: {
+            T01001_001N: { estimate: 9653100, label: 'Total population', suppressed: false },
+          },
+          applied_filters: { POPGROUP: 'European alone' },
+        },
+      ],
+    };
+    const blocks = censusQueryData.format!(output);
+    const text = (blocks[0] as { type: string; text: string }).text;
+    expect(text).toContain('POPGROUP = European alone');
   });
 
   it('formats output with geography names, FIPS, and variable values', () => {

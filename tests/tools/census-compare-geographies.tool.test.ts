@@ -8,7 +8,8 @@ import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { censusCompareGeographies } from '@/mcp-server/tools/definitions/census-compare-geographies.tool.js';
 
-vi.mock('@/services/census-api/census-api-service.js', () => ({
+vi.mock('@/services/census-api/census-api-service.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/services/census-api/census-api-service.js')>()),
   getCensusApiService: vi.fn(),
 }));
 
@@ -434,6 +435,58 @@ describe('censusCompareGeographies', () => {
     });
   });
 
+  /**
+   * `urban area` names no parent, so a `within` scope builds a hierarchy the Census API answers
+   * with an untyped 400 that names neither the offending input nor a way forward.
+   */
+  it('throws parent_not_accepted naming within as the input to drop', async () => {
+    mockCheckGeography.mockResolvedValue({
+      status: 'parent_not_accepted',
+      unacceptedParents: ['state'],
+      acceptedParents: [],
+    });
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'urban area',
+      within: '53',
+    });
+    await expect(censusCompareGeographies.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: {
+        reason: 'parent_not_accepted',
+        unacceptedParents: ['state'],
+        recovery: { hint: expect.stringContaining('Drop within') },
+      },
+    });
+    expect(mockQueryData).not.toHaveBeenCalled();
+  });
+
+  it('parent_not_accepted names within_county and the scope the level does take', async () => {
+    mockCheckGeography.mockResolvedValue({
+      status: 'parent_not_accepted',
+      unacceptedParents: ['county'],
+      acceptedParents: ['state'],
+    });
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'place',
+      within: '53',
+      within_county: '033',
+    });
+    await expect(censusCompareGeographies.handler(input, ctx)).rejects.toMatchObject({
+      data: {
+        reason: 'parent_not_accepted',
+        acceptedParents: ['state'],
+        recovery: { hint: expect.stringContaining('Drop within_county') },
+      },
+    });
+    expect(mockQueryData).not.toHaveBeenCalled();
+  });
+
   it('throws geography_not_supported before querying for a level the dataset lacks', async () => {
     mockCheckGeography.mockResolvedValue({
       status: 'level_not_supported',
@@ -852,7 +905,7 @@ describe('censusCompareGeographies — predicates', () => {
 
     const notice = getEnrichment(ctx).notice as string;
     expect(notice).toContain('NAICS2017 (2017 NAICS code)');
-    expect(notice).toContain('scoped to a category this query chose');
+    expect(notice).toContain('applied its own default');
     expect(notice.indexOf('NAICS2017')).toBeLessThan(notice.indexOf('Results truncated'));
   });
 
@@ -888,5 +941,194 @@ describe('censusCompareGeographies — predicates', () => {
       data: { reason: 'predicate_not_supported', unknownPredicates: ['NAICS2022'] },
     });
     expect(mockQueryData).not.toHaveBeenCalled();
+  });
+});
+
+describe('censusCompareGeographies — FIPS scope widths', () => {
+  const row = {
+    geographyName: 'Garland County, Arkansas',
+    geographyFips: '051',
+    geographyGeoid: '05051',
+    variables: { B19013_001E: { estimate: 55409, label: 'B19013_001E', suppressed: false } },
+  };
+
+  /**
+   * The Census API matches FIPS literally, so `in=state:5` scopes the comparison to nothing
+   * while `in=state:05` scopes it to Arkansas. census_resolve_geography pads the codes it hands
+   * back, so the two sides have to agree on the width.
+   */
+  it('pads a short within to the two digits a state FIPS carries', async () => {
+    mockQueryData.mockResolvedValue([row]);
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'county',
+      within: '5',
+    });
+    const result = await censusCompareGeographies.handler(input, ctx);
+
+    expect(mockQueryData).toHaveBeenCalledWith(
+      expect.objectContaining({ parentFips: '05' }),
+      expect.anything(),
+    );
+    expect(result.rows[0]?.geography_name).toBe('Garland County, Arkansas');
+  });
+
+  it('pads a short within_county to three digits', async () => {
+    mockQueryData.mockResolvedValue([row]);
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'tract',
+      within: '05',
+      within_county: '51',
+    });
+    await censusCompareGeographies.handler(input, ctx);
+
+    expect(mockQueryData).toHaveBeenCalledWith(
+      expect.objectContaining({ countyFips: '051' }),
+      expect.anything(),
+    );
+  });
+
+  it('reads a blank scope as omitted rather than padding it to zeros', async () => {
+    mockQueryData.mockResolvedValue([row]);
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'county',
+      within: '',
+    });
+    await censusCompareGeographies.handler(input, ctx);
+
+    expect(mockQueryData.mock.calls[0]?.[0]).not.toHaveProperty('parentFips');
+  });
+
+  /**
+   * `in=state:53 county:*` is the only hierarchy the Census API answers for every block group in
+   * a state, and a padded `00*` matches no county — so a wildcard scope has to clear the schema
+   * and reach the API as itself.
+   */
+  it('accepts a wildcard scope and sends it unpadded', async () => {
+    mockQueryData.mockResolvedValue([row]);
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'block group',
+      within: '53',
+      within_county: '*',
+    });
+    await censusCompareGeographies.handler(input, ctx);
+
+    expect(mockQueryData).toHaveBeenCalledWith(
+      expect.objectContaining({ parentFips: '53', countyFips: '*' }),
+      expect.anything(),
+    );
+  });
+
+  it('rejects a non-numeric scope at the schema boundary', () => {
+    expect(
+      censusCompareGeographies.input.safeParse({
+        variables: ['B19013_001E'],
+        geography_level: 'county',
+        within: 'WA',
+      }).success,
+    ).toBe(false);
+    expect(
+      censusCompareGeographies.input.safeParse({
+        variables: ['B19013_001E'],
+        geography_level: 'tract',
+        within: '05',
+        within_county: '0510',
+      }).success,
+    ).toBe(false);
+  });
+});
+
+describe('censusCompareGeographies — applied filter defaults', () => {
+  /**
+   * A ranking on a dataset that defaults a dimension to one category ranks that category, not
+   * the whole. The applied label is what stops a POPGROUP-scoped ranking from reading as a
+   * ranking of total population.
+   */
+  it('requests the label attribute of each unset dimension and echoes it per row', async () => {
+    mockCheckPredicates.mockResolvedValue({
+      unset: [{ code: 'NAICS2017', label: '2017 NAICS code', labelAttribute: 'NAICS2017_LABEL' }],
+      unknown: [],
+    });
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'King County, WA',
+        geographyFips: '033',
+        geographyGeoid: '53033',
+        variables: { ESTAB: { estimate: 70376, label: 'ESTAB', suppressed: false } },
+        appliedFilters: { NAICS2017: 'Total for all sectors' },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['ESTAB'],
+      geography_level: 'county',
+      within: '53',
+      dataset: 'cbp',
+    });
+    const result = await censusCompareGeographies.handler(input, ctx);
+
+    expect(mockQueryData).toHaveBeenCalledWith(
+      expect.objectContaining({ defaultLabelColumns: { NAICS2017: 'NAICS2017_LABEL' } }),
+      expect.anything(),
+    );
+    expect(result.rows[0]?.applied_filters).toEqual({ NAICS2017: 'Total for all sectors' });
+    expect(getEnrichment(ctx).notice).toContain('"Total for all sectors"');
+  });
+
+  it('asks for no label column for a dimension that publishes none', async () => {
+    mockCheckPredicates.mockResolvedValue({
+      unset: [{ code: 'YEAR', label: 'Vintage Year' }],
+      unknown: [],
+    });
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'King County, WA',
+        geographyFips: '033',
+        geographyGeoid: '53033',
+        variables: { ESTAB: { estimate: 70376, label: 'ESTAB', suppressed: false } },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['ESTAB'],
+      geography_level: 'county',
+      within: '53',
+      dataset: 'cbp',
+    });
+    const result = await censusCompareGeographies.handler(input, ctx);
+
+    expect(mockQueryData.mock.calls[0]?.[0]).not.toHaveProperty('defaultLabelColumns');
+    expect(result.rows[0]?.applied_filters).toBeUndefined();
+  });
+
+  it('format shows the applied filter defaults beside the ranked value', () => {
+    const output = {
+      rows: [
+        {
+          geography_name: 'King County, WA',
+          geography_fips: '033',
+          geography_geoid: '53033',
+          variables: { ESTAB: { estimate: 70376, label: 'Establishments', suppressed: false } },
+          applied_filters: { NAICS2017: 'Total for all sectors' },
+          rank: 1,
+        },
+      ],
+    };
+    const blocks = censusCompareGeographies.format!(output);
+    const text = (blocks[0] as { type: string; text: string }).text;
+    expect(text).toContain('NAICS2017 = Total for all sectors');
   });
 });

@@ -6,6 +6,13 @@
 /** A single row of Census API data with labeled variable values. */
 export interface CensusDataRow {
   /**
+   * Labels of the filter defaults the Census API applied on its own, keyed by predicate code
+   * (e.g. `{ POPGROUP: 'European alone' }`). Present only for dimensions the query left unset
+   * that publish a label attribute. A default is not always an all-categories total, so the
+   * label is what tells a total apart from one arbitrary category.
+   */
+  appliedFilters?: Record<string, string>;
+  /**
    * FIPS code of the geography at the queried level only, without its parents
    * (e.g., "033" for King County). This is the value the Census API `for=` clause
    * takes, so it round-trips into census_query_data's geography_fips input.
@@ -51,7 +58,22 @@ export type GeographyCheck =
       missingParents: string[];
       /** True when a `*` target would drop at least one of the missing parents. */
       wildcardRelaxes: boolean;
+    }
+  | {
+      status: 'parent_not_accepted';
+      /** Supplied parents the level does not name — `state`, `county`, or both. */
+      unacceptedParents: string[];
+      /** Every parent the level does name, in hierarchy order. Empty when it takes none. */
+      acceptedParents: string[];
     };
+
+/** One code a filter dimension accepts, with the label the dataset publishes for it. */
+export interface CensusPredicateValue {
+  /** The value to send in a predicates map (e.g. "210"). */
+  code: string;
+  /** Human-readable label (e.g. "Establishments with less than 5 employees"). */
+  label: string;
+}
 
 /** A single variable value from a Census data query. */
 export interface CensusVariableValue {

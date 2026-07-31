@@ -10,6 +10,7 @@ import {
   CensusApiService,
   getCensusApiService,
   initCensusApiService,
+  padFips,
 } from '@/services/census-api/census-api-service.js';
 
 vi.mock('@/config/server-config.js', () => ({
@@ -178,6 +179,85 @@ describe('CensusApiService.parseResponse — GEOID composition', () => {
     expect(rows[0]?.geographyGeoid).toBe('53033');
     expect(rows[0]?.geographyFips).toBe('033');
     expect(rows[0]?.variables.ESTAB?.estimate).toBe(577);
+  });
+
+  /**
+   * The applied-default label arrives as an extra column with no marker distinguishing it from
+   * a geography column, so leaving it out of the exclusion set splices "European alone" into
+   * the GEOID a caller round-trips back into another query.
+   */
+  it('excludes an applied-default label column from the composed GEOID', async () => {
+    queue([
+      ['NAME', 'T01001_001N', 'POPGROUP_LABEL', 'state', 'county'],
+      ['King County, Washington', '1119875', 'European alone', '53', '033'],
+    ]);
+
+    const rows = await service.queryData(
+      {
+        variables: ['T01001_001N'],
+        geographyLevel: 'county',
+        geographyFips: '*',
+        parentFips: '53',
+        defaultLabelColumns: { POPGROUP: 'POPGROUP_LABEL' },
+        dataset: 'dec/ddhca',
+        year: 2020,
+      },
+      createMockContext(),
+    );
+
+    expect(rows[0]?.geographyGeoid).toBe('53033');
+    expect(rows[0]?.geographyFips).toBe('033');
+    expect(rows[0]?.appliedFilters).toEqual({ POPGROUP: 'European alone' });
+  });
+
+  /**
+   * Requesting the bare predicate code in `get=` flips the API from applying one default to
+   * enumerating every category of it — 2,996 rows for a single state on dec/ddhca. Only the
+   * `_LABEL` attribute echoes the applied default back at one row.
+   */
+  it('requests the label attribute and never the bare predicate code', async () => {
+    queue([
+      ['NAME', 'T01001_001N', 'POPGROUP_LABEL', 'state'],
+      ['California', '9653100', 'European alone', '06'],
+    ]);
+
+    await service.queryData(
+      {
+        variables: ['T01001_001N'],
+        geographyLevel: 'state',
+        geographyFips: '06',
+        defaultLabelColumns: { POPGROUP: 'POPGROUP_LABEL' },
+        dataset: 'dec/ddhca',
+        year: 2020,
+      },
+      createMockContext(),
+    );
+
+    const getClause = requestedUrls[0]?.match(/[?&]get=([^&]*)/)?.[1] ?? '';
+    expect(decodeURIComponent(getClause)).toBe('NAME,T01001_001N,POPGROUP_LABEL');
+    expect(decodeURIComponent(getClause).split(',')).not.toContain('POPGROUP');
+  });
+
+  it('carries no appliedFilters when the query set every dimension itself', async () => {
+    queue([
+      ['NAME', 'T01001_001N', 'POPGROUP', 'state'],
+      ['California', '9653100', '1002', '06'],
+    ]);
+
+    const rows = await service.queryData(
+      {
+        variables: ['T01001_001N'],
+        geographyLevel: 'state',
+        geographyFips: '06',
+        predicates: { POPGROUP: '1002' },
+        dataset: 'dec/ddhca',
+        year: 2020,
+      },
+      createMockContext(),
+    );
+
+    expect(rows[0]?.appliedFilters).toBeUndefined();
+    expect(rows[0]?.geographyGeoid).toBe('06');
   });
 
   it('matches the geography column however the caller cased the level name', async () => {
@@ -440,6 +520,69 @@ describe('CensusApiService.checkGeography', () => {
     await expect(check('County')).resolves.toEqual({ status: 'ok' });
   });
 
+  /**
+   * The mirror of the missing-parent case. `zip code tabulation area` names no parent at all,
+   * so the `in=state:53` clause built from a supplied state is a hierarchy the Census API
+   * answers with an opaque 400 — the same cached metadata already rules it out.
+   */
+  it('rejects a state parent on a level that names no parent', async () => {
+    await expect(check('zip code tabulation area', { parentFips: '53' })).resolves.toEqual({
+      status: 'parent_not_accepted',
+      unacceptedParents: ['state'],
+      acceptedParents: [],
+    });
+  });
+
+  it('rejects a county parent on a level whose only parent is state', async () => {
+    await expect(
+      check('state legislative district (upper chamber)', { parentFips: '53', countyFips: '033' }),
+    ).resolves.toEqual({
+      status: 'parent_not_accepted',
+      unacceptedParents: ['county'],
+      acceptedParents: ['state'],
+    });
+  });
+
+  it('names both parents when a level that takes neither was given both', async () => {
+    await expect(
+      check('zip code tabulation area', { parentFips: '53', countyFips: '033' }),
+    ).resolves.toEqual({
+      status: 'parent_not_accepted',
+      unacceptedParents: ['state', 'county'],
+      acceptedParents: [],
+    });
+  });
+
+  /**
+   * Acceptance is a property of the level, not of the `*` relaxation: a wildcard changes which
+   * parents are mandatory, never which ones are allowed. `tract` names county under
+   * optionalWithWCFor, so a `*` target drops it from the mandatory set — reading acceptance off
+   * that relaxed set would reject the county scope on the most ordinary tract comparison there
+   * is, one the live API answers.
+   */
+  it('still accepts a parent the wildcard made optional', async () => {
+    await expect(
+      check('tract', { geographyFips: '*', parentFips: '53', countyFips: '033' }),
+    ).resolves.toEqual({ status: 'ok' });
+    await expect(
+      check('block group', { geographyFips: '*', parentFips: '53', countyFips: '033' }),
+    ).resolves.toEqual({ status: 'ok' });
+  });
+
+  /**
+   * A level can be under-scoped and over-scoped at once. The missing parent is the actionable
+   * half — reporting the unaccepted one first sends the caller to drop an input and hit
+   * `parent_required` on the retry.
+   */
+  it('reports a missing required parent ahead of an unaccepted one', async () => {
+    await expect(
+      check('state legislative district (upper chamber)', { countyFips: '033' }),
+    ).resolves.toMatchObject({
+      status: 'parent_required',
+      missingParents: ['state'],
+    });
+  });
+
   it('defers to the data call when the dataset+year has no geography metadata', async () => {
     // A 404 from geography.json (unavailable year) yields an empty level list.
     responses = [];
@@ -484,6 +627,137 @@ describe('CensusApiService.fetchGeographyLevels', () => {
 
     expect(requestedUrls).toHaveLength(2);
     expect(requestedUrls[1]).toContain('/2022/acs/acs5/geography.json');
+  });
+});
+
+describe('CensusApiService.fetchPredicateValues', () => {
+  const enumerate = (overrides: Record<string, unknown> = {}) =>
+    service.fetchPredicateValues(
+      {
+        dataset: 'cbp',
+        year: 2023,
+        code: 'EMPSZES',
+        labelAttribute: 'EMPSZES_LABEL',
+        ...overrides,
+      },
+      createMockContext(),
+    );
+
+  it('reads the wildcard group-by response into labeled codes', async () => {
+    queue([
+      ['EMPSZES_LABEL', 'EMPSZES', 'us'],
+      ['All establishments', '001', '1'],
+      ['Establishments with less than 5 employees', '210', '1'],
+    ]);
+
+    await expect(enumerate()).resolves.toEqual([
+      { code: '001', label: 'All establishments' },
+      { code: '210', label: 'Establishments with less than 5 employees' },
+    ]);
+    expect(requestedUrls[0]).toContain('EMPSZES=*');
+    expect(requestedUrls[0]).toContain('get=EMPSZES_LABEL');
+  });
+
+  /** A wildcarded dimension repeats each code once per combination of the others. */
+  it('returns each code once even when the response repeats it', async () => {
+    queue([
+      ['YEAR', 'YEAR', 'us'],
+      ['2020', '2020', '1'],
+      ['2020', '2020', '1'],
+      ['2021', '2021', '1'],
+    ]);
+
+    const values = await service.fetchPredicateValues(
+      { dataset: 'pep/charv', year: 2023, code: 'YEAR' },
+      createMockContext(),
+    );
+
+    expect(values).toEqual([
+      { code: '2020', label: '2020' },
+      { code: '2021', label: '2021' },
+    ]);
+  });
+
+  it('scopes the enumeration by an industry when one is supplied', async () => {
+    queue([
+      ['TAXSTAT_LABEL', 'TAXSTAT', 'NAICS2022', 'us'],
+      ['All establishments', '00', '62', '1'],
+      ['Establishments subject to federal income tax', 'T', '62', '1'],
+    ]);
+
+    const values = await service.fetchPredicateValues(
+      {
+        dataset: 'ecnbasic',
+        year: 2022,
+        code: 'TAXSTAT',
+        labelAttribute: 'TAXSTAT_LABEL',
+        naicsScope: { code: 'NAICS2022', value: '62' },
+      },
+      createMockContext(),
+    );
+
+    expect(values).toHaveLength(2);
+    expect(requestedUrls[0]).toContain('&NAICS2022=62');
+  });
+
+  it('reads a 204 as no codes rather than an unparseable response', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => Promise.resolve(new Response(null, { status: 204 }))),
+    );
+
+    await expect(enumerate()).resolves.toEqual([]);
+  });
+
+  it('serves a repeat dimension from cache but refetches for a different industry scope', async () => {
+    queue(
+      [
+        ['EMPSZES_LABEL', 'EMPSZES', 'us'],
+        ['All establishments', '001', '1'],
+      ],
+      [
+        ['EMPSZES_LABEL', 'EMPSZES', 'NAICS2017', 'us'],
+        ['All establishments', '001', '62', '1'],
+      ],
+    );
+
+    await enumerate();
+    await enumerate();
+    expect(requestedUrls).toHaveLength(1);
+
+    await enumerate({ naicsScope: { code: 'NAICS2017', value: '62' } });
+    expect(requestedUrls).toHaveLength(2);
+  });
+});
+
+describe('padFips', () => {
+  /**
+   * The Census API compares FIPS literally, so `state:5` finds nothing where `state:05` finds
+   * Arkansas. Both parent inputs have a fixed width, which makes padding unambiguous.
+   */
+  it('zero-pads a short code to the width the Census stores', () => {
+    expect(padFips('5', 2)).toBe('05');
+    expect(padFips('51', 3)).toBe('051');
+  });
+
+  it('leaves a full-width code alone', () => {
+    expect(padFips('05', 2)).toBe('05');
+    expect(padFips('051', 3)).toBe('051');
+  });
+
+  it('reads a blank or absent value as omitted', () => {
+    expect(padFips('', 2)).toBeUndefined();
+    expect(padFips('   ', 2)).toBeUndefined();
+    expect(padFips(undefined, 2)).toBeUndefined();
+  });
+
+  /**
+   * `in=state:53 county:*` is the only hierarchy that reaches every block group in a state, so
+   * `*` has to survive as itself — padded it becomes `00*`, which matches no county.
+   */
+  it('passes a wildcard scope through unpadded', () => {
+    expect(padFips('*', 2)).toBe('*');
+    expect(padFips('*', 3)).toBe('*');
   });
 });
 

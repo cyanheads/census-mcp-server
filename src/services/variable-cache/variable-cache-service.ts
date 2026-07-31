@@ -57,7 +57,7 @@ export function isAcsDataset(dataset: string): boolean {
  * component and defaults to the whole geography, and every Census dataset declares it — listing
  * it beside real filter dimensions like `NAICS2017` would bury the ones that change the answer.
  */
-const NON_FILTERING_PREDICATES = new Set(['GEOCOMP']);
+export const NON_FILTERING_PREDICATES = new Set(['GEOCOMP']);
 
 /** Join codes into readable prose: `A`, `A and B`, `A, B, and C`. */
 function listCodes(codes: string[]): string {
@@ -67,23 +67,53 @@ function listCodes(codes: string[]): string {
 }
 
 /**
+ * Map each unset dimension to the attribute column that echoes back the label of the default
+ * the Census API applied, skipping the dimensions that publish none. Both data tools share it
+ * so the row echo and the warning wording cannot drift apart.
+ *
+ * Requesting the bare predicate code instead of its attribute would flip the API from applying
+ * one default to enumerating every category of it.
+ */
+export function defaultLabelColumnsFor(unset: UnsetPredicate[]): Record<string, string> {
+  return Object.fromEntries(
+    unset.flatMap((p) => (p.labelAttribute ? [[p.code, p.labelAttribute]] : [])),
+  );
+}
+
+/**
  * Word the warning that a query left filter dimensions unset. Both data tools share it so the
  * two cannot drift into warning about the same silent default with different force.
  *
  * The default the Census API substitutes is not one shape: `cbp` defaults `NAICS2017` to the
- * all-industries total, while `pep/charv` defaults `YEAR` to a single vintage (2020) and returns
- * a row per matching combination. Calling every default an all-category total would be wrong for
- * the second kind, so the warning says only what holds for both — the value is scoped by
- * something the caller did not choose.
+ * all-industries total, while `dec/ddhca` defaults `POPGROUP` to a single population group and
+ * `ecnbasic` defaults its NAICS dimension to one sector. Calling every default an all-category
+ * total would be wrong, so `applied` carries the label the API echoed back per dimension and the
+ * warning names it — that label is what separates a total from one ordinary category.
+ *
+ * A dimension that publishes no label attribute (`pep/charv` `YEAR`, the `nonemp` NAICS codes
+ * before 2012) echoes nothing, so it is named as unreadable rather than left looking like a
+ * dimension no default was applied to.
  */
 export function describeUnsetPredicates(
   unset: UnsetPredicate[],
   dataset: string,
   year: number,
+  applied: Record<string, string> = {},
 ): string {
-  const named = unset.map((p) => `${p.code} (${p.label})`).join(', ');
+  const named = unset
+    .map((p) => {
+      const label = applied[p.code];
+      return label
+        ? `${p.code} (${p.label}) — the API applied "${label}"`
+        : `${p.code} (${p.label}) — which value the API applied is not visible, since this dimension publishes no label`;
+    })
+    .join('; ');
   const example = unset[0]?.code ?? '';
-  return `${dataset} (${year}) filters on dimensions this query left unset: ${named}. The Census API applied its own default to each — an all-categories total for some dimensions, one fixed category for others — so no value here is scoped to a category this query chose, and one geography can come back on more than one row. Set them explicitly to control what the numbers cover, e.g. {"${example}": "<code>"}.`;
+  const echo =
+    Object.keys(applied).length > 0
+      ? ' The labels quoted above are repeated on every row under applied_filters, and reading them is what separates a value that is a total from one that is not: a default is the all-categories total on some dimensions and one ordinary category on others.'
+      : ' A default is the all-categories total on some dimensions and one ordinary category on others, and nothing in the response says which this one is.';
+  return `${dataset} (${year}) filters on dimensions this query left unset: ${named}. The Census API applied its own default to each rather than rejecting the query.${echo} One geography can also come back on more than one row. Set a dimension explicitly to control what the numbers cover, e.g. {"${example}": "<code>"}; census_list_predicate_values enumerates the codes each one accepts.`;
 }
 
 /**
@@ -110,7 +140,7 @@ export function describeEmptyPredicatedResult(
 
   if (supplied.length > 0) {
     parts.push(
-      `A predicate value that does not exist in ${dataset} (${year}) also returns nothing rather than an error, so check the ${listCodes(supplied)} ${supplied.length === 1 ? 'value' : 'values'} this query sent.`,
+      `A predicate value that does not exist in ${dataset} (${year}) also returns nothing rather than an error, so check the ${listCodes(supplied)} ${supplied.length === 1 ? 'value' : 'values'} this query sent — census_list_predicate_values enumerates the codes each dimension accepts.`,
     );
   }
 
@@ -219,11 +249,40 @@ export class VariableCacheService {
     const unset: UnsetPredicate[] = [];
     for (const variable of variables.values()) {
       if (!variable.required || NON_FILTERING_PREDICATES.has(variable.code)) continue;
-      if (!supplied.has(variable.code)) unset.push({ code: variable.code, label: variable.label });
+      if (!supplied.has(variable.code)) {
+        unset.push({
+          code: variable.code,
+          label: variable.label,
+          ...(variable.labelAttribute && { labelAttribute: variable.labelAttribute }),
+        });
+      }
     }
     unset.sort((a, b) => a.code.localeCompare(b.code));
 
     return { unset, unknown: params.supplied.filter((code) => !variables.has(code)) };
+  }
+
+  /** Look up one variable, returning undefined rather than throwing when it is not defined. */
+  async findVariable(
+    code: string,
+    dataset: string,
+    year: number,
+    ctx: Context,
+  ): Promise<CensusVariable | undefined> {
+    const variables = await this.getVariables(dataset, year, ctx);
+    return variables.get(code);
+  }
+
+  /** The dataset's filter dimensions — every variable it marks required that changes the answer. */
+  async getFilterDimensions(
+    dataset: string,
+    year: number,
+    ctx: Context,
+  ): Promise<CensusVariable[]> {
+    const variables = await this.getVariables(dataset, year, ctx);
+    return [...variables.values()]
+      .filter((v) => v.required && !NON_FILTERING_PREDICATES.has(v.code))
+      .sort((a, b) => a.code.localeCompare(b.code));
   }
 
   /** Validate that a dataset code is known. */
@@ -315,6 +374,15 @@ export class VariableCacheService {
 
       if (entry.universe) variable.universe = entry.universe;
       if (entry.required != null) variable.required = true;
+      if (entry.values?.item) variable.values = entry.values.item;
+
+      // `attributes` is a comma-separated list mixing flag columns with the label column
+      // (e.g. "NAICS2017_F,NAICS2017_LABEL,NAICS2017_F") — only the label one is useful here.
+      const labelAttribute = entry.attributes
+        ?.split(',')
+        .map((name) => name.trim())
+        .find((name) => name === `${code}_LABEL` || name === `${code}_DESC`);
+      if (labelAttribute) variable.labelAttribute = labelAttribute;
 
       // Infer E↔M sibling codes by suffix pattern. ACS variables.json omits M-suffix
       // (MOE) variables, but within ACS the pattern is reliable: B*E estimates always have a

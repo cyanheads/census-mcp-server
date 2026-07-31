@@ -6,9 +6,10 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getDiscoveryConfig } from '@/config/server-config.js';
-import { getCensusApiService } from '@/services/census-api/census-api-service.js';
+import { getCensusApiService, padFips } from '@/services/census-api/census-api-service.js';
 import {
   DATASET_LATEST_YEARS,
+  defaultLabelColumnsFor,
   describeEmptyPredicatedResult,
   describeUnsetPredicates,
   getVariableCacheService,
@@ -18,7 +19,7 @@ import {
 export const censusCompareGeographies = tool('census_compare_geographies', {
   title: 'Compare Census Geographies',
   description:
-    'Compare one or more variables across multiple geographies at the same level — all counties in a state, all states nationally, or a named set of specific geographies. Results are sorted and ranked. Covers queries like "rank states by poverty rate", "compare median income across WA counties", or "which census tracts in King County have the highest renter rate." Omit within to compare all geographies nationally at the level. Suppressed values are decoded to human-readable labels rather than passed through as raw negative sentinels. On the business datasets (cbp, ecnbasic, nonemp) and pep/charv, use predicates to rank within one industry, size class, or demographic dimension — a comparison that omits them ranks on the total across every category, which the response notice names.',
+    'Compare one or more variables across multiple geographies at the same level — all counties in a state, all states nationally, or a named set of specific geographies. Results are sorted and ranked. Covers queries like "rank states by poverty rate", "compare median income across WA counties", or "which census tracts in King County have the highest renter rate." Omit within to compare all geographies nationally at the level. Suppressed values are decoded to human-readable labels rather than passed through as raw negative sentinels. On the business datasets (cbp, ecnbasic, nonemp), pep/charv, and dec/ddhca, use predicates to rank within one industry, size class, or population group — a comparison that omits one ranks on a default the Census API picks, which is an all-categories total on some dimensions and a single category on others. Each row names the defaults that were applied in applied_filters, and census_list_predicate_values enumerates the codes a dimension accepts.',
   annotations: { readOnlyHint: true, openWorldHint: false },
   input: z.object({
     variables: z
@@ -32,16 +33,28 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
         'The level to compare across (e.g., "state", "county", "tract"). Use census_list_geographies to see valid values for the dataset.',
       ),
     within: z
-      .string()
+      .union([
+        z.literal(''),
+        z
+          .string()
+          .regex(/^(\*|\d{1,2})$/)
+          .describe('1 to 2 digits, zero-padded here to the 2 the Census stores, or "*".'),
+      ])
       .optional()
       .describe(
-        'State FIPS to constrain results (e.g., "53" to compare counties or tracts within WA only). Omit to compare all geographies at the level nationally. Use census_resolve_geography to get state_fips.',
+        'State FIPS to constrain results (e.g., "53" to compare counties or tracts within WA only). Omit to compare all geographies at the level nationally. Use census_resolve_geography to get state_fips. Pass "*" to span every state. Blank is treated as omitted.',
       ),
     within_county: z
-      .string()
+      .union([
+        z.literal(''),
+        z
+          .string()
+          .regex(/^(\*|\d{1,3})$/)
+          .describe('1 to 3 digits, zero-padded here to the 3 the Census stores, or "*".'),
+      ])
       .optional()
       .describe(
-        'County FIPS (3 digits) to constrain tract or block-group comparisons to a single county within the state specified by within (e.g., "033" for King County). Required when geography_level is "tract" or "block group" and you want county-scoped results. census_resolve_geography returns this as county_fips.',
+        'County FIPS to constrain tract or block-group comparisons to a single county within the state specified by within (e.g., "033" for King County). Required when geography_level is "tract" or "block group" and you want county-scoped results. census_resolve_geography returns this as county_fips. Pass "*" to span every county in the state, which is the only way a block-group comparison reaches a whole state. Blank is treated as omitted.',
       ),
     geographies: z
       .array(z.string())
@@ -53,7 +66,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
       .record(z.string(), z.string())
       .optional()
       .describe(
-        'Filter values keyed by variable code, applied to every geography in the comparison — e.g. {"NAICS2017": "5112"} to rank counties by their software-publisher establishment count in cbp. The business datasets (cbp, ecnbasic, nonemp) and pep/charv declare filter dimensions such as industry (NAICS2017/NAICS2022), legal form (LFO), size class (EMPSZES/RCPSZES), tax status (TAXSTAT), operation type (TYPOP), sex (SEX), and age (AGE). Leaving one unset is not an error: the Census API ranks on the total across every category of that dimension, so a ranking of all industries comes back looking like the industry-specific one. Any dimension left unset is named in the response notice. Code names vary by dataset and vintage — cbp 2023 uses NAICS2017 while nonemp 2023 uses NAICS2022 — so read them from the notice or from census_search_variables. NAICS values are standard North American Industry Classification System codes at any depth (51 information, 5112 software publishers); the other dimensions use short Census category codes documented with the dataset.',
+        'Filter values keyed by variable code, applied to every geography in the comparison — e.g. {"NAICS2017": "5112"} to rank counties by their software-publisher establishment count in cbp. The business datasets (cbp, ecnbasic, nonemp), pep/charv, and dec/ddhca declare filter dimensions such as industry (NAICS2017/NAICS2022), legal form (LFO), size class (EMPSZES/RCPSZES), tax status (TAXSTAT), operation type (TYPOP), sex (SEX), age (AGE), and population group (POPGROUP). Leaving one unset is not an error: the Census API substitutes its own default, which is the all-categories total on cbp NAICS2017 but a single population group on dec/ddhca POPGROUP and a single sector on ecnbasic NAICS2022 — so a ranking can read like an overall one without being it. Every unset dimension is named in the response notice and its applied default is echoed per row in applied_filters. Code names vary by dataset and vintage — cbp 2023 uses NAICS2017 while nonemp 2023 uses NAICS2022 — so read them from the notice or from census_search_variables. Call census_list_predicate_values for the codes a dimension accepts; NAICS values are standard North American Industry Classification System codes at any depth (51 information, 5112 software publishers).',
       ),
     dataset: z
       .string()
@@ -104,6 +117,13 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
               .describe(
                 'Map of variable code to value entry. Each key is a variable code from the variables input; each value has: estimate (number|null), moe (number|null, optional), label (string), suppressed (boolean).',
               ),
+            applied_filters: z
+              .object({})
+              .passthrough()
+              .optional()
+              .describe(
+                'Filter dimensions the comparison left unset, mapped to the label of the default the Census API applied (e.g. {"POPGROUP": "European alone"}). Present only on datasets that declare filter dimensions. The label is what tells an all-categories total apart from one ordinary category, so a ranking whose rows carry "European alone" ranks that group rather than total population. Set the dimension in predicates to choose it yourself.',
+              ),
             rank: z
               .number()
               .describe(
@@ -129,7 +149,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
       .string()
       .optional()
       .describe(
-        'Guidance when results were truncated, when geographies entries matched no row, when a bare level code matched more than one state, or when the dataset declares filter dimensions the query left unset — how to narrow scope, raise the limit, correct the FIPS codes, or add the predicates that make the ranking specific rather than an all-categories total.',
+        'Guidance when results were truncated, when geographies entries matched no row, when a bare level code matched more than one state, or when the dataset declares filter dimensions the comparison left unset — how to narrow scope, raise the limit, correct the FIPS codes, or add the predicates that pin what the ranking covers. For an unset dimension it also quotes the label of the default the Census API applied, which is what says whether the ranking is on a total or on one category.',
       ),
   },
 
@@ -160,6 +180,13 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
       when: 'The geography level requires a parent FIPS but within, or within_county, was not provided.',
       recovery:
         'Add the within parameter with the state FIPS from census_resolve_geography state_fips. For tract or block-group levels also add within_county from census_resolve_geography county_fips.',
+    },
+    {
+      reason: 'parent_not_accepted',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'within or within_county names a parent the geography level does not sit within.',
+      recovery:
+        'Drop the parent this level does not name. Levels such as urban area, zip code tabulation area, and metropolitan statistical area/micropolitan statistical area are compared nationally with no scope at all; census_list_geographies shows the parents each level takes.',
     },
     {
       reason: 'variable_not_found',
@@ -217,8 +244,11 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
 
     // Every geography at the level is fetched with a wildcard, then filtered client-side.
     const geographyFips = '*';
-    const parentFips = input.within?.trim() || undefined;
-    const countyFips = input.within_county?.trim() || undefined;
+    // The Census API matches FIPS literally — `state:5` finds nothing where `state:05` finds
+    // Arkansas. Both scopes have a fixed width, so padding is unambiguous. `*` is a scope
+    // rather than a code and passes through unpadded.
+    const parentFips = padFips(input.within, 2);
+    const countyFips = padFips(input.within_county, 3);
 
     const apiService = getCensusApiService();
 
@@ -272,6 +302,30 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
       );
     }
 
+    if (check.status === 'parent_not_accepted') {
+      const inputs = check.unacceptedParents.map((parent) =>
+        parent === 'state' ? 'within' : 'within_county',
+      );
+      const scope =
+        check.acceptedParents.length > 0
+          ? `it sits within ${check.acceptedParents.join(' and ')} only`
+          : 'it sits within no parent geography';
+      throw ctx.fail(
+        'parent_not_accepted',
+        `Geography level "${input.geography_level}" in ${dataset} (${year}) does not accept ${check.unacceptedParents.join(' or ')} as a parent.`,
+        {
+          dataset,
+          year,
+          geographyLevel: input.geography_level,
+          unacceptedParents: check.unacceptedParents,
+          acceptedParents: check.acceptedParents,
+          recovery: {
+            hint: `Drop ${inputs.join(' and ')} — ${scope}, so the comparison runs unscoped. Call census_list_geographies to see the parents each level takes.`,
+          },
+        },
+      );
+    }
+
     const variableCacheService = getVariableCacheService();
 
     // Reject unknown predicate keys before spending the call — the Census API answers them with
@@ -296,6 +350,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
     }
 
     const unfiltered = predicateCheck.unset;
+    const defaultLabelColumns = defaultLabelColumnsFor(unfiltered);
 
     // Fetch variable labels for enrichment (best-effort)
     const variableLabels: Map<string, string> = new Map();
@@ -321,6 +376,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
         ...(parentFips !== undefined && { parentFips }),
         ...(countyFips !== undefined && { countyFips }),
         ...(Object.keys(predicates).length > 0 && { predicates }),
+        ...(Object.keys(defaultLabelColumns).length > 0 && { defaultLabelColumns }),
         dataset,
         year,
       },
@@ -439,6 +495,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
         geography_fips: row.geographyFips,
         geography_geoid: row.geographyGeoid,
         variables: enrichedVariables,
+        ...(row.appliedFilters && { applied_filters: row.appliedFilters }),
         rank: idx + 1,
       };
     });
@@ -449,7 +506,10 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
     // Lead with the unfiltered-dimension warning: it says the ranking answers a different
     // question, which outranks advice about how much of that ranking was shown.
     if (unfiltered.length > 0) {
-      notices.push(describeUnsetPredicates(unfiltered, dataset, year));
+      // The API applies the same default to every row, so the first one names them all.
+      notices.push(
+        describeUnsetPredicates(unfiltered, dataset, year, rows[0]?.appliedFilters ?? {}),
+      );
     }
     if (truncated) {
       notices.push(
@@ -493,6 +553,12 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
         if (val.label && val.label !== code) {
           lines.push(`  *${val.label}*`);
         }
+      }
+      const applied = Object.entries(row.applied_filters ?? {});
+      if (applied.length > 0) {
+        lines.push(
+          `**Applied filter defaults:** ${applied.map(([code, label]) => `${code} = ${String(label)}`).join(' · ')}`,
+        );
       }
       lines.push('');
     }

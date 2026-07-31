@@ -1,6 +1,6 @@
 {
   "name": "census-mcp-server",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Query U.S. Census Bureau data, variables, and geography via MCP. STDIO or Streamable HTTP.",
   "author": {
     "name": "cyanheads",
@@ -15,7 +15,7 @@
   "interface": {
     "displayName": "census-mcp-server",
     "shortDescription": "Query U.S. Census Bureau data, variables, and geography via MCP.",
-    "longDescription": "Query U.S. Census Bureau data through the official Census Data API. List available datasets and their vintage years (census_list_datasets), search variables by human-readable concept like \"median household income\" (census_search_variables), and resolve place names to FIPS codes (census_resolve_geography). Retrieve estimates for a single geography (census_query_data) or rank and compare a measure across many geographies (census_compare_geographies), with geography discovery (census_list_geographies) and per-variable metadata (census_get_variable). Runs over stdio or Streamable HTTP; a free CENSUS_API_KEY is required for data queries, while variable search and geography resolution work without one.",
+    "longDescription": "Query U.S. Census Bureau data through the official Census Data API. List available datasets and their vintage years (census_list_datasets), search variables by human-readable concept like \"median household income\" (census_search_variables), and resolve place names to FIPS codes (census_resolve_geography). Retrieve estimates for a single geography (census_query_data) or rank and compare a measure across many geographies (census_compare_geographies), with geography discovery (census_list_geographies), per-variable metadata (census_get_variable), and filter-dimension value lookup (census_list_predicate_values). Runs over stdio or Streamable HTTP; a free CENSUS_API_KEY is required for data queries, while variable search and geography resolution work without one.",
     "developerName": "cyanheads",
     "category": "",
     "capabilities": ["Read"],

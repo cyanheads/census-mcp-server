@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.2.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/census-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/census-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/census-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.3.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/census-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/census-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/census-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -29,7 +29,7 @@
 
 ## Tools
 
-7 tools covering the full Census data workflow — from dataset discovery and variable search through geography resolution and ranked comparisons:
+8 tools covering the full Census data workflow — from dataset discovery and variable search through geography resolution and ranked comparisons:
 
 | Tool | Description |
 |:-----|:------------|
@@ -37,6 +37,7 @@
 | `census_list_geographies` | List the geography levels supported by a dataset and year, with parent requirements and example FIPS values. |
 | `census_search_variables` | Keyword search across variable labels and concept groups. On ACS, returns estimate and margin-of-error codes together. |
 | `census_get_variable` | Fetch full metadata for one or more variable codes — label, concept, predicate type, universe, MOE sibling. |
+| `census_list_predicate_values` | List the codes a filter dimension accepts (`EMPSZES`, `LFO`, `POPGROUP`, `NAICS2017`…), from the dataset dictionary or a live wildcard enumeration. |
 | `census_resolve_geography` | Convert place names (e.g., "King County, WA") or street addresses to Census FIPS identifiers via TIGERweb and Census Geocoder. |
 | `census_query_data` | Query a Census dataset for variables at a specific geography. Returns estimates with MOE, suppression codes resolved to readable reasons, and predicate filtering for the business datasets. |
 | `census_compare_geographies` | Rank and compare variables across multiple geographies — all counties in a state, all states nationally, or a named set. Sorted table output, with the same predicate filtering. |
@@ -65,6 +66,17 @@ Search Census variables by keyword.
 
 ---
 
+### `census_list_predicate_values`
+
+List the codes a filter dimension accepts, so a `predicates` map can be written without guessing.
+
+- Two routes, picked by where the answer lives: a dimension with a published value list is read from the dataset dictionary, one without is enumerated live by wildcarding it on the data endpoint. `NAICS*` and `POPGROUP` always publish one (thousands of codes — narrow them with `query`); on the current vintages `EMPSZES`, `LFO`, `RCPSZES`, `TAXSTAT`, and `TYPOP` publish none, so the live route is the only place their codes appear
+- Keyword `query` matches code and label; results are sorted by code and a truncated list is disclosed rather than passed off as complete
+- `ecnbasic` publishes `TAXSTAT` and `TYPOP` per industry, so `within_naics` scopes the enumeration — and the notice says the result is complete for that industry alone
+- Live enumerations are cached per dataset, year, dimension, and industry scope
+
+---
+
 ### `census_resolve_geography`
 
 Convert place names and addresses to Census FIPS identifiers.
@@ -86,10 +98,12 @@ Query a Census dataset for one or more variables at a specific geography.
 
 - Requires FIPS codes — use `census_resolve_geography` first for place names
 - Use `geography_fips: "*"` to return all geographies at the level within the parent
-- The level and its required parents are checked against the dataset's own geography metadata before the query runs, so a missing `parent_fips` returns `parent_required` naming what to add rather than an upstream 400
+- The level and its parents are checked against the dataset's own geography metadata before the query runs: a missing `parent_fips` returns `parent_required` naming what to add, and a parent the level does not sit within returns `parent_not_accepted` naming the input to drop — neither reaches the API as an opaque 400
+- `parent_fips` and `county_fips` are zero-padded to the widths the Census matches on, so `"5"` and `"05"` both find Arkansas; either also takes `"*"`, which is what reaches every block group in a state. `geography_fips` takes its width from `geography_level` and is passed through as given
 - Each row carries both `geography_fips` (bare level code, round-trips back into this tool) and `geography_geoid` (level plus parents, nationally unique)
 - A query that matches nothing returns `no_data` with dataset-aware recovery, not a retried upstream error
-- Optional `predicates` map for the datasets that filter on one — `{"NAICS2017": "5112"}` narrows a `cbp` count to software publishers. Keys are validated against the dataset's own variables before the query; dimensions left unset are named in a notice, because the Census API answers an omitted one with its own default rather than an error
+- Optional `predicates` map for the datasets that filter on one — `{"NAICS2017": "5112"}` narrows a `cbp` count to software publishers, and `census_list_predicate_values` supplies the codes. Keys are validated against the dataset's own variables before the query
+- Dimensions left unset are named in a notice and their applied default is echoed per row in `applied_filters`. That label is load-bearing: `cbp` defaults `NAICS2017` to the all-industries total, but `dec/ddhca` defaults `POPGROUP` to one population group and `ecnbasic` defaults its NAICS dimension to a single sector, so an unfiltered value can read like a total without being one. A dimension that publishes no label attribute (`pep/charv` `YEAR`, the `nonemp` NAICS codes before 2012) has no default to echo, and the notice says so rather than leaving it looking undefaulted
 - Suppression codes (geography too small, data not collected, etc.) resolved to human-readable reasons
 - Variable labels enriched from cache and surfaced alongside estimates
 - Requires `CENSUS_API_KEY`
@@ -105,7 +119,7 @@ Rank and compare variables across multiple geographies.
 - Optional `geographies` list to filter to specific geographies — full GEOIDs (`"53033"`, `"06037"`) work across states; bare level codes (`"033"`) need `within` to disambiguate. Entries matching no row, and bare codes that matched more than one state, are named in a notice
 - Same pre-query level and parent validation as `census_query_data`, reported against `within` / `within_county`
 - Configurable sort variable, direction, and limit (default 50, max 500)
-- Same `predicates` map as `census_query_data`, applied to every geography — without it a business-dataset ranking ranks on the all-categories total, which the notice names
+- Same `predicates` map as `census_query_data`, applied to every geography — without it the ranking runs on whatever default the API picks, named in the notice and echoed per row in `applied_filters`
 - Suppressed values sorted to end of results and labeled rather than passed through as negative sentinels
 - Requires `CENSUS_API_KEY`
 

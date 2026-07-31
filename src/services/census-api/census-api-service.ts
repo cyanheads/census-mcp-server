@@ -12,6 +12,7 @@ import { isAcsDataset } from '@/services/variable-cache/variable-cache-service.j
 import type {
   CensusDataRow,
   CensusGeographyLevel,
+  CensusPredicateValue,
   CensusRawResponse,
   CensusVariableValue,
   GeographyCheck,
@@ -20,14 +21,36 @@ import { SUPPRESSION_CODES } from './types.js';
 
 const CENSUS_API_BASE = 'https://api.census.gov/data';
 
+/**
+ * Zero-pad a fixed-width parent FIPS code to the width the Census API matches on, returning
+ * undefined for a blank value so it reads as omitted. State codes are 2 digits and county codes
+ * 3; the API compares them literally, so `state:5` finds nothing where `state:05` finds Arkansas.
+ *
+ * `*` is a scope, not a code — `in=state:53 county:*` is the only way to reach every block group
+ * in a state — so it passes through untouched rather than becoming `00*`.
+ */
+export function padFips(value: string | undefined, width: number): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return;
+  return trimmed === '*' ? trimmed : trimmed.padStart(width, '0');
+}
+
 interface GeographyLevelsCacheEntry {
   fetchedAt: number;
   levels: CensusGeographyLevel[];
 }
 
+interface PredicateValuesCacheEntry {
+  fetchedAt: number;
+  values: CensusPredicateValue[];
+}
+
 export class CensusApiService {
   /** geography.json per dataset+year — immutable upstream, cached for the discovery TTL. */
   private readonly geographyLevelsCache = new Map<string, GeographyLevelsCacheEntry>();
+
+  /** Wildcard group-by enumerations per dataset+year+dimension+NAICS scope. */
+  private readonly predicateValuesCache = new Map<string, PredicateValuesCacheEntry>();
 
   /**
    * Query a Census dataset for variables at a specific geography.
@@ -48,6 +71,13 @@ export class CensusApiService {
        * upstream — the API returns the aggregate across that dimension instead.
        */
       predicates?: Record<string, string>;
+      /**
+       * Attribute column to request per filter dimension the query left unset, keyed by
+       * predicate code (e.g. `{ POPGROUP: 'POPGROUP_LABEL' }`). The attribute carries the
+       * label of the default the API applied; requesting the bare predicate code instead
+       * would flip the API from applying one default to enumerating every category.
+       */
+      defaultLabelColumns?: Record<string, string>;
       dataset: string;
       year: number;
     },
@@ -55,7 +85,8 @@ export class CensusApiService {
   ): Promise<CensusDataRow[]> {
     const { censusApiKey } = getServerConfig();
 
-    const varList = ['NAME', ...params.variables].join(',');
+    const defaultLabelColumns = params.defaultLabelColumns ?? {};
+    const varList = ['NAME', ...params.variables, ...Object.values(defaultLabelColumns)].join(',');
     const forClause = `${params.geographyLevel}:${params.geographyFips}`;
 
     // Build compound in= clause: county FIPS requires state FIPS as the outer scope.
@@ -138,6 +169,7 @@ export class CensusApiService {
       params.geographyLevel,
       params.dataset,
       predicateKeys,
+      defaultLabelColumns,
       ctx,
     );
   }
@@ -189,15 +221,26 @@ export class CensusApiService {
     if (params.countyFips) supplied.add('county');
 
     const missingParents = effective.filter((name) => !supplied.has(name));
-    if (missingParents.length === 0) return { status: 'ok' };
+    if (missingParents.length > 0) {
+      // A concrete target can demand parents (e.g. block group needs its tract) that a `*`
+      // target would not — worth telling the caller, since `*` is an input they control.
+      const wildcardRelaxes =
+        params.geographyFips !== '*' &&
+        underWildcard.filter((name) => !supplied.has(name)).length < missingParents.length;
 
-    // A concrete target can demand parents (e.g. block group needs its tract) that a `*`
-    // target would not — worth telling the caller, since `*` is an input they control.
-    const wildcardRelaxes =
-      params.geographyFips !== '*' &&
-      underWildcard.filter((name) => !supplied.has(name)).length < missingParents.length;
+      return { status: 'parent_required', missingParents, wildcardRelaxes };
+    }
 
-    return { status: 'parent_required', missingParents, wildcardRelaxes };
+    // The mirror of the missing-parent case: a parent the level never names produces an
+    // `in=` clause the Census API answers with an opaque 400. Acceptance is a property of
+    // the level, so it is checked against the full `requires` list rather than `effective` —
+    // the `*` wildcard relaxes which parents are mandatory, never which ones are allowed.
+    const unacceptedParents = [...supplied].filter((name) => !required.includes(name));
+    if (unacceptedParents.length > 0) {
+      return { status: 'parent_not_accepted', unacceptedParents, acceptedParents: required };
+    }
+
+    return { status: 'ok' };
   }
 
   /**
@@ -271,12 +314,125 @@ export class CensusApiService {
     return levels;
   }
 
+  /**
+   * Enumerate the codes a filter dimension accepts, by wildcarding it on the data endpoint.
+   *
+   * Setting `<CODE>=*` turns the predicate into a group-by, so the response carries one row
+   * per code the dimension takes for the scope queried. `variables.json` publishes a
+   * `values.item` map for only two dimensions across the whole catalog, so this is the only
+   * route to the rest. Cached per dataset+year+dimension+scope with the discovery TTL.
+   *
+   * The scope matters: on `ecnbasic` the codes `TAXSTAT` and `TYPOP` take are published per
+   * industry, so an unscoped call returns only the all-establishments row and a `naicsScope`
+   * is what makes the enumeration useful — and complete only for that industry.
+   */
+  async fetchPredicateValues(
+    params: {
+      dataset: string;
+      year: number;
+      /** The filter dimension to enumerate (e.g. "EMPSZES"). */
+      code: string;
+      /** Attribute column carrying each code's label (e.g. "EMPSZES_LABEL"), when published. */
+      labelAttribute?: string;
+      /** NAICS dimension code and industry value to scope the enumeration by. */
+      naicsScope?: { code: string; value: string };
+    },
+    ctx: Context,
+  ): Promise<CensusPredicateValue[]> {
+    const { censusApiKey } = getServerConfig();
+    const ttlMs = getDiscoveryConfig().variableCacheTtlHours * 60 * 60 * 1000;
+    const scopeKey = params.naicsScope
+      ? `${params.naicsScope.code}=${params.naicsScope.value}`
+      : '';
+    const cacheKey = `${params.dataset}|${params.year}|${params.code}|${scopeKey}`;
+    const cached = this.predicateValuesCache.get(cacheKey);
+    if (cached && Date.now() - cached.fetchedAt < ttlMs) {
+      ctx.log.debug('Predicate values cache hit', { dataset: params.dataset, code: params.code });
+      return cached.values;
+    }
+
+    const scopeClause = params.naicsScope
+      ? `&${encodeURIComponent(params.naicsScope.code)}=${encodeURIComponent(params.naicsScope.value)}`
+      : '';
+    const url = `${CENSUS_API_BASE}/${params.year}/${params.dataset}?get=${encodeURIComponent(params.labelAttribute ?? params.code)}&${encodeURIComponent(params.code)}=*${scopeClause}&for=us:1&key=${censusApiKey}`;
+
+    ctx.log.debug('Enumerating predicate values', {
+      dataset: params.dataset,
+      year: params.year,
+      code: params.code,
+    });
+
+    const raw = await withRetry(
+      async () => {
+        const response = await fetchWithTimeout(url, 15_000, ctx as unknown as RequestContext, {
+          signal: ctx.signal,
+        });
+        const text = await response.text();
+
+        // A dimension with nothing to enumerate under this scope answers 204 with no body.
+        if (response.status === 204 || text.trim() === '') return [] as CensusRawResponse;
+
+        if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
+          throw serviceUnavailable('Census API returned HTML instead of JSON.', {
+            reason: 'upstream_error',
+          });
+        }
+
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          throw serviceUnavailable('Census API returned unparseable response.', {
+            reason: 'upstream_error',
+          });
+        }
+
+        if (!Array.isArray(parsed)) {
+          throw serviceUnavailable('Census API response was not an array.', {
+            reason: 'upstream_error',
+          });
+        }
+
+        return parsed as CensusRawResponse;
+      },
+      {
+        operation: 'CensusApiService.fetchPredicateValues',
+        context: ctx as unknown as RequestContext,
+        baseDelayMs: 1000,
+        signal: ctx.signal,
+      },
+    );
+
+    const values: CensusPredicateValue[] = [];
+    if (raw.length > 1) {
+      const headers = raw[0] as string[];
+      const codeIdx = headers.indexOf(params.code);
+      const labelIdx = params.labelAttribute ? headers.indexOf(params.labelAttribute) : -1;
+      const seen = new Set<string>();
+
+      for (let i = 1; i < raw.length; i++) {
+        const row = raw[i] as string[];
+        const code = codeIdx >= 0 ? (row[codeIdx] ?? '') : '';
+        // A wildcarded dimension repeats codes across the other dimensions' rows.
+        if (!code || seen.has(code)) continue;
+        seen.add(code);
+        values.push({ code, label: (labelIdx >= 0 ? row[labelIdx] : undefined) || code });
+      }
+      values.sort((a, b) => a.code.localeCompare(b.code));
+    }
+
+    this.predicateValuesCache.set(cacheKey, { values, fetchedAt: Date.now() });
+    ctx.log.info('Predicate values enumerated', { code: params.code, valueCount: values.length });
+    return values;
+  }
+
   private parseResponse(
     raw: CensusRawResponse,
     requestedVariables: string[],
     geographyLevel: string,
     dataset: string,
     predicateKeys: string[],
+    defaultLabelColumns: Record<string, string>,
     ctx: Context,
   ): CensusDataRow[] {
     if (raw.length < 1) return [];
@@ -293,12 +449,19 @@ export class CensusApiService {
     // echoes back every predicate that was filtered on. Once NAME, the requested variables,
     // and those echoed predicates are excluded, what remains is the geography hierarchy, and
     // concatenating it in order composes the full GEOID.
-    const nonGeoColumns = new Set([...requestedVariables, ...predicateKeys]);
+    const nonGeoColumns = new Set([
+      ...requestedVariables,
+      ...predicateKeys,
+      ...Object.values(defaultLabelColumns),
+    ]);
     const geoColumnIdxs = headers.flatMap((header, idx) =>
       header !== 'NAME' && !nonGeoColumns.has(header) ? [idx] : [],
     );
     const variableIdxs = requestedVariables
       .map((code) => [code, headers.indexOf(code)] as const)
+      .filter(([, idx]) => idx >= 0);
+    const appliedFilterIdxs = Object.entries(defaultLabelColumns)
+      .map(([code, column]) => [code, headers.indexOf(column)] as const)
       .filter(([, idx]) => idx >= 0);
 
     const rows: CensusDataRow[] = [];
@@ -342,7 +505,19 @@ export class CensusApiService {
         }
       }
 
-      rows.push({ geographyName, geographyFips, geographyGeoid, variables });
+      const appliedFilters: Record<string, string> = {};
+      for (const [code, idx] of appliedFilterIdxs) {
+        const label = row[idx];
+        if (label) appliedFilters[code] = label;
+      }
+
+      rows.push({
+        geographyName,
+        geographyFips,
+        geographyGeoid,
+        variables,
+        ...(Object.keys(appliedFilters).length > 0 && { appliedFilters }),
+      });
     }
 
     ctx.log.info('Census API response parsed', { rowCount: rows.length });

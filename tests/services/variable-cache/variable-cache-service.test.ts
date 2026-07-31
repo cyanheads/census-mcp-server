@@ -109,6 +109,49 @@ const cbpVariablesJson = {
   },
 };
 
+/**
+ * A trimmed dec/ddhca variables.json. POPGROUP is the one dimension it filters on and it
+ * carries both a published value map and the `_LABEL` attribute.
+ */
+const ddhcaVariablesJson = {
+  variables: {
+    T01001_001N: { label: 'Total population', concept: 'Total Population', predicateType: 'int' },
+    POPGROUP: {
+      label: 'Race/Ethnic Group',
+      required: 'default displayed',
+      predicateType: 'string',
+      attributes: 'POPGROUP_LABEL',
+      values: { item: { '001': 'Total population', '1002': 'European alone' } },
+    },
+    GEOCOMP: { label: 'GEO_ID Component', required: 'default displayed', predicateType: 'string' },
+  },
+};
+
+/**
+ * A trimmed ecnbasic variables.json. TAXSTAT publishes no value map, only a label attribute;
+ * NAICS2022 carries the mixed flag/label `attributes` list the Census publishes for it.
+ */
+const ecnbasicVariablesJson = {
+  variables: {
+    ESTAB: { label: 'Number of establishments', concept: 'Economic Census', predicateType: 'int' },
+    NAICS2022: {
+      label: '2022 NAICS code',
+      required: 'default displayed',
+      predicateType: 'string',
+      attributes: 'NAICS2022_F,NAICS2022_LABEL,NAICS2022_F',
+      values: {
+        item: { '00': 'Total for all sectors', '62': 'Health Care and Social Assistance' },
+      },
+    },
+    TAXSTAT: {
+      label: 'Tax status code',
+      required: 'default displayed',
+      predicateType: 'string',
+      attributes: 'TAXSTAT_LABEL',
+    },
+  },
+};
+
 describe('isAcsDataset', () => {
   it.each(['acs/acs5', 'acs/acs5/profile', 'acs/acs5/subject', 'acs/acs1', 'acs/acs1/profile'])(
     'treats %s as ACS',
@@ -292,6 +335,67 @@ describe('VariableCacheService.checkPredicates', () => {
   });
 });
 
+describe('VariableCacheService — filter dimension metadata', () => {
+  it('captures the published value map and the label attribute of a dimension', async () => {
+    queue(ddhcaVariablesJson);
+
+    const popgroup = await service.findVariable('POPGROUP', 'dec/ddhca', 2020, createMockContext());
+
+    expect(popgroup?.labelAttribute).toBe('POPGROUP_LABEL');
+    expect(popgroup?.values).toEqual({ '001': 'Total population', '1002': 'European alone' });
+  });
+
+  /**
+   * `attributes` mixes flag columns with the label column, sometimes repeating one. Taking the
+   * first entry would request `NAICS2022_F` and echo back a suppression flag instead of a label.
+   */
+  it('picks the label column out of a mixed attributes list', async () => {
+    queue(ecnbasicVariablesJson);
+
+    const naics = await service.findVariable('NAICS2022', 'ecnbasic', 2022, createMockContext());
+
+    expect(naics?.labelAttribute).toBe('NAICS2022_LABEL');
+  });
+
+  it('leaves a dimension with no published values undecorated but still labeled', async () => {
+    queue(ecnbasicVariablesJson);
+
+    const taxstat = await service.findVariable('TAXSTAT', 'ecnbasic', 2022, createMockContext());
+
+    expect(taxstat?.values).toBeUndefined();
+    expect(taxstat?.labelAttribute).toBe('TAXSTAT_LABEL');
+  });
+
+  it('returns undefined for a code the dataset does not define', async () => {
+    queue(cbpVariablesJson);
+
+    await expect(
+      service.findVariable('POPGROUP', 'cbp', 2023, createMockContext()),
+    ).resolves.toBeUndefined();
+  });
+
+  it('carries the label attribute through to the unset-dimension report', async () => {
+    queue(ddhcaVariablesJson);
+
+    const check = await service.checkPredicates(
+      { dataset: 'dec/ddhca', year: 2020, supplied: [] },
+      createMockContext(),
+    );
+
+    expect(check.unset).toEqual([
+      { code: 'POPGROUP', label: 'Race/Ethnic Group', labelAttribute: 'POPGROUP_LABEL' },
+    ]);
+  });
+
+  it('lists the dimensions a dataset filters on, without GEOCOMP', async () => {
+    queue(cbpVariablesJson);
+
+    const dimensions = await service.getFilterDimensions('cbp', 2023, createMockContext());
+
+    expect(dimensions.map((d) => d.code)).toEqual(['LFO', 'NAICS2017']);
+  });
+});
+
 describe('describeUnsetPredicates', () => {
   it('names each dimension with its label and says the API supplied the default', () => {
     const text = describeUnsetPredicates(
@@ -306,7 +410,62 @@ describe('describeUnsetPredicates', () => {
     expect(text).toContain('NAICS2017 (2017 NAICS code)');
     expect(text).toContain('LFO (Legal form of organization code)');
     expect(text).toContain('applied its own default');
-    expect(text).toContain('scoped to a category this query chose');
+    expect(text).toContain('census_list_predicate_values');
+  });
+
+  /**
+   * The label of the default the API applied is the only thing separating an all-categories
+   * total from one arbitrary category, so it has to reach the caller verbatim.
+   */
+  it('quotes the applied default label for each dimension that echoed one', () => {
+    const text = describeUnsetPredicates(
+      [{ code: 'POPGROUP', label: 'Race/Ethnic Group', labelAttribute: 'POPGROUP_LABEL' }],
+      'dec/ddhca',
+      2020,
+      { POPGROUP: 'European alone' },
+    );
+
+    expect(text).toContain('POPGROUP (Race/Ethnic Group)');
+    expect(text).toContain('"European alone"');
+    expect(text).toContain('applied_filters');
+  });
+
+  /**
+   * pep/charv defaults YEAR to one vintage and returns a row per matching combination, but
+   * declares no label attribute for it — so two rows come back identical apart from the number.
+   * Naming YEAR without saying its default is unreadable leaves it looking like the one
+   * dimension nothing was applied to, which is the opposite of the truth.
+   */
+  it('says so when a dimension publishes no label to echo', () => {
+    const text = describeUnsetPredicates(
+      [
+        { code: 'SEX', label: 'Sex Code', labelAttribute: 'SEX_DESC' },
+        { code: 'YEAR', label: 'Vintage Year' },
+      ],
+      'pep/charv',
+      2023,
+      { SEX: 'Both Male and Female' },
+    );
+
+    expect(text).toContain('SEX (Sex Code) — the API applied "Both Male and Female"');
+    expect(text).toContain('YEAR (Vintage Year) — which value the API applied is not visible');
+    expect(text).not.toContain('YEAR (Vintage Year) — the API applied');
+  });
+
+  /**
+   * nonemp vintages before 2012 declare a NAICS dimension with no label attribute at all, so
+   * their rows carry no applied_filters — promising the labels are repeated there sends a caller
+   * looking for a field that is absent.
+   */
+  it('promises no per-row echo when no dimension published a label', () => {
+    const text = describeUnsetPredicates(
+      [{ code: 'NAICS2002', label: 'NAICS Industry Code' }],
+      'nonemp',
+      2005,
+    );
+
+    expect(text).not.toContain('applied_filters');
+    expect(text).toContain('publishes no label');
   });
 
   /**
@@ -321,12 +480,17 @@ describe('describeUnsetPredicates', () => {
     );
 
     expect(text).not.toMatch(/total across all categories/);
-    expect(text).toContain('one fixed category for others');
+    expect(text).toContain('one ordinary category on others');
     expect(text).toContain('more than one row');
   });
 
-  it('promises no value lookup — variables.json publishes values for only some codes', () => {
+  /**
+   * `census_get_variable` resolves the dimension, not its values — pointing a caller there for
+   * the code to supply sends them back with the same question they arrived with.
+   */
+  it('points at the value lookup rather than the variable lookup', () => {
     const text = describeUnsetPredicates([{ code: 'LFO', label: 'Legal form' }], 'cbp', 2023);
+    expect(text).toContain('census_list_predicate_values');
     expect(text).not.toContain('census_get_variable');
   });
 });

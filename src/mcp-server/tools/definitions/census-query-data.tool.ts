@@ -6,9 +6,10 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, validationError } from '@cyanheads/mcp-ts-core/errors';
 import { getDiscoveryConfig } from '@/config/server-config.js';
-import { getCensusApiService } from '@/services/census-api/census-api-service.js';
+import { getCensusApiService, padFips } from '@/services/census-api/census-api-service.js';
 import {
   DATASET_LATEST_YEARS,
+  defaultLabelColumnsFor,
   describeEmptyPredicatedResult,
   describeUnsetPredicates,
   getVariableCacheService,
@@ -18,7 +19,7 @@ import {
 export const censusQueryData = tool('census_query_data', {
   title: 'Query Census Data',
   description:
-    'Query a Census dataset for one or more variables at a specific geography. Accepts FIPS codes for the target geography — use census_resolve_geography to convert place names to FIPS when needed. On ACS datasets, labeled estimates and margin-of-error values are returned together. Suppression codes (geography too small, data not collected) are decoded into human-readable reasons rather than passed through as raw negative numbers. Pass geography_fips as "*" to return all geographies at the level within the parent. On the business datasets (cbp, ecnbasic, nonemp) and pep/charv, use predicates to filter by industry, size class, or demographic dimension — a query that omits them returns the total across every category, which the response notice names.',
+    'Query a Census dataset for one or more variables at a specific geography. Accepts FIPS codes for the target geography — use census_resolve_geography to convert place names to FIPS when needed. On ACS datasets, labeled estimates and margin-of-error values are returned together. Suppression codes (geography too small, data not collected) are decoded into human-readable reasons rather than passed through as raw negative numbers. Pass geography_fips as "*" to return all geographies at the level within the parent. On the business datasets (cbp, ecnbasic, nonemp), pep/charv, and dec/ddhca, use predicates to filter by industry, size class, or population group — a query that omits one is answered with a default the Census API picks, which is an all-categories total on some dimensions and a single category on others. Each row names the defaults that were applied in applied_filters, and census_list_predicate_values enumerates the codes a dimension accepts.',
   annotations: { readOnlyHint: true, openWorldHint: false },
   input: z.object({
     variables: z
@@ -34,25 +35,37 @@ export const censusQueryData = tool('census_query_data', {
     geography_fips: z
       .string()
       .describe(
-        'FIPS code for the target geography (e.g., "033" for a county, "*" for all geographies at the level within the parent). Use census_resolve_geography to obtain this value — it is returned as fips_summary.',
+        'FIPS code for the target geography (e.g., "033" for a county, "*" for all geographies at the level within the parent). Use census_resolve_geography to obtain this value — it is returned as fips_summary. The Census API matches this literally and its width follows geography_level, so it is passed through unpadded: a county is 3 digits ("051", not "51") and a tract is 6. parent_fips and county_fips are zero-padded for you; this one is not.',
       ),
     parent_fips: z
-      .string()
+      .union([
+        z.literal(''),
+        z
+          .string()
+          .regex(/^(\*|\d{1,2})$/)
+          .describe('1 to 2 digits, zero-padded here to the 2 the Census stores, or "*".'),
+      ])
       .optional()
       .describe(
-        'State FIPS code when querying sub-state levels (e.g., "53" for Washington). Required for county, tract, and block-group queries. census_resolve_geography returns this as state_fips.',
+        'State FIPS code when querying sub-state levels (e.g., "53" for Washington). Required for county, tract, and block-group queries. census_resolve_geography returns this as state_fips. Pass "*" to span every state. Blank is treated as omitted.',
       ),
     county_fips: z
-      .string()
+      .union([
+        z.literal(''),
+        z
+          .string()
+          .regex(/^(\*|\d{1,3})$/)
+          .describe('1 to 3 digits, zero-padded here to the 3 the Census stores, or "*".'),
+      ])
       .optional()
       .describe(
-        'County FIPS code (3 digits) when querying tracts or block groups within a specific county (e.g., "033" for King County within WA). Required for tract and block-group queries scoped to a county — use alongside parent_fips (state). census_resolve_geography returns this as county_fips.',
+        'County FIPS code when querying tracts or block groups within a specific county (e.g., "033" for King County within WA). Required for tract and block-group queries scoped to a county — use alongside parent_fips (state). census_resolve_geography returns this as county_fips. Pass "*" to span every county in the state, which is the only way a block-group query reaches a whole state. Blank is treated as omitted.',
       ),
     predicates: z
       .record(z.string(), z.string())
       .optional()
       .describe(
-        'Filter values keyed by variable code, sent as extra query parameters — e.g. {"NAICS2017": "5112"} to count only software publishers in cbp. The business datasets (cbp, ecnbasic, nonemp) and pep/charv declare filter dimensions such as industry (NAICS2017/NAICS2022), legal form (LFO), size class (EMPSZES/RCPSZES), tax status (TAXSTAT), operation type (TYPOP), sex (SEX), and age (AGE). Leaving one unset is not an error: the Census API returns the total across every category of that dimension, so an unfiltered count of all industries comes back looking like the industry-specific answer. Any dimension left unset is named in the response notice. Code names vary by dataset and vintage — cbp 2023 uses NAICS2017 while nonemp 2023 uses NAICS2022 — so read them from the notice or from census_search_variables. NAICS values are standard North American Industry Classification System codes at any depth (51 information, 5112 software publishers); the other dimensions use short Census category codes documented with the dataset.',
+        'Filter values keyed by variable code, sent as extra query parameters — e.g. {"NAICS2017": "5112"} to count only software publishers in cbp. The business datasets (cbp, ecnbasic, nonemp), pep/charv, and dec/ddhca declare filter dimensions such as industry (NAICS2017/NAICS2022), legal form (LFO), size class (EMPSZES/RCPSZES), tax status (TAXSTAT), operation type (TYPOP), sex (SEX), age (AGE), and population group (POPGROUP). Leaving one unset is not an error: the Census API substitutes its own default, which is the all-categories total on cbp NAICS2017 but a single population group on dec/ddhca POPGROUP and a single sector on ecnbasic NAICS2022 — so an unfiltered value can read like a total without being one. Every unset dimension is named in the response notice and its applied default is echoed per row in applied_filters. Code names vary by dataset and vintage — cbp 2023 uses NAICS2017 while nonemp 2023 uses NAICS2022 — so read them from the notice or from census_search_variables. Call census_list_predicate_values for the codes a dimension accepts; NAICS values are standard North American Industry Classification System codes at any depth (51 information, 5112 software publishers).',
       ),
     dataset: z
       .string()
@@ -89,6 +102,13 @@ export const censusQueryData = tool('census_query_data', {
               .describe(
                 'Map of variable code to value entry. Each key is a variable code from the variables input; each value has: estimate (number|null), moe (number|null, optional), label (string), suppressed (boolean), suppression_reason (string, optional).',
               ),
+            applied_filters: z
+              .object({})
+              .passthrough()
+              .optional()
+              .describe(
+                'Filter dimensions the query left unset, mapped to the label of the default the Census API applied (e.g. {"POPGROUP": "European alone"}). Present only on datasets that declare filter dimensions. The label is what tells an all-categories total apart from one ordinary category — dec/ddhca defaults POPGROUP to a single population group, so a value carrying "European alone" is that group\'s count and not the geography\'s population. Set the dimension in predicates to choose it yourself.',
+              ),
           })
           .describe('Data for one geography — name, FIPS, and variable values.'),
       )
@@ -105,7 +125,7 @@ export const censusQueryData = tool('census_query_data', {
       .string()
       .optional()
       .describe(
-        'Warning that the dataset declares filter dimensions the query left unset, naming each one. Values in that case are totals across every category of those dimensions, not a filtered subset.',
+        'Warning that the dataset declares filter dimensions the query left unset, naming each one alongside the label of the default the Census API applied to it. That default is an all-categories total on some dimensions and one ordinary category on others, so the label is what says which.',
       ),
   },
 
@@ -142,6 +162,13 @@ export const censusQueryData = tool('census_query_data', {
       when: 'The geography level requires a parent FIPS code but parent_fips was not provided, or a tract/block-group level requires county_fips but it was omitted.',
       recovery:
         'Add parent_fips (state FIPS) from census_resolve_geography state_fips. For tract or block-group levels also add county_fips from census_resolve_geography county_fips.',
+    },
+    {
+      reason: 'parent_not_accepted',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'parent_fips or county_fips names a parent the geography level does not sit within.',
+      recovery:
+        'Drop the parent this level does not name. Levels such as zip code tabulation area, urban area, and metropolitan statistical area/micropolitan statistical area are queried with no parent at all; census_list_geographies shows the parents each level takes.',
     },
     {
       reason: 'no_data',
@@ -210,8 +237,12 @@ export const censusQueryData = tool('census_query_data', {
     });
 
     const apiService = getCensusApiService();
-    const parentFips = input.parent_fips?.trim() || undefined;
-    const countyFips = input.county_fips?.trim() || undefined;
+    // The Census API matches FIPS literally — `county:51` and `county:051` are different
+    // queries and the short one answers 204. Both parents have a fixed width, so padding is
+    // unambiguous; census_resolve_geography already pads the codes it hands back. `*` is a
+    // scope rather than a code and passes through unpadded.
+    const parentFips = padFips(input.parent_fips, 2);
+    const countyFips = padFips(input.county_fips, 3);
 
     // Validate the level and its parents against the dataset's own geography.json before
     // spending a data query the Census API would reject with an opaque 400.
@@ -265,6 +296,30 @@ export const censusQueryData = tool('census_query_data', {
       );
     }
 
+    if (check.status === 'parent_not_accepted') {
+      const inputs = check.unacceptedParents.map((parent) =>
+        parent === 'state' ? 'parent_fips' : 'county_fips',
+      );
+      const scope =
+        check.acceptedParents.length > 0
+          ? `it sits within ${check.acceptedParents.join(' and ')} only`
+          : 'it sits within no parent geography';
+      throw ctx.fail(
+        'parent_not_accepted',
+        `Geography level "${input.geography_level}" in ${dataset} (${year}) does not accept ${check.unacceptedParents.join(' or ')} as a parent.`,
+        {
+          dataset,
+          year,
+          geographyLevel: input.geography_level,
+          unacceptedParents: check.unacceptedParents,
+          acceptedParents: check.acceptedParents,
+          recovery: {
+            hint: `Drop ${inputs.join(' and ')} — ${scope}, so the query needs no other scope. Call census_list_geographies to see the parents each level takes.`,
+          },
+        },
+      );
+    }
+
     const variableCacheService = getVariableCacheService();
 
     // Reject unknown predicate keys before spending the call — the Census API answers them with
@@ -289,6 +344,7 @@ export const censusQueryData = tool('census_query_data', {
     }
 
     const unfiltered = predicateCheck.unset;
+    const defaultLabelColumns = defaultLabelColumnsFor(unfiltered);
 
     // Fetch variable labels for enrichment (best-effort — don't fail if cache is cold)
     const variableLabels: Map<string, string> = new Map();
@@ -314,6 +370,7 @@ export const censusQueryData = tool('census_query_data', {
         ...(parentFips !== undefined && { parentFips }),
         ...(countyFips !== undefined && { countyFips }),
         ...(Object.keys(predicates).length > 0 && { predicates }),
+        ...(Object.keys(defaultLabelColumns).length > 0 && { defaultLabelColumns }),
         dataset,
         year,
       },
@@ -334,7 +391,7 @@ export const censusQueryData = tool('census_query_data', {
         ? `${predicateHint} Otherwise confirm the FIPS codes with census_resolve_geography.`
         : dataset.startsWith('acs/acs1')
           ? `ACS1 only covers geographies with 65,000+ population — switch to dataset "acs/acs5" for smaller geographies, or confirm the FIPS codes with census_resolve_geography.`
-          : `Confirm the FIPS codes exist in ${dataset} (${year}) — census_resolve_geography returns them for a place name. If the level itself is in doubt, call census_list_geographies.`;
+          : `Confirm the FIPS codes exist in ${dataset} (${year}) — census_resolve_geography returns them for a place name. The Census API matches geography_fips literally at the width of its level, so a short code finds nothing: a county is "051", not "51". If the level itself is in doubt, call census_list_geographies.`;
       throw ctx.fail(
         'no_data',
         `No data returned for ${input.geography_level} in ${dataset} (${year}).`,
@@ -374,12 +431,16 @@ export const censusQueryData = tool('census_query_data', {
         geography_fips: row.geographyFips,
         geography_geoid: row.geographyGeoid,
         variables: enrichedVariables,
+        ...(row.appliedFilters && { applied_filters: row.appliedFilters }),
       };
     });
 
     ctx.enrich({ totalRows: enrichedRows.length, dataset, year });
     if (unfiltered.length > 0) {
-      ctx.enrich.notice(describeUnsetPredicates(unfiltered, dataset, year));
+      // The API applies the same default to every row, so the first one names them all.
+      ctx.enrich.notice(
+        describeUnsetPredicates(unfiltered, dataset, year, rows[0]?.appliedFilters ?? {}),
+      );
     }
 
     return { rows: enrichedRows };
@@ -410,6 +471,12 @@ export const censusQueryData = tool('census_query_data', {
         if (val.label && val.label !== code) {
           lines.push(`  *${val.label}*`);
         }
+      }
+      const applied = Object.entries(row.applied_filters ?? {});
+      if (applied.length > 0) {
+        lines.push(
+          `**Applied filter defaults:** ${applied.map(([code, label]) => `${code} = ${String(label)}`).join(' · ')}`,
+        );
       }
       lines.push('');
     }

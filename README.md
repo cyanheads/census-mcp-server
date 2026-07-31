@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.12-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/census-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/census-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/census-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.1.13-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/census-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/census-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/census-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -82,6 +82,9 @@ Query a Census dataset for one or more variables at a specific geography.
 
 - Requires FIPS codes — use `census_resolve_geography` first for place names
 - Use `geography_fips: "*"` to return all geographies at the level within the parent
+- The level and its required parents are checked against the dataset's own geography metadata before the query runs, so a missing `parent_fips` returns `parent_required` naming what to add rather than an upstream 400
+- Each row carries both `geography_fips` (bare level code, round-trips back into this tool) and `geography_geoid` (level plus parents, nationally unique)
+- A query that matches nothing returns `no_data` with dataset-aware recovery, not a retried upstream error
 - Suppression codes (geography too small, data not collected, etc.) resolved to human-readable reasons
 - Variable labels enriched from cache and surfaced alongside estimates
 - Requires `CENSUS_API_KEY`
@@ -94,7 +97,8 @@ Rank and compare variables across multiple geographies.
 
 - Fetches all geographies at a level (e.g., all WA counties) in one API call, then sorts and slices
 - Optional `within` parameter to constrain to a parent FIPS; omit for national comparison
-- Optional `geographies` list to filter to specific FIPS values
+- Optional `geographies` list to filter to specific geographies — full GEOIDs (`"53033"`, `"06037"`) work across states; bare level codes (`"033"`) need `within` to disambiguate. Entries matching no row, and bare codes that matched more than one state, are named in a notice
+- Same pre-query level and parent validation as `census_query_data`, reported against `within` / `within_county`
 - Configurable sort variable, direction, and limit (default 50, max 500)
 - Suppressed values sorted to end of results and labeled rather than passed through as negative sentinels
 - Requires `CENSUS_API_KEY`

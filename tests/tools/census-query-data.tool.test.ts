@@ -28,13 +28,20 @@ vi.mock('@/config/server-config.js', () => ({
 }));
 
 const mockQueryData = vi.fn();
+const mockCheckGeography = vi.fn();
 const mockGetVariablesByCode = vi.fn();
 
 beforeEach(async () => {
   vi.clearAllMocks();
 
   const { getCensusApiService } = await import('@/services/census-api/census-api-service.js');
-  vi.mocked(getCensusApiService).mockReturnValue({ queryData: mockQueryData } as never);
+  vi.mocked(getCensusApiService).mockReturnValue({
+    queryData: mockQueryData,
+    checkGeography: mockCheckGeography,
+  } as never);
+
+  // Default: the level and its parents are valid for the dataset.
+  mockCheckGeography.mockResolvedValue({ status: 'ok' });
 
   const { getVariableCacheService } = await import(
     '@/services/variable-cache/variable-cache-service.js'
@@ -53,6 +60,7 @@ describe('censusQueryData', () => {
       {
         geographyName: 'King County, Washington',
         geographyFips: '033',
+        geographyGeoid: '53033',
         variables: {
           B19013_001E: { estimate: 105000, label: 'B19013_001E', suppressed: false },
         },
@@ -82,6 +90,7 @@ describe('censusQueryData', () => {
       {
         geographyName: 'King County, Washington',
         geographyFips: '033',
+        geographyGeoid: '53033',
         variables: {
           B19013_001E: { estimate: 105000, label: 'B19013_001E', suppressed: false },
         },
@@ -108,6 +117,7 @@ describe('censusQueryData', () => {
       {
         geographyName: 'California',
         geographyFips: '06',
+        geographyGeoid: '06',
         variables: {
           B01001_001E: { estimate: 39000000, label: 'B01001_001E', suppressed: false },
         },
@@ -155,6 +165,7 @@ describe('censusQueryData', () => {
       {
         geographyName: 'Census Tract 1, King County, Washington',
         geographyFips: '000100',
+        geographyGeoid: '53033000100',
         variables: {
           B19013_001E: { estimate: 98000, label: 'B19013_001E', suppressed: false },
         },
@@ -182,6 +193,7 @@ describe('censusQueryData', () => {
       {
         geographyName: 'King County, Washington',
         geographyFips: '033',
+        geographyGeoid: '53033',
         variables: {
           B19013_001E: { estimate: 105000, label: 'B19013_001E', suppressed: false },
         },
@@ -230,11 +242,163 @@ describe('censusQueryData', () => {
     });
   });
 
+  it('throws parent_required before querying for a tract with no parent_fips', async () => {
+    mockCheckGeography.mockResolvedValue({ status: 'parent_required', missingParents: ['state'] });
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'tract',
+      geography_fips: '*',
+    });
+    await expect(censusQueryData.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: {
+        reason: 'parent_required',
+        missingParents: ['state'],
+        recovery: { hint: expect.stringContaining('parent_fips') },
+      },
+    });
+    expect(mockQueryData).not.toHaveBeenCalled();
+  });
+
+  it('parent_required names county_fips when the county parent is missing', async () => {
+    mockCheckGeography.mockResolvedValue({ status: 'parent_required', missingParents: ['county'] });
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'block group',
+      geography_fips: '*',
+      parent_fips: '53',
+    });
+    await expect(censusQueryData.handler(input, ctx)).rejects.toMatchObject({
+      data: { recovery: { hint: expect.stringContaining('county_fips') } },
+    });
+  });
+
+  it('parent_required offers the wildcard when the missing parent has no input', async () => {
+    mockCheckGeography.mockResolvedValue({
+      status: 'parent_required',
+      missingParents: ['tract'],
+      wildcardRelaxes: true,
+    });
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'block group',
+      geography_fips: '1',
+      parent_fips: '53',
+      county_fips: '033',
+    });
+    await expect(censusQueryData.handler(input, ctx)).rejects.toMatchObject({
+      data: { recovery: { hint: expect.stringContaining('geography_fips to "*"') } },
+    });
+  });
+
+  it('parent_required says the level is out of reach when no wildcard would help', async () => {
+    mockCheckGeography.mockResolvedValue({
+      status: 'parent_required',
+      missingParents: ['county subdivision'],
+      wildcardRelaxes: false,
+    });
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'subminor civil division',
+      geography_fips: '*',
+      parent_fips: '53',
+      county_fips: '033',
+    });
+    await expect(censusQueryData.handler(input, ctx)).rejects.toMatchObject({
+      data: { recovery: { hint: expect.stringContaining('no input for') } },
+    });
+  });
+
+  it('throws geography_not_supported before querying for a level the dataset lacks', async () => {
+    mockCheckGeography.mockResolvedValue({
+      status: 'level_not_supported',
+      availableLevels: ['us', 'state', 'county'],
+    });
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'tract',
+      geography_fips: '*',
+      parent_fips: '53',
+      dataset: 'acs/acs1',
+    });
+    await expect(censusQueryData.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'geography_not_supported', availableLevels: ['us', 'state', 'county'] },
+    });
+    expect(mockQueryData).not.toHaveBeenCalled();
+  });
+
+  it('no_data recovery does not tell an acs/acs5 caller to switch to acs/acs5', async () => {
+    mockQueryData.mockResolvedValue([]);
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'county',
+      geography_fips: '999',
+      dataset: 'acs/acs5',
+    });
+    await expect(censusQueryData.handler(input, ctx)).rejects.toMatchObject({
+      data: { recovery: { hint: expect.not.stringContaining('switch to') } },
+    });
+  });
+
+  it('no_data recovery suggests acs/acs5 when the caller is on acs/acs1', async () => {
+    mockQueryData.mockResolvedValue([]);
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'county',
+      geography_fips: '999',
+      dataset: 'acs/acs1',
+    });
+    await expect(censusQueryData.handler(input, ctx)).rejects.toMatchObject({
+      data: { recovery: { hint: expect.stringContaining('acs/acs5') } },
+    });
+  });
+
+  it('returns the composed GEOID alongside the bare level FIPS', async () => {
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'King County, Washington',
+        geographyFips: '033',
+        geographyGeoid: '53033',
+        variables: {
+          B19013_001E: { estimate: 105000, label: 'B19013_001E', suppressed: false },
+        },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'county',
+      geography_fips: '033',
+      parent_fips: '53',
+    });
+    const result = await censusQueryData.handler(input, ctx);
+
+    expect(result.rows[0]?.geography_fips).toBe('033');
+    expect(result.rows[0]?.geography_geoid).toBe('53033');
+  });
+
   it('surfaces suppressed values with suppression_reason in output', async () => {
     mockQueryData.mockResolvedValue([
       {
         geographyName: 'Small County',
         geographyFips: '999',
+        geographyGeoid: '53999',
         variables: {
           B19013_001E: {
             estimate: null,
@@ -268,6 +432,7 @@ describe('censusQueryData', () => {
         {
           geography_name: 'King County, Washington',
           geography_fips: '033',
+          geography_geoid: '53033',
           variables: {
             B19013_001E: {
               estimate: 105000,
@@ -293,6 +458,7 @@ describe('censusQueryData', () => {
         {
           geography_name: 'Tiny Town',
           geography_fips: '999',
+          geography_geoid: '53999',
           variables: {
             B19013_001E: {
               estimate: null,
@@ -315,6 +481,7 @@ describe('censusQueryData', () => {
       {
         geographyName: 'California',
         geographyFips: '06',
+        geographyGeoid: '06',
         variables: {
           B19013_001E: {
             estimate: 75000,
@@ -342,6 +509,7 @@ describe('censusQueryData', () => {
       {
         geographyName: 'Alabama',
         geographyFips: '01',
+        geographyGeoid: '01',
         variables: {
           B01001_001E: { estimate: 4900000, label: 'Total', suppressed: false },
         },
@@ -374,6 +542,7 @@ describe('censusQueryData', () => {
       {
         geographyName: 'Oregon',
         geographyFips: '41',
+        geographyGeoid: '41',
         variables: {
           B01001_001E: { estimate: 4200000, label: 'Total population', suppressed: false },
         },
@@ -417,6 +586,7 @@ describe('censusQueryData', () => {
         {
           geography_name: 'Oregon',
           geography_fips: '41',
+          geography_geoid: '41',
           variables: {
             B19013_001E: {
               estimate: 75000,
@@ -440,6 +610,7 @@ describe('censusQueryData', () => {
         {
           geography_name: 'Oregon',
           geography_fips: '41',
+          geography_geoid: '41',
           variables: {
             B19013_001E: {
               estimate: 75000,
@@ -482,6 +653,7 @@ describe('censusQueryData', () => {
       {
         geographyName: 'State X',
         geographyFips: '01',
+        geographyGeoid: '01',
         variables: Object.fromEntries(
           Array.from({ length: 50 }, (_, i) => [
             `B${String(i).padStart(7, '0')}E`,
@@ -508,6 +680,7 @@ describe('censusQueryData', () => {
         {
           geography_name: 'King County',
           geography_fips: '033',
+          geography_geoid: '53033',
           variables: {
             B19013_001E: { estimate: 105000, label: 'Median income', suppressed: false },
           },
@@ -515,6 +688,7 @@ describe('censusQueryData', () => {
         {
           geography_name: 'Pierce County',
           geography_fips: '053',
+          geography_geoid: '53053',
           variables: {
             B19013_001E: { estimate: 72000, label: 'Median income', suppressed: false },
           },

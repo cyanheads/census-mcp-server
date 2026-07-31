@@ -28,13 +28,20 @@ vi.mock('@/config/server-config.js', () => ({
 }));
 
 const mockQueryData = vi.fn();
+const mockCheckGeography = vi.fn();
 const mockGetVariablesByCode = vi.fn();
 
 beforeEach(async () => {
   vi.clearAllMocks();
 
   const { getCensusApiService } = await import('@/services/census-api/census-api-service.js');
-  vi.mocked(getCensusApiService).mockReturnValue({ queryData: mockQueryData } as never);
+  vi.mocked(getCensusApiService).mockReturnValue({
+    queryData: mockQueryData,
+    checkGeography: mockCheckGeography,
+  } as never);
+
+  // Default: the level and its parents are valid for the dataset.
+  mockCheckGeography.mockResolvedValue({ status: 'ok' });
 
   const { getVariableCacheService } = await import(
     '@/services/variable-cache/variable-cache-service.js'
@@ -52,21 +59,24 @@ describe('censusCompareGeographies', () => {
     mockQueryData.mockResolvedValue([
       {
         geographyName: 'King County, WA',
-        geographyFips: '53033',
+        geographyFips: '033',
+        geographyGeoid: '53033',
         variables: {
           B19013_001E: { estimate: 105000, label: 'Median income', suppressed: false },
         },
       },
       {
         geographyName: 'Pierce County, WA',
-        geographyFips: '53053',
+        geographyFips: '053',
+        geographyGeoid: '53053',
         variables: {
           B19013_001E: { estimate: 72000, label: 'Median income', suppressed: false },
         },
       },
       {
         geographyName: 'Spokane County, WA',
-        geographyFips: '53063',
+        geographyFips: '063',
+        geographyGeoid: '53063',
         variables: {
           B19013_001E: { estimate: 65000, label: 'Median income', suppressed: false },
         },
@@ -96,14 +106,16 @@ describe('censusCompareGeographies', () => {
     mockQueryData.mockResolvedValue([
       {
         geographyName: 'King County, WA',
-        geographyFips: '53033',
+        geographyFips: '033',
+        geographyGeoid: '53033',
         variables: {
           B19013_001E: { estimate: 105000, label: 'Median income', suppressed: false },
         },
       },
       {
         geographyName: 'Spokane County, WA',
-        geographyFips: '53063',
+        geographyFips: '063',
+        geographyGeoid: '53063',
         variables: {
           B19013_001E: { estimate: 65000, label: 'Median income', suppressed: false },
         },
@@ -123,21 +135,67 @@ describe('censusCompareGeographies', () => {
     expect(result.rows[0]?.rank).toBe(1);
   });
 
-  it('filters to specific geographies when geographies list is provided', async () => {
+  /**
+   * A nationwide county query returns the bare level code in geographyFips ("033") and
+   * the state-qualified GEOID in geographyGeoid ("53033") — the shape
+   * CensusApiService.parseResponse actually produces. Fixtures that pre-compose
+   * geographyFips hide the cross-state filter bug instead of exercising it.
+   */
+  const nationwideCounties = () => [
+    {
+      geographyName: 'King County, Washington',
+      geographyFips: '033',
+      geographyGeoid: '53033',
+      variables: { B19013_001E: { estimate: 105000, label: 'Median income', suppressed: false } },
+    },
+    {
+      geographyName: 'Los Angeles County, California',
+      geographyFips: '037',
+      geographyGeoid: '06037',
+      variables: { B19013_001E: { estimate: 82000, label: 'Median income', suppressed: false } },
+    },
+    {
+      geographyName: 'Autauga County, Alabama',
+      geographyFips: '001',
+      geographyGeoid: '01001',
+      variables: { B19013_001E: { estimate: 69000, label: 'Median income', suppressed: false } },
+    },
+  ];
+
+  it('filters to full GEOIDs spanning more than one state', async () => {
+    mockQueryData.mockResolvedValue(nationwideCounties());
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'county',
+      geographies: ['53033', '06037'],
+    });
+    const result = await censusCompareGeographies.handler(input, ctx);
+
+    expect(result.rows.map((r) => r.geography_name)).toEqual([
+      'King County, Washington',
+      'Los Angeles County, California',
+    ]);
+    expect(result.rows.map((r) => r.geography_geoid)).toEqual(['53033', '06037']);
+    // The bare level code stays intact for the census_query_data round-trip.
+    expect(result.rows[0]?.geography_fips).toBe('033');
+    expect(getEnrichment(ctx).notice).toBeUndefined();
+  });
+
+  it('filters to bare level codes when within scopes the comparison to one state', async () => {
     mockQueryData.mockResolvedValue([
       {
-        geographyName: 'King County, WA',
-        geographyFips: '53033',
-        variables: {
-          B19013_001E: { estimate: 105000, label: 'Median income', suppressed: false },
-        },
+        geographyName: 'King County, Washington',
+        geographyFips: '033',
+        geographyGeoid: '53033',
+        variables: { B19013_001E: { estimate: 105000, label: 'Median income', suppressed: false } },
       },
       {
-        geographyName: 'Pierce County, WA',
-        geographyFips: '53053',
-        variables: {
-          B19013_001E: { estimate: 72000, label: 'Median income', suppressed: false },
-        },
+        geographyName: 'Pierce County, Washington',
+        geographyFips: '053',
+        geographyGeoid: '53053',
+        variables: { B19013_001E: { estimate: 72000, label: 'Median income', suppressed: false } },
       },
     ]);
 
@@ -145,18 +203,101 @@ describe('censusCompareGeographies', () => {
     const input = censusCompareGeographies.input.parse({
       variables: ['B19013_001E'],
       geography_level: 'county',
-      geographies: ['53033'], // Only King County
+      within: '53',
+      geographies: ['033'],
     });
     const result = await censusCompareGeographies.handler(input, ctx);
 
     expect(result.rows).toHaveLength(1);
-    expect(result.rows[0]?.geography_fips).toBe('53033');
+    expect(result.rows[0]?.geography_name).toBe('King County, Washington');
+  });
+
+  it('notices the geographies entries that matched no row', async () => {
+    mockQueryData.mockResolvedValue(nationwideCounties());
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'county',
+      geographies: ['53033', '99999'],
+    });
+    const result = await censusCompareGeographies.handler(input, ctx);
+
+    expect(result.rows).toHaveLength(1);
+    // Only the entry that matched nothing is named — the matched one is not.
+    expect(getEnrichment(ctx).notice).toContain('1 of the requested geographies: 99999');
+  });
+
+  it('notices a bare level code that matched a geography in more than one state', async () => {
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'King County, Washington',
+        geographyFips: '033',
+        geographyGeoid: '53033',
+        variables: { B19013_001E: { estimate: 105000, label: 'Median income', suppressed: false } },
+      },
+      {
+        geographyName: "Prince George's County, Maryland",
+        geographyFips: '033',
+        geographyGeoid: '24033',
+        variables: { B19013_001E: { estimate: 97000, label: 'Median income', suppressed: false } },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'county',
+      geographies: ['033'],
+    });
+    const result = await censusCompareGeographies.handler(input, ctx);
+
+    // The rows are real counties, so nothing is unmatched — the ambiguity is the finding.
+    expect(result.rows).toHaveLength(2);
+    expect(getEnrichment(ctx).notice).toContain('033 matched a county in more than one state');
+  });
+
+  it('stays silent when within scopes a bare level code to a single match', async () => {
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'King County, Washington',
+        geographyFips: '033',
+        geographyGeoid: '53033',
+        variables: { B19013_001E: { estimate: 105000, label: 'Median income', suppressed: false } },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'county',
+      within: '53',
+      geographies: ['033'],
+    });
+    await censusCompareGeographies.handler(input, ctx);
+
+    expect(getEnrichment(ctx).notice).toBeUndefined();
+  });
+
+  it('throws no_data when the geographies filter drops every row', async () => {
+    mockQueryData.mockResolvedValue(nationwideCounties());
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'county',
+      geographies: ['99998', '99999'],
+    });
+    await expect(censusCompareGeographies.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'no_data', unmatchedGeographies: ['99998', '99999'] },
+    });
   });
 
   it('truncates results when count exceeds limit', async () => {
     const manyRows = Array.from({ length: 60 }, (_, i) => ({
       geographyName: `County ${i}`,
       geographyFips: String(i).padStart(5, '0'),
+      geographyGeoid: String(i).padStart(5, '0'),
       variables: {
         B19013_001E: {
           estimate: 50000 + i * 100,
@@ -186,6 +327,7 @@ describe('censusCompareGeographies', () => {
       {
         geographyName: 'Census Tract 1, King County, Washington',
         geographyFips: '000100',
+        geographyGeoid: '53033000100',
         variables: {
           B19013_001E: { estimate: 98000, label: 'Median income', suppressed: false },
         },
@@ -211,7 +353,8 @@ describe('censusCompareGeographies', () => {
     mockQueryData.mockResolvedValue([
       {
         geographyName: 'King County, WA',
-        geographyFips: '53033',
+        geographyFips: '033',
+        geographyGeoid: '53033',
         variables: {
           B19013_001E: { estimate: 105000, label: 'Median income', suppressed: false },
         },
@@ -256,18 +399,96 @@ describe('censusCompareGeographies', () => {
     });
   });
 
+  it('throws parent_required before querying when within is missing', async () => {
+    mockCheckGeography.mockResolvedValue({ status: 'parent_required', missingParents: ['state'] });
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'tract',
+    });
+    await expect(censusCompareGeographies.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'parent_required', missingParents: ['state'] },
+    });
+    expect(mockQueryData).not.toHaveBeenCalled();
+  });
+
+  it('parent_required names within_county when the county parent is missing', async () => {
+    mockCheckGeography.mockResolvedValue({ status: 'parent_required', missingParents: ['county'] });
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'block group',
+      within: '53',
+    });
+    await expect(censusCompareGeographies.handler(input, ctx)).rejects.toMatchObject({
+      data: { recovery: { hint: expect.stringContaining('within_county') } },
+    });
+  });
+
+  it('throws geography_not_supported before querying for a level the dataset lacks', async () => {
+    mockCheckGeography.mockResolvedValue({
+      status: 'level_not_supported',
+      availableLevels: ['us', 'state', 'county'],
+    });
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'tract',
+      dataset: 'acs/acs1',
+    });
+    await expect(censusCompareGeographies.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'geography_not_supported', availableLevels: ['us', 'state', 'county'] },
+    });
+    expect(mockQueryData).not.toHaveBeenCalled();
+  });
+
+  it('no_data recovery does not tell an acs/acs5 caller to switch to acs/acs5', async () => {
+    mockQueryData.mockResolvedValue([]);
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'county',
+      dataset: 'acs/acs5',
+    });
+    await expect(censusCompareGeographies.handler(input, ctx)).rejects.toMatchObject({
+      data: { recovery: { hint: expect.not.stringContaining('switch to') } },
+    });
+  });
+
+  it('no_data recovery suggests acs/acs5 when the caller is on acs/acs1', async () => {
+    mockQueryData.mockResolvedValue([]);
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'county',
+      dataset: 'acs/acs1',
+    });
+    await expect(censusCompareGeographies.handler(input, ctx)).rejects.toMatchObject({
+      data: { recovery: { hint: expect.stringContaining('acs/acs5') } },
+    });
+  });
+
   it('puts suppressed values at end of ranking', async () => {
     mockQueryData.mockResolvedValue([
       {
         geographyName: 'Tiny County',
-        geographyFips: '53099',
+        geographyFips: '099',
+        geographyGeoid: '53099',
         variables: {
           B19013_001E: { estimate: null, label: 'Median income', suppressed: true },
         },
       },
       {
         geographyName: 'King County, WA',
-        geographyFips: '53033',
+        geographyFips: '033',
+        geographyGeoid: '53033',
         variables: {
           B19013_001E: { estimate: 105000, label: 'Median income', suppressed: false },
         },
@@ -291,6 +512,7 @@ describe('censusCompareGeographies', () => {
       {
         geographyName: 'County A',
         geographyFips: '001',
+        geographyGeoid: '53001',
         variables: {
           B17001_002E: { estimate: 5000, label: 'Poverty', suppressed: false },
           B01001_001E: { estimate: 100000, label: 'Population', suppressed: false },
@@ -299,6 +521,7 @@ describe('censusCompareGeographies', () => {
       {
         geographyName: 'County B',
         geographyFips: '002',
+        geographyGeoid: '53002',
         variables: {
           B17001_002E: { estimate: 8000, label: 'Poverty', suppressed: false },
           B01001_001E: { estimate: 200000, label: 'Population', suppressed: false },
@@ -324,6 +547,7 @@ describe('censusCompareGeographies', () => {
     const manyRows = Array.from({ length: 600 }, (_, i) => ({
       geographyName: `County ${i}`,
       geographyFips: String(i).padStart(5, '0'),
+      geographyGeoid: String(i).padStart(5, '0'),
       variables: {
         B19013_001E: { estimate: i * 1000, label: 'Median income', suppressed: false },
       },
@@ -348,7 +572,8 @@ describe('censusCompareGeographies', () => {
     mockQueryData.mockResolvedValue([
       {
         geographyName: 'King County, WA',
-        geographyFips: '53033',
+        geographyFips: '033',
+        geographyGeoid: '53033',
         variables: {
           B19013_001E: { estimate: 105000, label: 'Median income', suppressed: false },
         },
@@ -369,6 +594,7 @@ describe('censusCompareGeographies', () => {
     const manyRows = Array.from({ length: 60 }, (_, i) => ({
       geographyName: `County ${i}`,
       geographyFips: String(i).padStart(5, '0'),
+      geographyGeoid: String(i).padStart(5, '0'),
       variables: {
         B19013_001E: { estimate: i * 1000, label: 'Median income', suppressed: false },
       },
@@ -408,6 +634,7 @@ describe('censusCompareGeographies', () => {
       {
         geographyName: 'State A',
         geographyFips: '01',
+        geographyGeoid: '01',
         variables: {
           B19013_001E: { estimate: 50000, label: 'Median income', suppressed: false },
         },
@@ -439,6 +666,7 @@ describe('censusCompareGeographies', () => {
       {
         geographyName: 'County X',
         geographyFips: '001',
+        geographyGeoid: '53001',
         variables: {
           B19013_001E: { estimate: 80000, label: 'Median income', suppressed: false },
         },
@@ -459,7 +687,8 @@ describe('censusCompareGeographies', () => {
       rows: [
         {
           geography_name: 'King County, WA',
-          geography_fips: '53033',
+          geography_fips: '033',
+          geography_geoid: '53033',
           variables: {
             B19013_001E: { estimate: 105000, label: 'Median income', suppressed: false },
           },
@@ -479,7 +708,8 @@ describe('censusCompareGeographies', () => {
       rows: [
         {
           geography_name: 'King County, WA',
-          geography_fips: '53033',
+          geography_fips: '033',
+          geography_geoid: '53033',
           variables: {
             B19013_001E: { estimate: 105000, moe: 500, label: 'Median income', suppressed: false },
           },
@@ -516,7 +746,8 @@ describe('censusCompareGeographies', () => {
       rows: [
         {
           geography_name: 'King County, WA',
-          geography_fips: '53033',
+          geography_fips: '033',
+          geography_geoid: '53033',
           variables: {
             B19013_001E: {
               estimate: 105000,
@@ -532,6 +763,7 @@ describe('censusCompareGeographies', () => {
     expect(blocks[0]?.type).toBe('text');
     const text = (blocks[0] as { type: string; text: string }).text;
     expect(text).toContain('King County, WA');
+    expect(text).toContain('GEOID');
     expect(text).toContain('53033');
     expect(text).toContain('B19013_001E');
     expect(text).toContain('105,000');

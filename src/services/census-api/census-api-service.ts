@@ -7,13 +7,27 @@
 import type { Context } from '@cyanheads/mcp-ts-core';
 import { McpError, serviceUnavailable, unauthorized } from '@cyanheads/mcp-ts-core/errors';
 import { fetchWithTimeout, type RequestContext, withRetry } from '@cyanheads/mcp-ts-core/utils';
-import { getServerConfig } from '@/config/server-config.js';
-import type { CensusDataRow, CensusRawResponse, CensusVariableValue } from './types.js';
+import { getDiscoveryConfig, getServerConfig } from '@/config/server-config.js';
+import type {
+  CensusDataRow,
+  CensusGeographyLevel,
+  CensusRawResponse,
+  CensusVariableValue,
+  GeographyCheck,
+} from './types.js';
 import { SUPPRESSION_CODES } from './types.js';
 
 const CENSUS_API_BASE = 'https://api.census.gov/data';
 
+interface GeographyLevelsCacheEntry {
+  fetchedAt: number;
+  levels: CensusGeographyLevel[];
+}
+
 export class CensusApiService {
+  /** geography.json per dataset+year — immutable upstream, cached for the discovery TTL. */
+  private readonly geographyLevelsCache = new Map<string, GeographyLevelsCacheEntry>();
+
   /**
    * Query a Census dataset for variables at a specific geography.
    * Returns parsed rows with suppression codes resolved.
@@ -63,6 +77,10 @@ export class CensusApiService {
         });
         const text = await response.text();
 
+        // A well-formed query that matches nothing answers 204 with an empty body — the
+        // caller's problem is no_data, not an unparseable upstream response worth retrying.
+        if (response.status === 204 || text.trim() === '') return [] as CensusRawResponse;
+
         if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
           if (text.includes('Invalid Key') || text.includes('key_signup')) {
             throw unauthorized(
@@ -105,26 +123,85 @@ export class CensusApiService {
   }
 
   /**
-   * Fetch the list of geography levels supported by a dataset+year from the Census API.
+   * Check a geography level and its supplied parents against the dataset's own
+   * geography.json before spending a data query on a request the Census API will reject.
+   *
+   * Returns `ok` when the dataset has no metadata for the year — the data call then
+   * reports the real problem rather than this check guessing at one.
    */
-  fetchGeographyLevels(
+  async checkGeography(
+    params: {
+      dataset: string;
+      year: number;
+      geographyLevel: string;
+      /** The `for=` value — `*` relaxes the innermost required parent. */
+      geographyFips: string;
+      /** State FIPS, when supplied by the caller. */
+      parentFips?: string;
+      /** County FIPS, when supplied by the caller. */
+      countyFips?: string;
+    },
+    ctx: Context,
+  ): Promise<GeographyCheck> {
+    const levels = await this.fetchGeographyLevels(params.dataset, params.year, ctx);
+    if (levels.length === 0) return { status: 'ok' };
+
+    const target = params.geographyLevel.trim().toLowerCase();
+    const level = levels.find((l) => l.name.toLowerCase() === target);
+    if (!level) {
+      return {
+        status: 'level_not_supported',
+        availableLevels: [...new Set(levels.map((l) => l.name))],
+      };
+    }
+
+    const required = level.requires ?? [];
+    // A `*` target lets the Census API infer the innermost optional parent and everything
+    // below it — `optionalWithWCFor` names where that cutoff starts. Without it, or with a
+    // concrete FIPS target, every required parent must be supplied.
+    const cutoff = level.optionalWithWCFor ? required.indexOf(level.optionalWithWCFor) : -1;
+    const underWildcard = cutoff >= 0 ? required.slice(0, cutoff) : required;
+    const effective = params.geographyFips === '*' ? underWildcard : required;
+
+    // state and county are the only parents the `in=` clause can express.
+    const supplied = new Set<string>();
+    if (params.parentFips) supplied.add('state');
+    if (params.countyFips) supplied.add('county');
+
+    const missingParents = effective.filter((name) => !supplied.has(name));
+    if (missingParents.length === 0) return { status: 'ok' };
+
+    // A concrete target can demand parents (e.g. block group needs its tract) that a `*`
+    // target would not — worth telling the caller, since `*` is an input they control.
+    const wildcardRelaxes =
+      params.geographyFips !== '*' &&
+      underWildcard.filter((name) => !supplied.has(name)).length < missingParents.length;
+
+    return { status: 'parent_required', missingParents, wildcardRelaxes };
+  }
+
+  /**
+   * Fetch the list of geography levels supported by a dataset+year from the Census API.
+   * Cached in-memory per dataset+year with the discovery TTL.
+   */
+  async fetchGeographyLevels(
     dataset: string,
     year: number,
     ctx: Context,
-  ): Promise<
-    Array<{
-      name: string;
-      geoLevelId: string;
-      referenceDate?: string;
-      requires?: string[];
-      wildcard?: string[];
-    }>
-  > {
+  ): Promise<CensusGeographyLevel[]> {
+    const ttlMs = getDiscoveryConfig().variableCacheTtlHours * 60 * 60 * 1000;
+    const cacheKey = `${dataset}|${year}`;
+    const cached = this.geographyLevelsCache.get(cacheKey);
+    if (cached && Date.now() - cached.fetchedAt < ttlMs) {
+      ctx.log.debug('Geography levels cache hit', { dataset, year });
+      return cached.levels;
+    }
+
     const url = `${CENSUS_API_BASE}/${year}/${dataset}/geography.json`;
 
     ctx.log.debug('Fetching geography levels', { dataset, year });
 
-    return withRetry(
+    const levels = await withRetry(
       async () => {
         let response: Response;
         try {
@@ -159,15 +236,7 @@ export class CensusApiService {
           });
         }
 
-        const obj = parsed as {
-          fips?: Array<{
-            name: string;
-            geoLevelId: string;
-            referenceDate?: string;
-            requires?: string[];
-            wildcard?: string[];
-          }>;
-        };
+        const obj = parsed as { fips?: CensusGeographyLevel[] };
         return obj.fips ?? [];
       },
       {
@@ -177,6 +246,9 @@ export class CensusApiService {
         signal: ctx.signal,
       },
     );
+
+    this.geographyLevelsCache.set(cacheKey, { levels, fetchedAt: Date.now() });
+    return levels;
   }
 
   private parseResponse(
@@ -189,7 +261,22 @@ export class CensusApiService {
 
     const headers = raw[0] as string[];
     const nameIdx = headers.indexOf('NAME');
-    const geoIdx = headers.indexOf(geographyLevel);
+    // The Census API echoes the level name in its own casing, so match it the way
+    // checkGeography does rather than requiring the caller's exact spelling.
+    const geoTarget = geographyLevel.trim().toLowerCase();
+    const geoIdx = headers.findIndex((h) => h.toLowerCase() === geoTarget);
+
+    // The Census API appends one column per geography level in the resolved hierarchy —
+    // a county query returns state + county, a tract query state + county + tract. Every
+    // header that is neither NAME nor a requested variable is one of those columns, and
+    // concatenating them in order composes the full GEOID.
+    const requested = new Set(requestedVariables);
+    const geoColumnIdxs = headers.flatMap((header, idx) =>
+      header !== 'NAME' && !requested.has(header) ? [idx] : [],
+    );
+    const variableIdxs = requestedVariables
+      .map((code) => [code, headers.indexOf(code)] as const)
+      .filter(([, idx]) => idx >= 0);
 
     const rows: CensusDataRow[] = [];
 
@@ -197,13 +284,11 @@ export class CensusApiService {
       const row = raw[i] as string[];
       const geographyName = nameIdx >= 0 ? (row[nameIdx] ?? '') : '';
       const geographyFips = geoIdx >= 0 ? (row[geoIdx] ?? '') : '';
+      const geographyGeoid = geoColumnIdxs.map((idx) => row[idx] ?? '').join('') || geographyFips;
 
       const variables: Record<string, CensusVariableValue> = {};
 
-      for (const varCode of requestedVariables) {
-        const idx = headers.indexOf(varCode);
-        if (idx < 0) continue;
-
+      for (const [varCode, idx] of variableIdxs) {
         const rawValue = row[idx] ?? null;
         const numValue = rawValue !== null ? Number(rawValue) : null;
         const suppressionReason = rawValue !== null ? SUPPRESSION_CODES[rawValue] : undefined;
@@ -229,7 +314,7 @@ export class CensusApiService {
         }
       }
 
-      rows.push({ geographyName, geographyFips, variables });
+      rows.push({ geographyName, geographyFips, geographyGeoid, variables });
     }
 
     ctx.log.info('Census API response parsed', { rowCount: rows.length });

@@ -68,7 +68,12 @@ export const censusQueryData = tool('census_query_data', {
             geography_fips: z
               .string()
               .describe(
-                'FIPS code for this geography at the queried level. Matches the geography_fips parameter in census_query_data for follow-up queries.',
+                'FIPS code for this geography at the queried level only, without its parents (e.g., "033" for King County). Pass back as the geography_fips parameter in census_query_data — alongside the same parent_fips/county_fips — for follow-up queries.',
+              ),
+            geography_geoid: z
+              .string()
+              .describe(
+                'Full GEOID — the queried level concatenated with its parent levels (e.g., "53033" for King County, "53033000101" for a tract). Nationally unique, unlike geography_fips. Pass these to the geographies filter in census_compare_geographies to compare geographies across different states.',
               ),
             variables: z
               .object({})
@@ -114,7 +119,7 @@ export const censusQueryData = tool('census_query_data', {
     {
       reason: 'geography_not_supported',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The requested geography level is not available for this dataset and year.',
+      when: 'The requested geography level does not exist in this dataset and year.',
       recovery: 'Call census_list_geographies to see supported geography levels for this dataset.',
     },
     {
@@ -129,7 +134,7 @@ export const censusQueryData = tool('census_query_data', {
       code: JsonRpcErrorCode.NotFound,
       when: 'The query returned no rows.',
       recovery:
-        'ACS1 only covers geographies with 65K+ population — switch to acs/acs5, or check census_list_geographies for supported levels.',
+        'Confirm the FIPS codes exist for this dataset and year — census_resolve_geography returns them for a place name, and census_list_geographies confirms the level is supported.',
     },
     {
       reason: 'too_many_variables',
@@ -183,6 +188,62 @@ export const censusQueryData = tool('census_query_data', {
       year,
     });
 
+    const apiService = getCensusApiService();
+    const parentFips = input.parent_fips?.trim() || undefined;
+    const countyFips = input.county_fips?.trim() || undefined;
+
+    // Validate the level and its parents against the dataset's own geography.json before
+    // spending a data query the Census API would reject with an opaque 400.
+    const check = await apiService.checkGeography(
+      {
+        dataset,
+        year,
+        geographyLevel: input.geography_level,
+        geographyFips: input.geography_fips,
+        ...(parentFips !== undefined && { parentFips }),
+        ...(countyFips !== undefined && { countyFips }),
+      },
+      ctx,
+    );
+
+    if (check.status === 'level_not_supported') {
+      throw ctx.fail(
+        'geography_not_supported',
+        `Geography level "${input.geography_level}" does not exist in ${dataset} (${year}).`,
+        {
+          dataset,
+          year,
+          geographyLevel: input.geography_level,
+          availableLevels: check.availableLevels,
+          ...ctx.recoveryFor('geography_not_supported'),
+        },
+      );
+    }
+
+    if (check.status === 'parent_required') {
+      const missing = check.missingParents;
+      const steps = missing.map((parent) =>
+        parent === 'state'
+          ? 'add parent_fips (census_resolve_geography returns it as state_fips)'
+          : parent === 'county'
+            ? 'add county_fips (census_resolve_geography returns it as county_fips)'
+            : check.wildcardRelaxes
+              ? `drop the ${parent} scope by setting geography_fips to "*", which returns every ${input.geography_level} under the parents you did supply`
+              : `scope the query by ${parent}, which this tool has no input for — call census_list_geographies and pick a level whose only parents are state and county`,
+      );
+      throw ctx.fail(
+        'parent_required',
+        `Geography level "${input.geography_level}" in ${dataset} (${year}) must be scoped by ${missing.join(' and ')}.`,
+        {
+          dataset,
+          year,
+          geographyLevel: input.geography_level,
+          missingParents: missing,
+          recovery: { hint: `To query this level, ${steps.join(', and ')}.` },
+        },
+      );
+    }
+
     // Fetch variable labels for enrichment (best-effort — don't fail if cache is cold)
     const variableCacheService = getVariableCacheService();
     const variableLabels: Map<string, string> = new Map();
@@ -200,9 +261,6 @@ export const censusQueryData = tool('census_query_data', {
       ctx.log.debug('Variable label enrichment skipped', { dataset, year });
     }
 
-    const apiService = getCensusApiService();
-    const parentFips = input.parent_fips?.trim() || undefined;
-    const countyFips = input.county_fips?.trim() || undefined;
     const rows = await apiService.queryData(
       {
         variables: input.variables,
@@ -217,6 +275,10 @@ export const censusQueryData = tool('census_query_data', {
     );
 
     if (rows.length === 0) {
+      // Only steer toward acs/acs5 from a dataset that actually covers less than it does.
+      const hint = dataset.startsWith('acs/acs1')
+        ? `ACS1 only covers geographies with 65,000+ population — switch to dataset "acs/acs5" for smaller geographies, or confirm the FIPS codes with census_resolve_geography.`
+        : `Confirm the FIPS codes exist in ${dataset} (${year}) — census_resolve_geography returns them for a place name. If the level itself is in doubt, call census_list_geographies.`;
       throw ctx.fail(
         'no_data',
         `No data returned for ${input.geography_level} in ${dataset} (${year}).`,
@@ -224,7 +286,7 @@ export const censusQueryData = tool('census_query_data', {
           dataset,
           year,
           geographyLevel: input.geography_level,
-          ...ctx.recoveryFor('no_data'),
+          recovery: { hint },
         },
       );
     }
@@ -254,6 +316,7 @@ export const censusQueryData = tool('census_query_data', {
       return {
         geography_name: row.geographyName,
         geography_fips: row.geographyFips,
+        geography_geoid: row.geographyGeoid,
         variables: enrichedVariables,
       };
     });
@@ -268,7 +331,7 @@ export const censusQueryData = tool('census_query_data', {
 
     for (const row of result.rows) {
       lines.push(`### ${row.geography_name}`);
-      lines.push(`**FIPS:** \`${row.geography_fips}\``);
+      lines.push(`**FIPS:** \`${row.geography_fips}\` · **GEOID:** \`${row.geography_geoid}\``);
       for (const [code, rawVal] of Object.entries(row.variables)) {
         const val = rawVal as {
           estimate: number | null;

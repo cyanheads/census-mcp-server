@@ -41,7 +41,7 @@ export const censusListGeographies = tool('census_list_geographies', {
             requires_parent: z
               .boolean()
               .describe(
-                'Whether this level requires a parent FIPS code (parent_fips in census_query_data).',
+                'Whether this level names any parent level. A parent is always mandatory for a concrete FIPS target; some levels drop their innermost parents when the target is "*", which is why a nationwide county query needs no parent_fips while a single county does.',
               ),
             required_parent_levels: z
               .array(z.string())

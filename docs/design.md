@@ -211,17 +211,20 @@ Each step is independently testable. Steps 5–6 can be tested without a Census 
 - `geography_level: string` — level of the target geography (e.g., `"county"`, `"tract"`, `"state"`, `"zip code tabulation area"`). Use `census_list_geographies` to see valid values for the dataset.
 - `geography_fips: string` — FIPS code for the target geography at the requested level (e.g., `"033"` for a county, `"*"` for all geographies at that level within the parent). Use `census_resolve_geography` to obtain this value.
 - `parent_fips?: string` — FIPS of the parent geography when the level requires one (e.g., state FIPS `"53"` when querying counties within WA). Required for sub-state levels. `census_resolve_geography` returns this as `state_fips`.
+- `county_fips?: string` — county FIPS when querying tracts or block groups inside one county (e.g., `"033"` for King County), alongside `parent_fips`. `census_resolve_geography` returns this as `county_fips`.
 - `dataset?: string` — dataset to query (default: `"acs/acs5"`). Use `census_list_datasets` for valid values.
 - `year?: number` — vintage year (default: latest available for the dataset)
 
-**Output:** Array of result rows, each with `{ geography_name, geography_fips, variables: { [code]: { estimate, moe?, label, suppressed, suppression_reason? } } }`. Suppressed values include a human-readable `suppression_reason` (e.g., "geography too small for reliable estimate") rather than the raw negative sentinel. When `geography_fips` is `"*"`, returns all geographies at the level — results include `geography_fips` on each row for use in follow-up calls.
+**Output:** Array of result rows, each with `{ geography_name, geography_fips, geography_geoid, variables: { [code]: { estimate, moe?, label, suppressed, suppression_reason? } } }`. Suppressed values include a human-readable `suppression_reason` (e.g., "geography too small for reliable estimate") rather than the raw negative sentinel. When `geography_fips` is `"*"`, returns all geographies at the level.
+
+Each row carries two identifiers because they serve different purposes. `geography_fips` is the bare code at the queried level (`"033"`) — what the Census API `for=` clause takes, so it round-trips back into this tool's own `geography_fips` input alongside the same parents. `geography_geoid` concatenates the level with its parents (`"53033"` for a county, `"53033000101"` for a tract) and is nationally unique, so it is the identifier that works when geographies span states — notably in `census_compare_geographies`'s `geographies` filter.
 
 **Errors:**
 - `missing_api_key` (Unauthorized) — `CENSUS_API_KEY` not configured or invalid. Recovery: set the env var and restart.
 - `variable_not_found` (InvalidParams) — one or more variable codes don't exist in the dataset+year. Recovery: call `census_search_variables` or `census_get_variable` to confirm codes.
-- `geography_not_supported` (InvalidParams) — the requested geography level is not available for this dataset and year. Recovery: call `census_list_geographies` to see supported levels.
-- `parent_required` (InvalidParams) — the geography level requires a parent FIPS (e.g., county requires state FIPS) but none was provided. Recovery: add `parent_fips` — use `census_resolve_geography` to get it.
-- `no_data` (NotFound) — the query returned no rows. Most common cause: ACS1 queried for a geography with fewer than 65K population, or a dataset+year combination that doesn't cover the requested level. Recovery: switch to `acs/acs5` or check `census_list_geographies`.
+- `geography_not_supported` (InvalidParams) — the requested geography level does not exist in this dataset and year. Thrown before the data query, from the dataset's own geography metadata; the error carries the levels the dataset does have. Recovery: call `census_list_geographies` to see supported levels.
+- `parent_required` (InvalidParams) — the geography level requires a parent the request did not supply (e.g., tract requires a state, block group a state and a county). Thrown before the data query, from the same metadata; the error names the missing parents and the recovery hint names the input to add. A `*` target relaxes the innermost required parent, which is why a nationwide `county` query needs no `parent_fips` while a tract query does. A missing parent this tool has no input for (a single block group needs its tract) is reported as such: the hint offers `geography_fips: "*"` when the wildcard would drop that parent, and otherwise says the level is out of reach.
+- `no_data` (NotFound) — the query returned no rows. The Census API answers a well-formed but empty query with `204 No Content`, which is read as zero rows here rather than an unparseable response. Recovery is dataset-aware: on ACS1 it points at the 65K population floor and suggests `acs/acs5`; on any other dataset it points at confirming the FIPS codes and level, without suggesting a switch to the dataset already in use.
 - `too_many_variables` (InvalidParams) — more than 50 variable codes requested. Recovery: split into multiple calls.
 - `upstream_error` (ServiceUnavailable, retryable) — Census API returned an error or was unreachable. Recovery: retry; if persistent, the API may be down.
 
@@ -237,21 +240,23 @@ Each step is independently testable. Steps 5–6 can be tested without a Census 
 - `variables: string[]` — variable codes to compare (e.g., `["B17001_002E", "B17001_001E"]`). Include MOE counterparts (`M` suffix) to get reliability context.
 - `geography_level: string` — the level to compare across (e.g., `"state"`, `"county"`, `"tract"`). Use `census_list_geographies` to see valid values for the dataset.
 - `within?: string` — FIPS of the parent geography to constrain results (e.g., state FIPS `"53"` to compare counties within WA only). Omit to compare all geographies at the level nationally. Use `census_resolve_geography` to get the FIPS.
-- `geographies?: string[]` — optional list of specific geography FIPS codes to include. When provided, only these geographies are returned. Omit to return all geographies at the level within `within` (or nationally). Use `census_resolve_geography` for each place name to get its FIPS.
+- `within_county?: string` — county FIPS to constrain a tract or block-group comparison to one county inside `within` (e.g., `"033"`). `census_resolve_geography` returns this as `county_fips`.
+- `geographies?: string[]` — optional list of specific geographies to include; when provided, only these are returned. Omit to return all geographies at the level within `within` (or nationally). An entry matches a row's full GEOID (`"53033"` King County WA, `"06037"` Los Angeles County CA) or its bare level code (`"033"`). Prefer GEOIDs: they are nationally unique, so a list may span states, whereas a bare code matches that code in every state unless `within` scopes the comparison. A GEOID is easiest taken from a row's own `geography_geoid`; from `census_resolve_geography`, concatenate `state_fips`, then `county_fips` when present, then `fips_summary` — a tract GEOID is state + county + tract, not state + tract. Entries that match no row, and bare codes that matched more than one state, are named in the response notice; a list that matches nothing at all throws `no_data` rather than returning an empty ranking.
 - `dataset?: string` — dataset to query (default: `"acs/acs5"`)
 - `year?: number` — vintage year (default: latest available)
 - `sort_by?: string` — variable code to sort by (default: first variable in the list)
 - `sort_dir?: 'asc' | 'desc'` — sort direction (default: `'desc'`)
 - `limit?: number` — max geographies to return (default: 50, max: 500). When results are truncated, `total_count` indicates how many geographies matched.
 
-**Output:** `{ rows: [{ geography_name, geography_fips, variables: { [code]: { estimate, moe?, label, suppressed } } }], total_count, truncated }`. `geography_fips` on each row enables follow-up calls to `census_query_data` for more variables on a specific result. Suppressed values are labeled rather than passed through as raw sentinels.
+**Output:** `{ rows: [{ geography_name, geography_fips, geography_geoid, variables: { [code]: { estimate, moe?, label, suppressed } }, rank }], total_count, truncated }`. `geography_fips` on each row enables follow-up calls to `census_query_data` for more variables on a specific result; `geography_geoid` is the nationally unique form to pass back in `geographies`. Suppressed values are labeled rather than passed through as raw sentinels.
 
 **Errors:**
 - `missing_api_key` (Unauthorized) — `CENSUS_API_KEY` not configured or invalid.
-- `geography_not_supported` (InvalidParams) — geography level not available for this dataset+year. Recovery: call `census_list_geographies`.
-- `parent_required` (InvalidParams) — the level requires a parent FIPS but `within` was not provided. Error message names which parent level is required.
+- `geography_not_supported` (InvalidParams) — the geography level does not exist in this dataset+year. Thrown before the data query, from the dataset's own geography metadata. Recovery: call `census_list_geographies`.
+- `parent_required` (InvalidParams) — the level requires a parent the request did not supply. Thrown before the data query; the message names the missing parent levels and the recovery hint names `within` or `within_county`.
 - `variable_not_found` (InvalidParams) — one or more variable codes invalid for this dataset+year.
-- `no_data` (NotFound) — no geographies returned. Most common: ACS1 + sub-state level, or `geographies` list contains codes that don't exist in the dataset.
+- `no_data` (NotFound) — no geographies returned, or the `geographies` list matched no row. Recovery is dataset-aware on the first case (ACS1 gets the 65K population floor and an `acs/acs5` suggestion; other datasets get level and FIPS verification) and names the unmatched entries on the second.
+- Extraneous parents are not pre-validated: passing `within` for a level that has no state parent (a national ZCTA or urban-area comparison) still reaches the Census API and surfaces its `400`.
 - `upstream_error` (ServiceUnavailable, retryable) — Census API unreachable or returned an error.
 
 **Annotations:** `readOnlyHint: true`, `openWorldHint: false`

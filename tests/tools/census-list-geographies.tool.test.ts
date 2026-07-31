@@ -34,10 +34,10 @@ beforeEach(async () => {
 describe('censusListGeographies', () => {
   it('returns geography levels for a valid dataset', async () => {
     mockFetchGeographyLevels.mockResolvedValue([
-      { name: 'us', geoLevelId: '010', requires: [] },
-      { name: 'state', geoLevelId: '040', requires: [] },
-      { name: 'county', geoLevelId: '050', requires: ['state'] },
-      { name: 'tract', geoLevelId: '140', requires: ['state', 'county'] },
+      { name: 'us', geoLevelDisplay: '010', requires: [] },
+      { name: 'state', geoLevelDisplay: '040', requires: [] },
+      { name: 'county', geoLevelDisplay: '050', requires: ['state'] },
+      { name: 'tract', geoLevelDisplay: '140', requires: ['state', 'county'] },
     ]);
 
     const ctx = createMockContext({ errors: censusListGeographies.errors });
@@ -79,9 +79,9 @@ describe('censusListGeographies', () => {
 
   it('assigns example FIPS values for known level names', async () => {
     mockFetchGeographyLevels.mockResolvedValue([
-      { name: 'state', geoLevelId: '040', requires: [] },
-      { name: 'county', geoLevelId: '050', requires: ['state'] },
-      { name: 'zip code tabulation area', geoLevelId: '860', requires: [] },
+      { name: 'state', geoLevelDisplay: '040', requires: [] },
+      { name: 'county', geoLevelDisplay: '050', requires: ['state'] },
+      { name: 'zip code tabulation area', geoLevelDisplay: '860', requires: [] },
     ]);
 
     const ctx = createMockContext({ errors: censusListGeographies.errors });
@@ -99,8 +99,8 @@ describe('censusListGeographies', () => {
 
   it('assigns example FIPS for "us" and "block group" levels', async () => {
     mockFetchGeographyLevels.mockResolvedValue([
-      { name: 'us', geoLevelId: '010', requires: [] },
-      { name: 'block group', geoLevelId: '150', requires: ['state', 'county', 'tract'] },
+      { name: 'us', geoLevelDisplay: '010', requires: [] },
+      { name: 'block group', geoLevelDisplay: '150', requires: ['state', 'county', 'tract'] },
     ]);
 
     const ctx = createMockContext({ errors: censusListGeographies.errors });
@@ -116,7 +116,7 @@ describe('censusListGeographies', () => {
 
   it('assigns wildcard example for unrecognized geography names', async () => {
     mockFetchGeographyLevels.mockResolvedValue([
-      { name: 'congressional district', geoLevelId: '500', requires: ['state'] },
+      { name: 'congressional district', geoLevelDisplay: '500', requires: ['state'] },
     ]);
 
     const ctx = createMockContext({ errors: censusListGeographies.errors });
@@ -129,7 +129,7 @@ describe('censusListGeographies', () => {
 
   it('uses default year when year not provided', async () => {
     mockFetchGeographyLevels.mockResolvedValue([
-      { name: 'state', geoLevelId: '040', requires: [] },
+      { name: 'state', geoLevelDisplay: '040', requires: [] },
     ]);
 
     const ctx = createMockContext({ errors: censusListGeographies.errors });
@@ -142,7 +142,7 @@ describe('censusListGeographies', () => {
 
   it('passes custom year to api service', async () => {
     mockFetchGeographyLevels.mockResolvedValue([
-      { name: 'state', geoLevelId: '040', requires: [] },
+      { name: 'state', geoLevelDisplay: '040', requires: [] },
     ]);
 
     const ctx = createMockContext({ errors: censusListGeographies.errors });
@@ -154,9 +154,9 @@ describe('censusListGeographies', () => {
 
   it('enrich reports correct totalLevels count', async () => {
     mockFetchGeographyLevels.mockResolvedValue([
-      { name: 'state', geoLevelId: '040', requires: [] },
-      { name: 'county', geoLevelId: '050', requires: ['state'] },
-      { name: 'tract', geoLevelId: '140', requires: ['state', 'county'] },
+      { name: 'state', geoLevelDisplay: '040', requires: [] },
+      { name: 'county', geoLevelDisplay: '050', requires: ['state'] },
+      { name: 'tract', geoLevelDisplay: '140', requires: ['state', 'county'] },
     ]);
 
     const { getEnrichment } = await import('@cyanheads/mcp-ts-core/testing');

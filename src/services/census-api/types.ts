@@ -5,13 +5,53 @@
 
 /** A single row of Census API data with labeled variable values. */
 export interface CensusDataRow {
-  /** FIPS code of the geography at the queried level (e.g., "033"). */
+  /**
+   * FIPS code of the geography at the queried level only, without its parents
+   * (e.g., "033" for King County). This is the value the Census API `for=` clause
+   * takes, so it round-trips into census_query_data's geography_fips input.
+   */
   geographyFips: string;
+  /**
+   * Full GEOID — every geography column the response carried, concatenated in
+   * hierarchy order (e.g., "53033" for King County, "53033000101" for a tract).
+   * Nationally unique, so it is the safe identifier for cross-state matching.
+   */
+  geographyGeoid: string;
   /** Human-readable geography name (e.g., "King County, Washington"). */
   geographyName: string;
   /** Map of variable code to parsed value entry. */
   variables: Record<string, CensusVariableValue>;
 }
+
+/** One geography level entry from a dataset's `geography.json`. */
+export interface CensusGeographyLevel {
+  /** Census summary-level code (e.g., "050" for county). */
+  geoLevelDisplay: string;
+  /** Level name as the `for=` clause takes it (e.g., "county", "block group"). */
+  name: string;
+  /**
+   * The innermost required parent that becomes optional when the level itself is
+   * queried with a `*` wildcard. Everything from this parent inward may be omitted.
+   */
+  optionalWithWCFor?: string;
+  /** Vintage reference date for this level. */
+  referenceDate?: string;
+  /** Parent level names this level must be scoped by, outermost first. */
+  requires?: string[];
+  /** Parent levels that may themselves be wildcarded. */
+  wildcard?: string[];
+}
+
+/** Outcome of pre-validating a geography level + parent combination against a dataset. */
+export type GeographyCheck =
+  | { status: 'ok' }
+  | { status: 'level_not_supported'; availableLevels: string[] }
+  | {
+      status: 'parent_required';
+      missingParents: string[];
+      /** True when a `*` target would drop at least one of the missing parents. */
+      wildcardRelaxes: boolean;
+    };
 
 /** A single variable value from a Census data query. */
 export interface CensusVariableValue {

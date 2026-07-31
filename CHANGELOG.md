@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.1](changelog/0.3.x/0.3.1.md) — 2026-07-31
+
+Fixed census_list_predicate_values listing dataset-dictionary codes a dataset publishes no rows for (#26), and pep/charv returning two indistinguishable rows per geography that both entered comparison rankings (#27)
+
 ## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-07-31
 
 Added census_list_predicate_values to discover filter-dimension codes (#23), plus fixes for a raw 400 on an unaccepted parent (#21), silent no_data on an unpadded FIPS code (#25), and dec/ddhca/ecnbasic returning one category as if it were a total (#24)

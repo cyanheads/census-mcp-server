@@ -83,6 +83,13 @@ export const censusGetVariable = tool('census_get_variable', {
       recovery: 'Call census_list_datasets to discover valid dataset codes like acs/acs5.',
     },
     {
+      reason: 'year_not_available',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The dataset does not serve the requested vintage year.',
+      recovery:
+        'Retry with a year from available_years in census_list_datasets; the error names the years this dataset serves.',
+    },
+    {
       reason: 'variables_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'Variable metadata endpoint is unreachable or returned an unparseable response.',

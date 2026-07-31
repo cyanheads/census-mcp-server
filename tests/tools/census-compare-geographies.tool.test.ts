@@ -7,6 +7,8 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { censusCompareGeographies } from '@/mcp-server/tools/definitions/census-compare-geographies.tool.js';
+import { yearNotAvailable } from '@/services/census-api/errors.js';
+import { DATASET_AVAILABLE_YEARS } from '@/services/variable-cache/variable-cache-service.js';
 
 vi.mock('@/services/census-api/census-api-service.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/services/census-api/census-api-service.js')>()),
@@ -41,6 +43,7 @@ const mockCheckGeography = vi.fn();
 const mockGetVariablesByCode = vi.fn();
 const mockCheckPredicates = vi.fn();
 const mockGetRecordDimensions = vi.fn();
+const mockValidateYear = vi.fn();
 
 beforeEach(async () => {
   vi.clearAllMocks();
@@ -61,7 +64,17 @@ beforeEach(async () => {
     getVariablesByCode: mockGetVariablesByCode,
     checkPredicates: mockCheckPredicates,
     getRecordDimensions: mockGetRecordDimensions,
+    validateYear: mockValidateYear,
   } as never);
+
+  /**
+   * The real check, not a stub: a test that asserts the year is refused before the first
+   * request is only meaningful if the mock refuses the same years the service does.
+   */
+  mockValidateYear.mockImplementation((dataset: string, year: number) => {
+    const years = DATASET_AVAILABLE_YEARS[dataset];
+    if (years && !years.includes(year)) throw yearNotAvailable(dataset, year, years);
+  });
 
   // Default: the dataset declares no filter dimensions, so nothing is unset or unknown.
   mockCheckPredicates.mockResolvedValue({ unset: [], unknown: [] });
@@ -733,6 +746,7 @@ describe('censusCompareGeographies', () => {
       getVariablesByCode: vi.fn().mockRejectedValue(new Error('cache cold')),
       checkPredicates: mockCheckPredicates,
       getRecordDimensions: mockGetRecordDimensions,
+      validateYear: mockValidateYear,
     } as never);
 
     mockQueryData.mockResolvedValue([
@@ -774,6 +788,95 @@ describe('censusCompareGeographies', () => {
     expect(text).not.toMatch(/CENSUS_API_KEY/);
     expect(text).not.toMatch(/api.key/i);
     expect(text).not.toMatch(/secret/i);
+  });
+
+  /**
+   * The check has to sit ahead of the geography check, which is the handler's first request —
+   * a year the dataset does not serve has no geography metadata either. Nothing here is stubbed
+   * to reject: the refusal has to come from the handler calling validateYear itself.
+   */
+  it('refuses a year the dataset does not serve before any request goes out', async () => {
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['POP'],
+      geography_level: 'state',
+      dataset: 'pep/charv',
+      year: 2021,
+    });
+
+    await expect(censusCompareGeographies.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'year_not_available', availableYears: [2023] },
+    });
+    expect(mockCheckGeography).not.toHaveBeenCalled();
+    expect(mockQueryData).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The ranking is on the numeric variable; the text one rides along as a join key and has to
+   * arrive readable rather than as the null a geography with no value gets.
+   */
+  it('carries a text value through onto every ranked row', async () => {
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'King County, WA',
+        geographyFips: '033',
+        geographyGeoid: '53033',
+        variables: {
+          B19013_001E: { estimate: 122148, label: 'B19013_001E', suppressed: false },
+          GEO_ID: {
+            estimate: null,
+            label: 'GEO_ID',
+            suppressed: false,
+            value: '0500000US53033',
+          },
+        },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['B19013_001E', 'GEO_ID'],
+      geography_level: 'county',
+      within: '53',
+    });
+    const result = await censusCompareGeographies.handler(input, ctx);
+
+    const variables = result.rows[0]?.variables as Record<
+      string,
+      { estimate: number | null; suppressed: boolean; value?: string }
+    >;
+    expect(variables.GEO_ID?.value).toBe('0500000US53033');
+    expect(variables.B19013_001E?.value).toBeUndefined();
+    expect(result.rows[0]?.rank).toBe(1);
+  });
+
+  it('format renders a text value rather than the N/A a missing one gets', () => {
+    const output = {
+      rows: [
+        {
+          geography_name: 'King County, WA',
+          geography_fips: '033',
+          geography_geoid: '53033',
+          variables: {
+            GEO_ID: {
+              estimate: null,
+              label: 'Geography',
+              suppressed: false,
+              value: '0500000US53033',
+            },
+            B19013_001M: { estimate: null, label: 'Margin of error', suppressed: false },
+          },
+          rank: 1,
+        },
+      ],
+    };
+
+    const blocks = censusCompareGeographies.format!(output);
+    const text = (blocks[0] as { type: string; text: string }).text;
+
+    expect(text).toContain('**GEO_ID:** 0500000US53033');
+    expect(text).toContain('**B19013_001M:** N/A');
   });
 
   it('format shows moe alongside estimate when present', () => {

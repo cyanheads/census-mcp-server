@@ -7,6 +7,8 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { censusQueryData } from '@/mcp-server/tools/definitions/census-query-data.tool.js';
+import { yearNotAvailable } from '@/services/census-api/errors.js';
+import { DATASET_AVAILABLE_YEARS } from '@/services/variable-cache/variable-cache-service.js';
 
 vi.mock('@/services/census-api/census-api-service.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/services/census-api/census-api-service.js')>()),
@@ -42,6 +44,7 @@ const mockCheckGeography = vi.fn();
 const mockGetVariablesByCode = vi.fn();
 const mockCheckPredicates = vi.fn();
 const mockGetRecordDimensions = vi.fn();
+const mockValidateYear = vi.fn();
 
 beforeEach(async () => {
   vi.clearAllMocks();
@@ -62,7 +65,17 @@ beforeEach(async () => {
     getVariablesByCode: mockGetVariablesByCode,
     checkPredicates: mockCheckPredicates,
     getRecordDimensions: mockGetRecordDimensions,
+    validateYear: mockValidateYear,
   } as never);
+
+  /**
+   * The real check, not a stub: a test that asserts the year is refused before the first
+   * request is only meaningful if the mock refuses the same years the service does.
+   */
+  mockValidateYear.mockImplementation((dataset: string, year: number) => {
+    const years = DATASET_AVAILABLE_YEARS[dataset];
+    if (years && !years.includes(year)) throw yearNotAvailable(dataset, year, years);
+  });
 
   // Default: the dataset declares no filter dimensions, so nothing is unset or unknown.
   mockCheckPredicates.mockResolvedValue({ unset: [], unknown: [] });
@@ -992,6 +1005,129 @@ describe('censusQueryData', () => {
     expect(text).toContain('geography too small');
   });
 
+  /**
+   * The check has to sit ahead of the geography check, which is the handler's first request —
+   * a year the dataset does not serve has no geography metadata either, so leaving the check
+   * downstream spends a round trip and reports the wrong problem. Nothing here is stubbed to
+   * reject: the refusal has to come from the handler calling validateYear itself.
+   */
+  it('refuses a year the dataset does not serve before any request goes out', async () => {
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['POP'],
+      geography_level: 'state',
+      geography_fips: '53',
+      dataset: 'pep/charv',
+      year: 2021,
+    });
+
+    await expect(censusQueryData.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: {
+        reason: 'year_not_available',
+        availableYears: [2023],
+        recovery: { hint: expect.stringContaining('2023') },
+      },
+    });
+    expect(mockCheckGeography).not.toHaveBeenCalled();
+    expect(mockCheckPredicates).not.toHaveBeenCalled();
+    expect(mockQueryData).not.toHaveBeenCalled();
+  });
+
+  /**
+   * cbp does publish a 2009 vintage; it rejects the NAME column every query here sends. Saying
+   * the dataset has no such vintage would be false, so the message says it cannot be queried.
+   */
+  it('words the refusal for a vintage that exists upstream but cannot be queried', async () => {
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['ESTAB'],
+      geography_level: 'state',
+      geography_fips: '53',
+      dataset: 'cbp',
+      year: 2009,
+    });
+
+    const error = await censusQueryData.handler(input, ctx).then(
+      () => undefined,
+      (err: Error) => err,
+    );
+
+    expect(error?.message).toContain('cbp cannot be queried for 2009');
+    expect(error?.message).toContain('2012-2023');
+    expect(error?.message).not.toMatch(/has no 2009 vintage|does not publish/);
+  });
+
+  /**
+   * A text column reached the caller as `estimate: null` with `suppressed: false`, which is what a
+   * geography with no value looks like — so the text was both lost and unreadable as text.
+   */
+  it('carries a text value through to the caller alongside the numeric ones', async () => {
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'King County, Washington',
+        geographyFips: '033',
+        geographyGeoid: '53033',
+        variables: {
+          B19013_001E: { estimate: 122148, label: 'B19013_001E', suppressed: false },
+          GEO_ID: {
+            estimate: null,
+            label: 'GEO_ID',
+            suppressed: false,
+            value: '0500000US53033',
+          },
+        },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['B19013_001E', 'GEO_ID'],
+      geography_level: 'county',
+      geography_fips: '033',
+      parent_fips: '53',
+    });
+    const result = await censusQueryData.handler(input, ctx);
+
+    const variables = result.rows[0]?.variables as Record<
+      string,
+      { estimate: number | null; suppressed: boolean; value?: string }
+    >;
+    expect(variables.GEO_ID?.value).toBe('0500000US53033');
+    expect(variables.GEO_ID?.suppressed).toBe(false);
+    // The three ways an estimate can be null stay distinguishable from one another.
+    expect(variables.B19013_001E?.value).toBeUndefined();
+    expect(variables.B19013_001E?.estimate).toBe(122148);
+  });
+
+  it('format renders a text value rather than the N/A a missing one gets', () => {
+    const output = {
+      rows: [
+        {
+          geography_name: 'King County, Washington',
+          geography_fips: '033',
+          geography_geoid: '53033',
+          variables: {
+            GEO_ID: {
+              estimate: null,
+              label: 'Geography',
+              suppressed: false,
+              value: '0500000US53033',
+            },
+            B19013_001M: { estimate: null, label: 'Margin of error', suppressed: false },
+          },
+        },
+      ],
+    };
+
+    const blocks = censusQueryData.format!(output);
+    const text = (blocks[0] as { type: string; text: string }).text;
+
+    expect(text).toContain('**GEO_ID:** 0500000US53033');
+    // The column with nothing in it still reads as nothing.
+    expect(text).toContain('**B19013_001M:** N/A');
+  });
+
   it('includes moe in output when service returns it', async () => {
     mockQueryData.mockResolvedValue([
       {
@@ -1054,6 +1190,7 @@ describe('censusQueryData', () => {
       getVariablesByCode: vi.fn().mockRejectedValue(new Error('cache cold')),
       checkPredicates: mockCheckPredicates,
       getRecordDimensions: mockGetRecordDimensions,
+      validateYear: mockValidateYear,
     } as never);
 
     mockQueryData.mockResolvedValue([

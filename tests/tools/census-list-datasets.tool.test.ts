@@ -93,6 +93,34 @@ describe('censusListDatasets', () => {
     expect(years).toContain(2012);
   });
 
+  /**
+   * The Census API publishes one pep/charv vintage. Its 2020 through 2022 numbers are values of
+   * that vintage's own YEAR dimension, so advertising them as vintages sent a caller at a
+   * variables.json path that 404s.
+   */
+  it('advertises the single pep/charv vintage the API publishes', () => {
+    const ctx = createMockContext();
+    const result = censusListDatasets.handler(censusListDatasets.input.parse({}), ctx);
+    const pep = result.datasets.find((d) => d.dataset_id === 'pep/charv');
+
+    expect(pep?.available_years).toEqual([2023]);
+    // The years that are gone from the list have to be reachable some other way.
+    expect(pep?.description).toContain('YEAR');
+    expect(pep?.description).toContain('2020 through 2023');
+  });
+
+  it('advertises exactly the years the query path serves', async () => {
+    const { DATASET_AVAILABLE_YEARS } = await import(
+      '@/services/variable-cache/variable-cache-service.js'
+    );
+    const ctx = createMockContext();
+    const result = censusListDatasets.handler(censusListDatasets.input.parse({}), ctx);
+
+    for (const dataset of result.datasets) {
+      expect(dataset.available_years).toEqual(DATASET_AVAILABLE_YEARS[dataset.dataset_id]);
+    }
+  });
+
   it('keeps the catalog in step with the dataset codes the tools accept', async () => {
     const { KNOWN_DATASETS } = await import('@/services/variable-cache/variable-cache-service.js');
     const ctx = createMockContext();

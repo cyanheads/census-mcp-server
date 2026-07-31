@@ -121,7 +121,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
               .object({})
               .passthrough()
               .describe(
-                'Map of variable code to value entry. Each key is a variable code from the variables input; each value has: estimate (number|null), moe (number|null, optional), label (string), suppressed (boolean).',
+                'Map of variable code to value entry. Each key is a variable code from the variables input; each value has: estimate (number|null), moe (number|null, optional), label (string), suppressed (boolean), value (string, optional). An estimate of null means one of three things and the other fields say which: suppressed true is a number the Census withheld, a value field is a cell holding text rather than a number (GEO_ID returns "0500000US53033"; the older ACS profile vintages write not-applicable as "(X)" in a column that is a number elsewhere), and neither is a cell with nothing in it. Text has no ordering, so sorting on a column of it leaves every row tied and ranked in the order the Census returned them.',
               ),
             applied_filters: z
               .object({})
@@ -202,11 +202,26 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
         'Drop the parent this level does not name. Levels such as urban area, zip code tabulation area, and metropolitan statistical area/micropolitan statistical area are compared nationally with no scope at all; census_list_geographies shows the parents each level takes.',
     },
     {
+      reason: 'year_not_available',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The dataset does not serve the requested vintage year.',
+      recovery:
+        'Retry with a year from available_years in census_list_datasets; the error names the years this dataset serves.',
+    },
+    {
       reason: 'variable_not_found',
       code: JsonRpcErrorCode.NotFound,
       when: 'One or more variable codes are not found in this dataset and year.',
       recovery:
         'Use census_search_variables or census_get_variable to confirm codes for this dataset and year.',
+    },
+    {
+      reason: 'variables_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'The variable metadata endpoint returned an unparseable response for this dataset and year.',
+      retryable: true,
+      recovery:
+        'Retry the request; if it persists, the Census metadata endpoint is temporarily unavailable.',
     },
     {
       reason: 'predicate_not_supported',
@@ -253,6 +268,12 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
     const limit = Math.min(input.limit ?? 50, 500);
     const sortDir = input.sort_dir ?? 'desc';
     const sortBy = input.sort_by?.trim() || input.variables[0] || '';
+
+    const variableCacheService = getVariableCacheService();
+    // Ahead of the geography check, which is the first request this handler makes. A vintage the
+    // dataset does not serve has no geography metadata either, so leaving the check downstream
+    // spends a round trip and reports the wrong problem for a year that is simply wrong.
+    variableCacheService.validateYear(dataset, year);
 
     ctx.log.info('Comparing geographies', {
       variables: input.variables,
@@ -345,8 +366,6 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
         },
       );
     }
-
-    const variableCacheService = getVariableCacheService();
 
     // Reject unknown predicate keys before spending the call — the Census API answers them with
     // a 400 whose surfaced message names only the request URL, never which key it rejected.
@@ -529,6 +548,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
           moe?: number | null;
           label: string;
           suppressed: boolean;
+          value?: string;
         }
       > = {};
 
@@ -538,6 +558,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
           ...(val.moe !== undefined && { moe: val.moe }),
           label: variableLabels.get(code) ?? val.label,
           suppressed: val.suppressed,
+          ...(val.value !== undefined && { value: val.value }),
         };
       }
 
@@ -605,9 +626,12 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
           moe?: number | null;
           label: string;
           suppressed: boolean;
+          value?: string;
         };
         if (val.suppressed) {
           lines.push(`- **${code}:** Suppressed`);
+        } else if (val.value !== undefined) {
+          lines.push(`- **${code}:** ${val.value}`);
         } else {
           const moePart = val.moe != null ? ` ± ${val.moe.toLocaleString()}` : '';
           lines.push(`- **${code}:** ${val.estimate?.toLocaleString() ?? 'N/A'}${moePart}`);

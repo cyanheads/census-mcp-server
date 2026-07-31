@@ -31,7 +31,7 @@ export const censusQueryData = tool('census_query_data', {
     variables: z
       .array(z.string())
       .describe(
-        'Variable codes to retrieve (e.g., ["B19013_001E", "B19013_001M"]). Max 50 per request. Use census_search_variables to find codes. On ACS datasets only, each estimate has a margin-of-error counterpart at the same code with the E suffix swapped for M — request both to get the margin alongside the estimate. Other dataset families (pep, dec, cbp, ecnbasic, nonemp) publish no margins of error, and an E-final code there is an ordinary code with no M sibling.',
+        'Variable codes to retrieve (e.g., ["B19013_001E", "B19013_001M"]). Max 50 per request. Use census_search_variables to find codes. On ACS datasets only, each estimate has a margin-of-error counterpart at the same code with the E suffix swapped for M — request both to get the margin alongside the estimate. Other dataset families (pep, dec, cbp, ecnbasic, nonemp) publish no margins of error, and an E-final code there is an ordinary code with no M sibling. A code can also name a text column rather than a measure — GEO_ID, on every dataset, is the nationally unique geography identifier and comes back under value with estimate null, which is the code to request when a stable join key is what is wanted.',
       ),
     geography_level: z
       .string()
@@ -106,7 +106,7 @@ export const censusQueryData = tool('census_query_data', {
               .object({})
               .passthrough()
               .describe(
-                'Map of variable code to value entry. Each key is a variable code from the variables input; each value has: estimate (number|null), moe (number|null, optional), label (string), suppressed (boolean), suppression_reason (string, optional).',
+                'Map of variable code to value entry. Each key is a variable code from the variables input; each value has: estimate (number|null), moe (number|null, optional), label (string), suppressed (boolean), suppression_reason (string, optional), value (string, optional). An estimate of null means one of three things and the other fields say which: suppressed true is a number the Census withheld, a value field is a cell holding text rather than a number (GEO_ID returns "0500000US53033"; the older ACS profile vintages write not-applicable as "(X)" in a column that is a number elsewhere), and neither is a cell with nothing in it.',
               ),
             applied_filters: z
               .object({})
@@ -157,11 +157,26 @@ export const censusQueryData = tool('census_query_data', {
         'Set the CENSUS_API_KEY environment variable and restart the server. Register a free key at api.census.gov/data/key_signup.html.',
     },
     {
+      reason: 'year_not_available',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The dataset does not serve the requested vintage year.',
+      recovery:
+        'Retry with a year from available_years in census_list_datasets; the error names the years this dataset serves.',
+    },
+    {
       reason: 'variable_not_found',
       code: JsonRpcErrorCode.NotFound,
       when: 'One or more variable codes do not exist in the requested dataset and year.',
       recovery:
         'Call census_search_variables or census_get_variable to confirm codes for this dataset and year.',
+    },
+    {
+      reason: 'variables_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'The variable metadata endpoint returned an unparseable response for this dataset and year.',
+      retryable: true,
+      recovery:
+        'Retry the request; if it persists, the Census metadata endpoint is temporarily unavailable.',
     },
     {
       reason: 'geography_not_supported',
@@ -240,6 +255,12 @@ export const censusQueryData = tool('census_query_data', {
     const dataset = input.dataset?.trim() || 'acs/acs5';
     const { defaultYear } = getDiscoveryConfig();
     const year = input.year ?? DATASET_LATEST_YEARS[dataset] ?? defaultYear;
+
+    const variableCacheService = getVariableCacheService();
+    // Ahead of the geography check, which is the first request this handler makes. A vintage the
+    // dataset does not serve has no geography metadata either, so leaving the check downstream
+    // spends a round trip and reports the wrong problem for a year that is simply wrong.
+    variableCacheService.validateYear(dataset, year);
 
     ctx.log.info('Querying Census data', {
       variables: input.variables,
@@ -332,8 +353,6 @@ export const censusQueryData = tool('census_query_data', {
         },
       );
     }
-
-    const variableCacheService = getVariableCacheService();
 
     // Reject unknown predicate keys before spending the call — the Census API answers them with
     // a 400 whose surfaced message names only the request URL, never which key it rejected.
@@ -433,6 +452,7 @@ export const censusQueryData = tool('census_query_data', {
           label: string;
           suppressed: boolean;
           suppression_reason?: string;
+          value?: string;
         }
       > = {};
 
@@ -443,6 +463,7 @@ export const censusQueryData = tool('census_query_data', {
           label: variableLabels.get(code) ?? val.label,
           suppressed: val.suppressed,
           ...(val.suppressionReason && { suppression_reason: val.suppressionReason }),
+          ...(val.value !== undefined && { value: val.value }),
         };
       }
 
@@ -504,11 +525,14 @@ export const censusQueryData = tool('census_query_data', {
           label: string;
           suppressed: boolean;
           suppression_reason?: string;
+          value?: string;
         };
         if (val.suppressed) {
           lines.push(
             `- **${code}:** Suppressed${val.suppression_reason ? ` (${val.suppression_reason})` : ''}`,
           );
+        } else if (val.value !== undefined) {
+          lines.push(`- **${code}:** ${val.value}`);
         } else {
           const moePart = val.moe != null ? ` ± ${val.moe.toLocaleString()}` : '';
           lines.push(`- **${code}:** ${val.estimate?.toLocaleString() ?? 'N/A'}${moePart}`);

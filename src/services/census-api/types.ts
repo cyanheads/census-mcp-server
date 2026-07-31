@@ -94,6 +94,16 @@ export interface CensusVariableValue {
   suppressed: boolean;
   /** Human-readable explanation when suppressed. */
   suppressionReason?: string;
+  /**
+   * The text the Census returned, for a cell that does not hold a number. Some columns are text
+   * everywhere — `GEO_ID` (`"0500000US53033"`) on every dataset, `pep/charv` `UNIVERSE` (`"R"`) —
+   * and an otherwise numeric column can hold text in one cell, which is how the older ACS profile
+   * vintages write "not applicable" (`acs/acs5/profile` 2009 answers `DP02_0070E` with `"(X)"`).
+   * Present only for such a cell, so its presence is what says the cell is text: `estimate` is
+   * null alongside it, and that null means "not a number" rather than the "no value here" a bare
+   * null means.
+   */
+  value?: string;
 }
 
 /** Raw Census API JSON response — array of arrays, first row is headers. */

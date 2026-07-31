@@ -8,6 +8,7 @@ import type { Context } from '@cyanheads/mcp-ts-core';
 import { notFound, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import { fetchWithTimeout, type RequestContext, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getDiscoveryConfig } from '@/config/server-config.js';
+import { censusHttpError, yearNotAvailable } from '@/services/census-api/errors.js';
 import type {
   CensusVariable,
   PredicateCheck,
@@ -18,35 +19,60 @@ import type {
 
 const CENSUS_API_BASE = 'https://api.census.gov/data';
 
-/** Known dataset codes for validation. */
-export const KNOWN_DATASETS = new Set([
-  'acs/acs5',
-  'acs/acs5/profile',
-  'acs/acs5/subject',
-  'acs/acs1',
-  'acs/acs1/profile',
-  'pep/charv',
-  'dec/pl',
-  'dec/ddhca',
-  'cbp',
-  'ecnbasic',
-  'nonemp',
-]);
-
-/** Map of dataset to latest available year (as of implementation). */
-export const DATASET_LATEST_YEARS: Record<string, number> = {
-  'acs/acs5': 2024,
-  'acs/acs5/profile': 2024,
-  'acs/acs5/subject': 2024,
-  'acs/acs1': 2024,
-  'acs/acs1/profile': 2024,
-  'pep/charv': 2023,
-  'dec/pl': 2020,
-  'dec/ddhca': 2020,
-  cbp: 2023,
-  ecnbasic: 2022,
-  nonemp: 2023,
+/**
+ * Vintages each dataset can be queried for, and the only place they are written down —
+ * `KNOWN_DATASETS`, `DATASET_LATEST_YEARS`, and the `available_years` census_list_datasets
+ * advertises all derive from it, so a caller cannot be pointed at a year the query path refuses.
+ *
+ * The list is what a query here can answer with, which is narrower than what the Census API
+ * hosts, for two separate reasons. A vintage can be absent upstream: `pep/charv` publishes the
+ * 2023 vintage alone, and its 2020 through 2022 numbers are values of that vintage's own `YEAR`
+ * dimension, so `variables.json` 404s for those paths. Or it can exist upstream and reject the
+ * `NAME` column every query here requests, which is `cbp` before 2012 and `nonemp` 2008 through
+ * 2011. `yearNotAvailable` therefore says a year cannot be queried rather than that the dataset
+ * does not publish it, which would be false for the second kind.
+ *
+ * A vintage the Census publishes that is missing here is refused before the network, so the
+ * lists are checked against `api.census.gov/data/<year>.json` — the per-vintage catalog — rather
+ * than trimmed by hand. Adding a vintage the Census releases is an edit here; until it is made,
+ * the new year fails with `year_not_available`.
+ */
+export const DATASET_AVAILABLE_YEARS: Record<string, number[]> = {
+  'acs/acs5': [
+    2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024,
+  ],
+  'acs/acs5/profile': [
+    2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024,
+  ],
+  'acs/acs5/subject': [
+    2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024,
+  ],
+  'acs/acs1': [
+    2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2021,
+    2022, 2023, 2024,
+  ],
+  'acs/acs1/profile': [
+    2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2021,
+    2022, 2023, 2024,
+  ],
+  'pep/charv': [2023],
+  'dec/pl': [2000, 2010, 2020],
+  'dec/ddhca': [2020],
+  cbp: [2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023],
+  ecnbasic: [2012, 2017, 2022],
+  nonemp: [
+    1997, 1998, 1999, 2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2012, 2013, 2014, 2015, 2016,
+    2017, 2018, 2019, 2020, 2021, 2022, 2023,
+  ],
 };
+
+/** Known dataset codes for validation. */
+export const KNOWN_DATASETS = new Set(Object.keys(DATASET_AVAILABLE_YEARS));
+
+/** Map of dataset to latest available year. */
+export const DATASET_LATEST_YEARS: Record<string, number> = Object.fromEntries(
+  Object.entries(DATASET_AVAILABLE_YEARS).map(([dataset, years]) => [dataset, Math.max(...years)]),
+);
 
 /**
  * True for the ACS dataset family, the only family where the `E` estimate / `M` margin-of-error
@@ -411,6 +437,16 @@ export class VariableCacheService {
     return coarsest?.[1].sort()[0];
   }
 
+  /**
+   * Validate that a dataset serves the requested vintage, before a query spends a round trip on
+   * a path the Census API answers with a 404 and an HTML error page. Every data and discovery
+   * path runs through the variable cache, so this is the one place the check has to sit.
+   */
+  validateYear(dataset: string, year: number): void {
+    const years = DATASET_AVAILABLE_YEARS[dataset];
+    if (years && !years.includes(year)) throw yearNotAvailable(dataset, year, years);
+  }
+
   /** Validate that a dataset code is known. */
   validateDataset(dataset: string): void {
     if (!KNOWN_DATASETS.has(dataset)) {
@@ -434,6 +470,7 @@ export class VariableCacheService {
     ctx: Context,
   ): Promise<Map<string, CensusVariable>> {
     this.validateDataset(dataset);
+    this.validateYear(dataset, year);
 
     const { variableCacheTtlHours } = getDiscoveryConfig();
     const ttlMs = variableCacheTtlHours * 60 * 60 * 1000;
@@ -450,9 +487,21 @@ export class VariableCacheService {
 
     const raw = await withRetry(
       async () => {
-        const response = await fetchWithTimeout(url, 30_000, ctx as unknown as RequestContext, {
-          signal: ctx.signal,
-        });
+        let response: Response;
+        try {
+          response = await fetchWithTimeout(url, 30_000, ctx as unknown as RequestContext, {
+            signal: ctx.signal,
+            // A vintage this catalog lists that the API has since dropped is an expected
+            // outcome, not a fault — log it at debug and answer with year_not_available.
+            expectedStatuses: [404],
+          });
+        } catch (error) {
+          throw censusHttpError(error, {
+            dataset,
+            year,
+            availableYears: DATASET_AVAILABLE_YEARS[dataset],
+          });
+        }
         const text = await response.text();
 
         if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {

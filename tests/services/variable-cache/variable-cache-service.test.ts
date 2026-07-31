@@ -4,9 +4,17 @@
  * @module tests/services/variable-cache/variable-cache-service.test
  */
 
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  JsonRpcErrorCode,
+  type McpError,
+  McpError as McpErrorClass,
+} from '@cyanheads/mcp-ts-core/errors';
+import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { httpStatusToErrorCode } from '@cyanheads/mcp-ts-core/utils';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { censusHttpError } from '@/services/census-api/errors.js';
+import {
+  DATASET_AVAILABLE_YEARS,
   DATASET_LATEST_YEARS,
   describeEmptyPredicatedResult,
   describeUnsetPredicates,
@@ -26,13 +34,20 @@ vi.mock('@/config/server-config.js', () => ({
   })),
 }));
 
-/** Bodies handed out in call order; a request past the end sees an empty variables map. */
+/**
+ * Bodies handed out in call order; a request past the end sees an empty variables map. A queued
+ * `Response` is served as-is, which is how a non-2xx status and its body are staged.
+ */
 let responses: unknown[] = [];
 let requestedUrls: string[] = [];
 
 const queue = (...bodies: unknown[]) => {
   responses = bodies;
 };
+
+/** The servlet container error page the Census API answers a missing dataset+year path with. */
+const TOMCAT_404 =
+  '<!doctype html><html lang="en"><head><title>HTTP Status 404 – Not Found</title><style type="text/css">body {font-family:Tahoma,Arial,sans-serif;}</style></head><body><h1>HTTP Status 404 – Not Found</h1></body></html>';
 
 let service: VariableCacheService;
 
@@ -45,6 +60,7 @@ beforeEach(() => {
     vi.fn((url: string | URL) => {
       requestedUrls.push(String(url));
       const body = responses.shift() ?? { variables: {} };
+      if (body instanceof Response) return Promise.resolve(body);
       return Promise.resolve(
         new Response(JSON.stringify(body), {
           status: 200,
@@ -680,6 +696,204 @@ describe('VariableCacheService.validateDataset', () => {
 
   it('rejects an unregistered dataset', () => {
     expect(() => service.validateDataset('nonemployer-statistics/ns')).toThrow(/Unknown dataset/);
+  });
+});
+
+/**
+ * A vintage a dataset does not serve used to reach the caller as the raw fetch failure, carrying
+ * the first 500 bytes of the Census API's servlet-container error page in `data.body` and
+ * `data.responseBody` — several hundred bytes of markup and no statement of what to do instead.
+ */
+describe('VariableCacheService — a vintage the dataset does not serve', () => {
+  it('refuses a year outside the dataset catalog without spending a request', async () => {
+    await expect(
+      service.getVariablesByCode(['POP'], 'pep/charv', 2021, createMockContext()),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'year_not_available', dataset: 'pep/charv', year: 2021 },
+    });
+
+    expect(requestedUrls).toEqual([]);
+  });
+
+  it('names the years the dataset does serve, collapsing contiguous runs', async () => {
+    const error = await service
+      .getVariablesByCode(['ESTAB'], 'cbp', 2009, createMockContext())
+      .then(
+        () => undefined,
+        (err: McpError) => err,
+      );
+
+    expect(error).toBeDefined();
+    expect(error?.message).toContain('2012-2023');
+    const data = error?.data as { recovery: { hint: string }; availableYears: number[] };
+    expect(data.recovery.hint).toContain('2012-2023');
+    expect(data.availableYears).toContain(2012);
+  });
+
+  /**
+   * The year was checked against the catalog before the request went out, so a 404 on a year the
+   * catalog lists means the catalog has drifted from the API. Answering "no such vintage" while
+   * naming that same vintage under available_years is a loop, not a recovery.
+   */
+  it('does not call a catalogued year unavailable when the API 404s it', async () => {
+    queue(new Response(TOMCAT_404, { status: 404, headers: { 'content-type': 'text/html' } }));
+
+    const error = await service
+      .getVariablesByCode(['B19013_001E'], 'acs/acs5', 2024, createMockContext())
+      .then(
+        () => undefined,
+        (err: McpError) => err,
+      );
+
+    expect(error?.data).toMatchObject({ reason: 'upstream_error', year: 2024, status: 404 });
+    expect(error?.data).not.toMatchObject({ reason: 'year_not_available' });
+    expect(error?.message).toContain('acs/acs5 (2024)');
+    // The servlet error page never reaches the caller, at any status.
+    expect(JSON.stringify(error?.data)).not.toContain('HTTP Status 404');
+    expect(error?.data).not.toHaveProperty('body');
+    expect(error?.data).not.toHaveProperty('responseBody');
+    expect(error?.message).not.toContain('<');
+  });
+
+  it('strips the upstream error page from a status that is not a 404 as well', async () => {
+    queue(
+      new Response('<!doctype html><html><body>HTTP Status 400 – Bad Request</body></html>', {
+        status: 400,
+        headers: { 'content-type': 'text/html' },
+      }),
+    );
+
+    const error = await service
+      .getVariablesByCode(['B19013_001E'], 'acs/acs5', 2024, createMockContext())
+      .then(
+        () => undefined,
+        (err: McpError) => err,
+      );
+
+    expect(error?.data).toMatchObject({
+      reason: 'upstream_error',
+      dataset: 'acs/acs5',
+      year: 2024,
+    });
+    expect(JSON.stringify(error?.data)).not.toContain('HTTP Status 400');
+    expect(error?.data).not.toHaveProperty('body');
+    expect(error?.data).not.toHaveProperty('upstreamMessage');
+    expect(error?.message).toContain('acs/acs5 (2024)');
+  });
+
+  /**
+   * The Census API states a rejected query's cause in one line of plain text and nowhere else.
+   * Dropping it alongside the markup left the caller with a bare status and a maintainer with
+   * only the log line.
+   */
+  it("carries the Census API's own one-line rejection through to the caller", async () => {
+    queue(
+      new Response("error: unknown variable 'NAME'", {
+        status: 400,
+        headers: { 'content-type': 'text/plain' },
+      }),
+    );
+
+    const error = await service
+      .getVariablesByCode(['B19013_001E'], 'acs/acs5', 2024, createMockContext())
+      .then(
+        () => undefined,
+        (err: McpError) => err,
+      );
+
+    expect(error?.message).toContain("error: unknown variable 'NAME'");
+    expect(error?.data).toMatchObject({ upstreamMessage: "error: unknown variable 'NAME'" });
+    const data = error?.data as { recovery: { hint: string } };
+    // A 400 is deterministic, so the hint must not send the caller back for another attempt.
+    expect(data.recovery.hint).toContain("error: unknown variable 'NAME'");
+    expect(data.recovery.hint).toMatch(/rejected/i);
+    expect(data.recovery.hint).not.toMatch(/^Retry/);
+  });
+});
+
+/** Exercised directly: the retry path's own backoff makes a 5xx too slow to stage as a fetch. */
+describe('censusHttpError', () => {
+  const fetchFailure = (status: number, body: string) =>
+    new McpErrorClass(
+      httpStatusToErrorCode(status) ?? JsonRpcErrorCode.InternalError,
+      `Fetch failed. Status: ${status}`,
+      { status, statusCode: status, body, responseBody: body, errorSource: 'FetchHttpError' },
+    );
+
+  it('tells a caller to retry a status that is transient', () => {
+    const error = censusHttpError(fetchFailure(503, 'upstream unavailable'), {
+      dataset: 'acs/acs5',
+      year: 2024,
+      availableYears: DATASET_AVAILABLE_YEARS['acs/acs5'],
+    }) as McpError;
+
+    expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+    expect((error.data as { recovery: { hint: string } }).recovery.hint).toMatch(/^Retry/);
+  });
+
+  it('leaves a timeout or network failure for its own handling', () => {
+    const aborted = new McpErrorClass(JsonRpcErrorCode.Timeout, 'timed out', {
+      errorSource: 'FetchTimeout',
+    });
+
+    expect(censusHttpError(aborted, { dataset: 'acs/acs5', year: 2024 })).toBe(aborted);
+  });
+
+  it('answers a year outside the catalog with year_not_available', () => {
+    const error = censusHttpError(fetchFailure(404, TOMCAT_404), {
+      dataset: 'pep/charv',
+      year: 2021,
+      availableYears: DATASET_AVAILABLE_YEARS['pep/charv'],
+    }) as McpError;
+
+    expect(error.data).toMatchObject({ reason: 'year_not_available', year: 2021 });
+    expect(JSON.stringify(error.data)).not.toContain('HTTP Status 404');
+  });
+});
+
+/**
+ * `KNOWN_DATASETS` and `DATASET_LATEST_YEARS` derive from `DATASET_AVAILABLE_YEARS` rather than
+ * standing as their own literals. A wrong maximum would silently redirect every query that omits
+ * `year` to a different vintage, so the defaults are pinned rather than recomputed by the test.
+ */
+describe('dataset registries derived from DATASET_AVAILABLE_YEARS', () => {
+  it('defaults each dataset to the same vintage it always has', () => {
+    expect(DATASET_LATEST_YEARS).toEqual({
+      'acs/acs5': 2024,
+      'acs/acs5/profile': 2024,
+      'acs/acs5/subject': 2024,
+      'acs/acs1': 2024,
+      'acs/acs1/profile': 2024,
+      'pep/charv': 2023,
+      'dec/pl': 2020,
+      'dec/ddhca': 2020,
+      cbp: 2023,
+      ecnbasic: 2022,
+      nonemp: 2023,
+    });
+  });
+
+  it('registers exactly the datasets the vintage table covers', () => {
+    expect([...KNOWN_DATASETS].sort()).toEqual(Object.keys(DATASET_AVAILABLE_YEARS).sort());
+  });
+
+  /**
+   * The Census API publishes these; a year the table omits is refused before the network, so an
+   * omission here is a hard failure for a query that used to work rather than a missing hint.
+   */
+  it('serves the earliest vintage the Census API publishes for each ACS dataset', () => {
+    expect(DATASET_AVAILABLE_YEARS['acs/acs5']?.[0]).toBe(2009);
+    expect(DATASET_AVAILABLE_YEARS['acs/acs5/profile']?.[0]).toBe(2009);
+    expect(DATASET_AVAILABLE_YEARS['acs/acs5/subject']?.[0]).toBe(2010);
+    expect(DATASET_AVAILABLE_YEARS['acs/acs1']?.[0]).toBe(2005);
+    expect(DATASET_AVAILABLE_YEARS['acs/acs1/profile']?.[0]).toBe(2005);
+  });
+
+  /** 2020 ACS1 was not released, and both ACS1 datasets follow the same release calendar. */
+  it('omits the ACS1 vintage the Census never released', () => {
+    expect(DATASET_AVAILABLE_YEARS['acs/acs1']).not.toContain(2020);
+    expect(DATASET_AVAILABLE_YEARS['acs/acs1/profile']).not.toContain(2020);
   });
 });
 

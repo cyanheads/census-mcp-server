@@ -156,6 +156,13 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
       recovery: 'Call census_list_datasets to discover valid dataset codes like cbp or nonemp.',
     },
     {
+      reason: 'year_not_available',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The dataset does not serve the requested vintage year.',
+      recovery:
+        'Retry with a year from available_years in census_list_datasets; the error names the years this dataset serves.',
+    },
+    {
       reason: 'predicate_not_supported',
       code: JsonRpcErrorCode.NotFound,
       when: 'The predicate code is not a variable in this dataset and year.',

@@ -288,6 +288,97 @@ describe('CensusApiService.parseResponse — GEOID composition', () => {
   });
 });
 
+/**
+ * A column that holds text used to be coerced with `Number` like every other, so it arrived as
+ * `estimate: null` with `suppressed: false` — the same shape a geography with no value has, and
+ * with the text itself dropped.
+ */
+describe('CensusApiService.parseResponse — text values', () => {
+  it('keeps a text value the caller can read instead of reporting it as missing', async () => {
+    queue([
+      ['NAME', 'B19013_001E', 'GEO_ID', 'state', 'county'],
+      ['King County, Washington', '122148', '0500000US53033', '53', '033'],
+    ]);
+
+    const rows = await query('county', { variables: ['B19013_001E', 'GEO_ID'] });
+
+    expect(rows[0]?.variables.GEO_ID).toEqual({
+      estimate: null,
+      label: 'GEO_ID',
+      suppressed: false,
+      value: '0500000US53033',
+    });
+    // The measure alongside it is untouched.
+    expect(rows[0]?.variables.B19013_001E?.estimate).toBe(122148);
+    expect(rows[0]?.variables.B19013_001E?.value).toBeUndefined();
+  });
+
+  /**
+   * `variables.json` declares the ACS median-year codes `predicateType: "string"` and serves them
+   * ordinary years, so a fix keyed on the declared type would stop returning a number for them.
+   */
+  it('leaves a numeric value the dataset declares a string as a number', async () => {
+    queue([
+      ['NAME', 'B25035_001E', 'state', 'county'],
+      ['King County, Washington', '1983', '53', '033'],
+    ]);
+
+    const rows = await query('county', { variables: ['B25035_001E'] });
+
+    expect(rows[0]?.variables.B25035_001E?.estimate).toBe(1983);
+    expect(rows[0]?.variables.B25035_001E?.value).toBeUndefined();
+  });
+
+  it('reports an empty cell as missing rather than as text or as zero', async () => {
+    queue([
+      ['NAME', 'B19013_001E', 'GEO_ID', 'state', 'county'],
+      ['King County, Washington', '', null, '53', '033'],
+    ]);
+
+    const rows = await query('county', { variables: ['B19013_001E', 'GEO_ID'] });
+
+    for (const code of ['B19013_001E', 'GEO_ID']) {
+      expect(rows[0]?.variables[code]?.estimate).toBeNull();
+      expect(rows[0]?.variables[code]?.value).toBeUndefined();
+      expect(rows[0]?.variables[code]?.suppressed).toBe(false);
+    }
+  });
+
+  it('keeps a suppressed cell suppressed rather than reading its sentinel as text', async () => {
+    queue([
+      ['NAME', 'B19013_001E', 'GEO_ID', 'state', 'tract'],
+      [
+        'Census Tract 118.02; King County; Washington',
+        '-666666666',
+        '1400000US53033011802',
+        '53',
+        '011802',
+      ],
+    ]);
+
+    const rows = await query('tract', { variables: ['B19013_001E', 'GEO_ID'] });
+
+    expect(rows[0]?.variables.B19013_001E?.suppressed).toBe(true);
+    expect(rows[0]?.variables.B19013_001E?.value).toBeUndefined();
+    // Suppression and text are separate states, readable side by side on one row.
+    expect(rows[0]?.variables.GEO_ID?.suppressed).toBe(false);
+    expect(rows[0]?.variables.GEO_ID?.value).toBe('1400000US53033011802');
+  });
+
+  it('does not read a text value that names an Object member as a suppression code', async () => {
+    queue([
+      ['NAME', 'UNIVERSE', 'state'],
+      ['Washington', 'constructor', '53'],
+    ]);
+
+    const rows = await query('state', { variables: ['UNIVERSE'] });
+
+    expect(rows[0]?.variables.UNIVERSE?.suppressed).toBe(false);
+    expect(rows[0]?.variables.UNIVERSE?.suppressionReason).toBeUndefined();
+    expect(rows[0]?.variables.UNIVERSE?.value).toBe('constructor');
+  });
+});
+
 describe('CensusApiService.queryData — record columns', () => {
   /**
    * `pep/charv` publishes an April estimates base and a July estimate for every geography, so a

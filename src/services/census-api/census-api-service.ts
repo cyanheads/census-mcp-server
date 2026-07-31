@@ -8,7 +8,11 @@ import type { Context } from '@cyanheads/mcp-ts-core';
 import { McpError, serviceUnavailable, unauthorized } from '@cyanheads/mcp-ts-core/errors';
 import { fetchWithTimeout, type RequestContext, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getDiscoveryConfig, getServerConfig } from '@/config/server-config.js';
-import { isAcsDataset } from '@/services/variable-cache/variable-cache-service.js';
+import {
+  DATASET_AVAILABLE_YEARS,
+  isAcsDataset,
+} from '@/services/variable-cache/variable-cache-service.js';
+import { censusHttpError } from './errors.js';
 import type {
   CensusDataRow,
   CensusGeographyLevel,
@@ -59,6 +63,44 @@ export function observeRecordValues(
         .sort((a, b) => a.code.localeCompare(b.code)),
     ]),
   );
+}
+
+/**
+ * Read one cell of a Census response into a value entry.
+ *
+ * Not every cell a caller can request is a number. `GEO_ID` carries `"0500000US53033"` on every
+ * dataset and `pep/charv` `UNIVERSE` carries `"R"`; coercing those with `Number` produces `NaN`,
+ * which serializes to the same `null` the response uses for a geography that has no value — so
+ * the text is lost and what is left cannot be told apart from missing data. Text is kept under
+ * `value` instead, leaving `estimate` null and `suppressed` false: `value` present means the cell
+ * is text, `suppressed` means the Census withheld the number, and a bare null means the cell was
+ * empty.
+ *
+ * The read is per cell rather than per variable for two reasons. The dataset's own declared type
+ * does not survive contact with the data: `variables.json` declares the ACS median-year-built
+ * codes (`B25035_001E` and the `B25037`/`B25039` families) `predicateType: "string"`, and they
+ * serve ordinary years like `"1983"` that callers rank and average. And text is not always a
+ * property of the whole column — the older ACS profile vintages write "not applicable" as the
+ * literal `"(X)"` in a column that is a number everywhere else, which reaches the caller as that
+ * annotation rather than as an unexplained null.
+ */
+function readValue(rawValue: string | null, varCode: string): CensusVariableValue {
+  const suppressionReason =
+    rawValue !== null && Object.hasOwn(SUPPRESSION_CODES, rawValue)
+      ? SUPPRESSION_CODES[rawValue]
+      : undefined;
+  const text = rawValue?.trim() ?? '';
+  const numValue = text === '' ? null : Number(text);
+  const isNumber = numValue !== null && !Number.isNaN(numValue);
+  const suppressed = suppressionReason !== undefined || (isNumber && numValue < -100_000_000);
+
+  return {
+    estimate: suppressed || !isNumber ? null : numValue,
+    label: varCode,
+    suppressed,
+    ...(suppressionReason && { suppressionReason }),
+    ...(!suppressed && !isNumber && text !== '' && { value: text }),
+  };
 }
 
 interface GeographyLevelsCacheEntry {
@@ -156,9 +198,18 @@ export class CensusApiService {
 
     const raw = await withRetry(
       async () => {
-        const response = await fetchWithTimeout(url, 15_000, ctx as unknown as RequestContext, {
-          signal: ctx.signal,
-        });
+        let response: Response;
+        try {
+          response = await fetchWithTimeout(url, 15_000, ctx as unknown as RequestContext, {
+            signal: ctx.signal,
+          });
+        } catch (error) {
+          throw censusHttpError(error, {
+            dataset: params.dataset,
+            year: params.year,
+            availableYears: DATASET_AVAILABLE_YEARS[params.dataset],
+          });
+        }
         const text = await response.text();
 
         // A well-formed query that matches nothing answers 204 with an empty body — the
@@ -320,7 +371,11 @@ export class CensusApiService {
           if (err instanceof McpError && (err.data as { status?: number })?.status === 404) {
             return [];
           }
-          throw err;
+          throw censusHttpError(err, {
+            dataset,
+            year,
+            availableYears: DATASET_AVAILABLE_YEARS[dataset],
+          });
         }
 
         const text = await response.text();
@@ -417,9 +472,18 @@ export class CensusApiService {
 
     const raw = await withRetry(
       async () => {
-        const response = await fetchWithTimeout(url, 15_000, ctx as unknown as RequestContext, {
-          signal: ctx.signal,
-        });
+        let response: Response;
+        try {
+          response = await fetchWithTimeout(url, 15_000, ctx as unknown as RequestContext, {
+            signal: ctx.signal,
+          });
+        } catch (error) {
+          throw censusHttpError(error, {
+            dataset: params.dataset,
+            year: params.year,
+            availableYears: DATASET_AVAILABLE_YEARS[params.dataset],
+          });
+        }
         const text = await response.text();
 
         // A dimension with nothing to enumerate under this scope answers 204 with no body.
@@ -533,18 +597,7 @@ export class CensusApiService {
       const variables: Record<string, CensusVariableValue> = {};
 
       for (const [varCode, idx] of variableIdxs) {
-        const rawValue = row[idx] ?? null;
-        const numValue = rawValue !== null ? Number(rawValue) : null;
-        const suppressionReason = rawValue !== null ? SUPPRESSION_CODES[rawValue] : undefined;
-        const suppressed =
-          suppressionReason !== undefined || (numValue !== null && numValue < -100_000_000);
-
-        variables[varCode] = {
-          estimate: suppressed ? null : numValue,
-          label: varCode,
-          suppressed,
-          ...(suppressionReason && { suppressionReason }),
-        };
+        variables[varCode] = readValue(row[idx] ?? null, varCode);
       }
 
       // Pair each requested estimate with its margin of error. Only ACS uses the E/M suffix

@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.3.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/census-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/census-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/census-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.3.2-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/census-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/census-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/census-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -51,6 +51,7 @@ Browse available Census Bureau datasets.
 - Each description names the filter predicates the dataset requires and the geography levels it publishes — both vary by dataset
 - Accepts an optional keyword filter
 - Dataset codes (e.g., `acs/acs5`) are the values to pass to other tools
+- `available_years` is exhaustive, not a sample: any other year fails with `year_not_available` before a request goes out, naming the years that do work. It is narrower than what the Census API hosts — `pep/charv` reaches its 2020-2022 estimates through the `YEAR` filter inside the 2023 vintage, and the `cbp`/`nonemp` vintages left out reject the `NAME` column every query here sends
 
 ---
 
@@ -107,6 +108,7 @@ Query a Census dataset for one or more variables at a specific geography.
 - Dimensions left unset are named in a notice and their applied default is echoed per row in `applied_filters`. That label is load-bearing: `cbp` defaults `NAICS2017` to the all-industries total, but `dec/ddhca` defaults `POPGROUP` to one population group and `ecnbasic` defaults its NAICS dimension to a single sector, so an unfiltered value can read like a total without being one. A dimension that publishes no label attribute (`pep/charv` `YEAR`, the `nonemp` NAICS codes before 2012) has no default to echo, and the notice says so rather than leaving it looking undefaulted
 - One geography can come back on more than one row: `pep/charv` publishes an April 1 estimates base alongside its July 1 estimate, and `MONTH` is what separates them — not `YEAR`, which both rows carry. Each row names its record in a `record` field and on its rendered heading, and the notice gives the predicate that pins one (`{"MONTH": "7"}`)
 - Suppression codes (geography too small, data not collected, etc.) resolved to human-readable reasons
+- A cell that holds text rather than a number keeps it, under `value`, so a null `estimate` says which of three things it is: `suppressed` is a number the Census withheld, a `value` alongside it is text (`GEO_ID` returns `"0500000US53033"`), and neither is an empty cell
 - Variable labels enriched from cache and surfaced alongside estimates
 - Requires `CENSUS_API_KEY`
 
@@ -124,6 +126,7 @@ Rank and compare variables across multiple geographies.
 - Same `predicates` map as `census_query_data`, applied to every geography — without it the ranking runs on whatever default the API picks, named in the notice and echoed per row in `applied_filters`
 - A dataset that publishes several records per geography is refused rather than ranked twice: a rank is a statement about one geography, so `pep/charv` without a pinned record fails with `ambiguous_rows` naming `MONTH` and the code to pass. With one pinned, each geography ranks once and the row says which record it is
 - Suppressed values sorted to end of results and labeled rather than passed through as negative sentinels
+- Same `value` field as `census_query_data` for a text cell; text has no ordering, so sorting on a column of it leaves every row tied
 - Requires `CENSUS_API_KEY`
 
 ---

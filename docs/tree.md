@@ -1,6 +1,6 @@
 # census-mcp-server - Directory Structure
 
-Generated on: 2026-06-20 10:53:07
+Generated on: 2026-07-31 17:00:15
 
 ```text
 census-mcp-server/
@@ -16,7 +16,8 @@ census-mcp-server/
 │   │   ├── bug_report.yml
 │   │   ├── config.yml
 │   │   └── feature_request.yml
-│   └── FUNDING.yml
+│   ├── FUNDING.yml
+│   └── SECURITY.md
 ├── .vscode/
 │   ├── extensions.json
 │   └── settings.json
@@ -159,6 +160,9 @@ census-mcp-server/
 ├── tests/
 │   ├── prompts/
 │   ├── resources/
+│   ├── services/
+│   │   └── geography/
+│   │       └── geography-service.test.ts
 │   └── tools/
 │       ├── census-compare-geographies.tool.test.ts
 │       ├── census-get-variable.tool.test.ts
@@ -169,6 +173,7 @@ census-mcp-server/
 │       └── census-search-variables.tool.test.ts
 ├── .dockerignore
 ├── .env.example
+├── .gitattributes
 ├── .gitignore
 ├── .mcpbignore
 ├── AGENTS.md

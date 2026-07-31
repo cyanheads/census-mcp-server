@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.12](changelog/0.1.x/0.1.12.md) — 2026-07-31
+
+census_resolve_geography auto-detects place/state before defaulting to county, fixing wrong-place results (#15) and blank-state ambiguous_name candidates (#18); mcp-ts-core ^0.10.9 → ^0.11.0 maintenance
+
 ## [0.1.11](changelog/0.1.x/0.1.11.md) — 2026-06-20
 
 mcp-ts-core ^0.10.6 → ^0.10.9 maintenance — ctx.content media collector, Canvas SQL invalid_sql classification, fresh-scaffold devcheck guards; new dependency-specifier + plugin-manifest packaging checks; skills + scripts re-synced; .codex-plugin longDescription filled

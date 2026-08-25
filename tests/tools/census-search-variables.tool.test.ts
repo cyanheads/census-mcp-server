@@ -44,7 +44,7 @@ describe('censusSearchVariables', () => {
       totalMatches: 1,
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: censusSearchVariables.errors });
     const input = censusSearchVariables.input.parse({ query: 'median household income' });
     const result = await censusSearchVariables.handler(input, ctx);
 
@@ -60,7 +60,7 @@ describe('censusSearchVariables', () => {
   it('uses defaults when dataset and year are omitted', async () => {
     mockSearchVariables.mockResolvedValue({ variables: [], totalMatches: 0 });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: censusSearchVariables.errors });
     const input = censusSearchVariables.input.parse({ query: 'poverty' });
     await censusSearchVariables.handler(input, ctx);
 
@@ -76,7 +76,7 @@ describe('censusSearchVariables', () => {
   it('caps limit at 100', async () => {
     mockSearchVariables.mockResolvedValue({ variables: [], totalMatches: 0 });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: censusSearchVariables.errors });
     const input = censusSearchVariables.input.parse({ query: 'income', limit: 999 });
     await censusSearchVariables.handler(input, ctx);
 
@@ -89,7 +89,7 @@ describe('censusSearchVariables', () => {
   it('returns empty variables list when no match', async () => {
     mockSearchVariables.mockResolvedValue({ variables: [], totalMatches: 0 });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: censusSearchVariables.errors });
     const input = censusSearchVariables.input.parse({ query: 'xyzzy_nonexistent' });
     const result = await censusSearchVariables.handler(input, ctx);
 
@@ -146,7 +146,7 @@ describe('censusSearchVariables', () => {
   it('sets notice enrichment when no variables matched', async () => {
     const { getEnrichment } = await import('@cyanheads/mcp-ts-core/testing');
     mockSearchVariables.mockResolvedValue({ variables: [], totalMatches: 0 });
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: censusSearchVariables.errors });
     const input = censusSearchVariables.input.parse({ query: 'zzznomatch' });
     await censusSearchVariables.handler(input, ctx);
     expect(getEnrichment(ctx).notice).toContain('zzznomatch');
@@ -164,7 +164,7 @@ describe('censusSearchVariables', () => {
       ],
       totalMatches: 42,
     });
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: censusSearchVariables.errors });
     const input = censusSearchVariables.input.parse({ query: 'income', limit: 1 });
     await censusSearchVariables.handler(input, ctx);
     const enrichment = getEnrichment(ctx);
@@ -176,7 +176,7 @@ describe('censusSearchVariables', () => {
 
   it('passes custom year to variable cache service', async () => {
     mockSearchVariables.mockResolvedValue({ variables: [], totalMatches: 0 });
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: censusSearchVariables.errors });
     const input = censusSearchVariables.input.parse({ query: 'income', year: 2020 });
     await censusSearchVariables.handler(input, ctx);
     expect(mockSearchVariables).toHaveBeenCalledWith(
@@ -187,7 +187,7 @@ describe('censusSearchVariables', () => {
 
   it('applies minimum limit of 1 without crashing', async () => {
     mockSearchVariables.mockResolvedValue({ variables: [], totalMatches: 0 });
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: censusSearchVariables.errors });
     const input = censusSearchVariables.input.parse({ query: 'income', limit: 1 });
     await censusSearchVariables.handler(input, ctx);
     expect(mockSearchVariables).toHaveBeenCalledWith(
@@ -232,7 +232,7 @@ describe('censusSearchVariables', () => {
 
   it('injection attempt in query string is safely passed to service', async () => {
     mockSearchVariables.mockResolvedValue({ variables: [], totalMatches: 0 });
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: censusSearchVariables.errors });
     const injectionPayload = "'; DROP TABLE vars; --";
     const input = censusSearchVariables.input.parse({ query: injectionPayload });
     const result = await censusSearchVariables.handler(input, ctx);

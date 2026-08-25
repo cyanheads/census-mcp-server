@@ -42,7 +42,7 @@ describe('censusGetVariable', () => {
       },
     ]);
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: censusGetVariable.errors });
     const input = censusGetVariable.input.parse({ variables: ['B19013_001E'] });
     const result = await censusGetVariable.handler(input, ctx);
 
@@ -73,7 +73,7 @@ describe('censusGetVariable', () => {
       },
     ]);
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: censusGetVariable.errors });
     const input = censusGetVariable.input.parse({
       variables: ['B19013_001E', 'B19013_001M'],
     });
@@ -109,7 +109,7 @@ describe('censusGetVariable', () => {
       },
     ]);
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: censusGetVariable.errors });
     const input = censusGetVariable.input.parse({ variables: ['NAME'] });
     const result = await censusGetVariable.handler(input, ctx);
 
@@ -129,7 +129,7 @@ describe('censusGetVariable', () => {
       },
     ]);
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: censusGetVariable.errors });
     const input = censusGetVariable.input.parse({ variables: ['B19013_001E'] });
     const result = await censusGetVariable.handler(input, ctx);
 
@@ -169,7 +169,7 @@ describe('censusGetVariable', () => {
         predicateType: 'int',
       },
     ]);
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: censusGetVariable.errors });
     const input = censusGetVariable.input.parse({ variables: ['B01001_001E'] });
     const result = await censusGetVariable.handler(input, ctx);
     expect(result.dataset).toBe('acs/acs5');
@@ -184,7 +184,7 @@ describe('censusGetVariable', () => {
         predicateType: 'int',
       },
     ]);
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: censusGetVariable.errors });
     const input = censusGetVariable.input.parse({
       variables: ['B01001_001E'],
       dataset: '  acs/acs5  ',
@@ -274,7 +274,7 @@ describe('censusGetVariable', () => {
         predicateType: 'int',
       },
     ]);
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: censusGetVariable.errors });
     const input = censusGetVariable.input.parse({ variables: ['B03001_003E'] });
     const result = await censusGetVariable.handler(input, ctx);
     expect(result.variables[0]?.label).toContain('—Mexican');

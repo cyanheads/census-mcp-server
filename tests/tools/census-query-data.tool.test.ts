@@ -1048,7 +1048,7 @@ describe('censusQueryData', () => {
       year: 2009,
     });
 
-    const error = await censusQueryData.handler(input, ctx).then(
+    const error = await Promise.resolve(censusQueryData.handler(input, ctx)).then(
       () => undefined,
       (err: Error) => err,
     );

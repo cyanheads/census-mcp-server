@@ -1314,9 +1314,9 @@ describe('censusCompareGeographies — datasets that publish several records per
     mockQueryData.mockResolvedValue(duplicated);
 
     const ctx = createMockContext({ errors: censusCompareGeographies.errors });
-    const error = await censusCompareGeographies
-      .handler(charvInput(), ctx)
-      .catch((err: { data: { recovery: { hint: string } } }) => err);
+    const error = await Promise.resolve(censusCompareGeographies.handler(charvInput(), ctx)).catch(
+      (err: { data: { recovery: { hint: string } } }) => err,
+    );
     const hint = (error as { data: { recovery: { hint: string } } }).data.recovery.hint;
 
     expect(hint).toContain('MONTH');

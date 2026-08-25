@@ -1,11 +1,9 @@
 # census-mcp-server - Directory Structure
 
-Generated on: 2026-07-31 23:29:34
+Generated on: 2026-08-25 02:22:32
 
 ```text
 census-mcp-server/
-├── .agents/
-├── .claude/
 ├── .claude-plugin/
 │   └── plugin.json
 ├── .codex-plugin/
@@ -16,6 +14,8 @@ census-mcp-server/
 │   │   ├── bug_report.yml
 │   │   ├── config.yml
 │   │   └── feature_request.yml
+│   ├── CODE_OF_CONDUCT.md
+│   ├── CONTRIBUTING.md
 │   ├── FUNDING.yml
 │   └── SECURITY.md
 ├── .vscode/
@@ -179,7 +179,8 @@ census-mcp-server/
 │       ├── census-list-predicate-values.tool.test.ts
 │       ├── census-query-data.tool.test.ts
 │       ├── census-resolve-geography.tool.test.ts
-│       └── census-search-variables.tool.test.ts
+│       ├── census-search-variables.tool.test.ts
+│       └── tool-input-contract.test.ts
 ├── .dockerignore
 ├── .env.example
 ├── .gitattributes

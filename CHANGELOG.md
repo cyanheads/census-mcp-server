@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.3](changelog/0.3.x/0.3.3.md) — 2026-08-24
+
+Framework bump to mcp-ts-core 0.12.3 adopts MCP SDK v2: tool inputs are now strict and reject an undeclared argument key instead of silently stripping it, advertised schemas move to JSON Schema 2020-12 with outputSchema declaring the error envelope, and bun audit clears from 35 advisories to 0 across 345 packages.
+
 ## [0.3.2](changelog/0.3.x/0.3.2.md) — 2026-07-31
 
 Fixed census_list_datasets advertising pep/charv vintages the Census API does not publish, and a dataset+year miss reaching the caller as raw upstream HTML (#28); fixed string-valued variables returning estimate: null indistinguishable from genuinely missing data (#29)

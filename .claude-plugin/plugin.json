@@ -1,20 +1,42 @@
 {
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "census-mcp-server",
   "version": "0.3.3",
   "description": "Query U.S. Census Bureau data, variables, and geography via MCP. STDIO or Streamable HTTP.",
   "author": {
-    "name": "cyanheads"
+    "name": "cyanheads",
+    "email": "casey@caseyjhand.com",
+    "url": "https://github.com/cyanheads"
   },
   "homepage": "https://github.com/cyanheads/census-mcp-server#readme",
   "repository": "https://github.com/cyanheads/census-mcp-server",
   "license": "Apache-2.0",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "census",
+    "census-bureau",
+    "acs",
+    "geography",
+    "open-data"
+  ],
+  "userConfig": {
+    "CENSUS_API_KEY": {
+      "type": "string",
+      "title": "Census API key",
+      "description": "Required for data queries (census_query_data, census_compare_geographies); variable search and geography resolution work without it. Free at api.census.gov/data/key_signup.html.",
+      "sensitive": true,
+      "default": ""
+    }
+  },
   "mcpServers": {
     "census-mcp-server": {
       "command": "npx",
       "args": ["-y", "@cyanheads/census-mcp-server"],
       "env": {
         "MCP_TRANSPORT_TYPE": "stdio",
-        "CENSUS_API_KEY": ""
+        "CENSUS_API_KEY": "${user_config.CENSUS_API_KEY}"
       }
     }
   }

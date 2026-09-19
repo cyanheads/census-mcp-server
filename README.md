@@ -27,9 +27,11 @@
 
 ---
 
-## Tools
+## Overview
 
-8 tools covering the full Census data workflow — from dataset discovery and variable search through geography resolution and ranked comparisons:
+U.S. Census Bureau data — datasets, variables, and geography — via the Census Data API, TIGERweb, and the Census Geocoder. Discover datasets and variables, resolve place names or addresses to FIPS codes, and query or rank demographic, economic, and housing estimates across geographies from any MCP client. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
+
+### Tools
 
 | Tool | Description |
 |:-----|:------------|
@@ -42,9 +44,11 @@
 | `census_query_data` | Query a Census dataset for variables at a specific geography. Returns estimates with MOE, suppression codes resolved to readable reasons, and predicate filtering for the business datasets. |
 | `census_compare_geographies` | Rank and compare variables across multiple geographies — all counties in a state, all states nationally, or a named set. Sorted table output, with the same predicate filtering. |
 
-### `census_list_datasets`
+---
 
-Browse available Census Bureau datasets.
+## Capability reference
+
+### `census_list_datasets` <sub>tool</sub>
 
 - Returns dataset codes, names, descriptions, and available vintage years
 - Covers ACS5, ACS5 Data Profiles, ACS5 Subject Tables, ACS1, ACS1 Data Profiles, Population Estimates, Decennial Redistricting (P.L. 94-171), Decennial DHC, County Business Patterns (`cbp`), Economic Census (`ecnbasic`), and Nonemployer Statistics (`nonemp`)
@@ -55,9 +59,16 @@ Browse available Census Bureau datasets.
 
 ---
 
-### `census_search_variables`
+### `census_list_geographies` <sub>tool</sub>
 
-Search Census variables by keyword.
+- Returns one row per geography level — `geography_level`, whether a parent is required, `required_parent_levels`, and an example FIPS value
+- `geography_level` values are the exact inputs to `geography_level` in `census_query_data` and `census_compare_geographies`
+- `year` defaults to the dataset's latest available vintage
+- `dataset_not_found` when the dataset code is unrecognized; `year_not_available` when the dataset has no geography data for the requested year
+
+---
+
+### `census_search_variables` <sub>tool</sub>
 
 - Full-text search across label and concept fields with relevance scoring (exact concept match > label match > partial)
 - On ACS datasets, returns estimate (E suffix) and margin-of-error (M suffix) codes together so both can be requested in one query — no other family publishes margins of error, and an E-final code there is an ordinary code
@@ -67,78 +78,62 @@ Search Census variables by keyword.
 
 ---
 
-### `census_list_predicate_values`
+### `census_get_variable` <sub>tool</sub>
 
-List the codes a filter dimension accepts, so a `predicates` map can be written without guessing.
+- Accepts one or more variable codes (case-sensitive) and returns metadata in the same order — label, concept, predicate type, and universe when the dataset publishes one
+- On ACS datasets, returns `estimate_code`/`moe_code` sibling references; other families publish no margins of error and carry neither field
+- Also resolves predicate/filter dimension codes (e.g., `NAICS2017`, `SEX`) to confirm a dimension exists in a dataset — `census_list_predicate_values` lists the values it accepts
+- `dataset` defaults to `acs/acs5`, `year` defaults to the dataset's latest available vintage
+- `variable_not_found` when a code isn't defined in the dataset and year
+
+---
+
+### `census_list_predicate_values` <sub>tool</sub>
 
 - Two routes, picked by where the answer lives: a dimension with a published value list is read from the dataset dictionary, one without is enumerated live by wildcarding it on the data endpoint. `NAICS*` and `POPGROUP` always publish one (thousands of codes — narrow them with `query`); on the current vintages `EMPSZES`, `LFO`, `RCPSZES`, `TAXSTAT`, and `TYPOP` publish none, so the live route is the only place their codes appear
-- A dictionary value list is a classification shared across Census products, not a record of what one dataset serves — `dec/ddhca` declares 5,543 `POPGROUP` codes and publishes 2,996, `cbp` declares 6,694 `NAICS2017` codes and publishes 2,003. The declared list is checked against the dataset's own published rows and the dead codes are dropped; `source` says whether that check ran and the notice says how many were withheld. A keyword that matched only withheld codes names them, so "total population" on `dec/ddhca` reports that `001` is declared and serves nothing rather than reading like a typo
-- Keyword `query` matches code and label; results are sorted by code and a truncated list is disclosed rather than passed off as complete
-- `ecnbasic` publishes `TAXSTAT` and `TYPOP` per industry, so `within_naics` scopes the enumeration — and the notice says the result is complete for that industry alone. A per-industry dimension is left unchecked for the same reason, since an unscoped check would withhold codes a scoped query does return
+- A dictionary value list is a classification shared across Census products, not a record of what one dataset serves — `dec/ddhca` declares 5,543 `POPGROUP` codes and publishes 2,996, `cbp` declares 6,694 `NAICS2017` codes and publishes 2,003. The declared list is checked against the dataset's own published rows and the dead codes are dropped; `source` says whether that check ran and the notice says how many were withheld
+- Keyword `query` matches code and label; results are sorted by code and a truncated list is disclosed rather than passed off as complete (default limit 50, max 500)
+- `ecnbasic` publishes `TAXSTAT` and `TYPOP` per industry, so `within_naics` scopes the enumeration — and the notice says the result is complete for that industry alone
 - Live enumerations are cached per dataset, year, dimension, industry scope, and probe measure
 
 ---
 
-### `census_resolve_geography`
+### `census_resolve_geography` <sub>tool</sub>
 
-Convert place names and addresses to Census FIPS identifiers.
-
-- Named places (e.g., "King County, WA", "Seattle, WA", "California") resolved via TIGERweb MapServer
-- Street addresses resolved to tract level via Census Geocoder
-- Auto-detects the geography level — state for an abbreviation or spelled-out state name, county for "County"/"Borough"/"Parish", tract for "Tract", otherwise place falling back to county; `geography_type` overrides it
-- Also resolves metropolitan/micropolitan statistical areas, combined statistical areas, and consolidated cities — never auto-detected, since their names overlap city names, so each needs an explicit `geography_type`. The value is the level's own Census API name, so it feeds `geography_level` unchanged
-- Optional `county_fips` pins a tract name to one county, since a tract name is unique only inside its county. Only county and tract sit within a county, so it restricts resolution to those two levels rather than being dropped on a layer that cannot apply it
-- Prefers an exactly-named match, so "Kansas City, MO" does not resolve to North Kansas City
-- Never picks between matches: anything still matching more than one geography comes back as `ambiguous_name`, with every candidate carrying the code resolving it would have returned, plus the state that separates same-named places
-- Returns `state_fips` (→ `parent_fips`) and `fips_summary` (→ `geography_fips`) ready to pass to other tools; a statistical area omits `state_fips`, since it can span several states and takes no parent
+- Named places (e.g., "King County, WA") resolve via TIGERweb; street addresses resolve to tract level via Census Geocoder
+- Auto-detects `geography_type` for state, county, place, and tract; metropolitan/micropolitan statistical areas, combined statistical areas, and consolidated cities are never auto-detected and need an explicit `geography_type`, since their names overlap city names
+- Optional `county_fips` scopes resolution to the county and tract levels only — required when a tract name matches more than one county; `county_scope_unsupported` when paired with any other level or a street address
+- Prefers an exactly-named match over a partial one (e.g., "Kansas City, MO" does not resolve to North Kansas City)
+- A name matching more than one geography returns `ambiguous_name`, with every candidate's FIPS code and the state that separates them
+- Returns `state_fips` (→ `parent_fips`) and `fips_summary` (→ `geography_fips`) ready to pass to other tools; a statistical area omits `state_fips` since it can span several states
 
 ---
 
-### `census_query_data`
+### `census_query_data` <sub>tool</sub>
 
-Query a Census dataset for one or more variables at a specific geography.
-
-- Requires FIPS codes — use `census_resolve_geography` first for place names
-- Use `geography_fips: "*"` to return all geographies at the level within the parent
-- The level and its parents are checked against the dataset's own geography metadata before the query runs: a missing `parent_fips` returns `parent_required` naming what to add, and a parent the level does not sit within returns `parent_not_accepted` naming the input to drop — neither reaches the API as an opaque 400
-- `parent_fips` and `county_fips` are zero-padded to the widths the Census matches on, so `"5"` and `"05"` both find Arkansas; either also takes `"*"`, which is what reaches every block group in a state. `geography_fips` takes its width from `geography_level` and is passed through as given
-- Each row carries both `geography_fips` (bare level code, round-trips back into this tool) and `geography_geoid` (level plus parents, nationally unique)
-- A query that matches nothing returns `no_data` with dataset-aware recovery, not a retried upstream error
-- Optional `predicates` map for the datasets that filter on one — `{"NAICS2017": "5112"}` narrows a `cbp` count to software publishers, and `census_list_predicate_values` supplies the codes. Keys are validated against the dataset's own variables before the query
-- Dimensions left unset are named in a notice and their applied default is echoed per row in `applied_filters`. That label is load-bearing: `cbp` defaults `NAICS2017` to the all-industries total, but `dec/ddhca` defaults `POPGROUP` to one population group and `ecnbasic` defaults its NAICS dimension to a single sector, so an unfiltered value can read like a total without being one. A dimension that publishes no label attribute (`pep/charv` `YEAR`, the `nonemp` NAICS codes before 2012) has no default to echo, and the notice says so rather than leaving it looking undefaulted
-- One geography can come back on more than one row: `pep/charv` publishes an April 1 estimates base alongside its July 1 estimate, and `MONTH` is what separates them — not `YEAR`, which both rows carry. Each row names its record in a `record` field and on its rendered heading, and the notice gives the predicate that pins one (`{"MONTH": "7"}`)
-- Suppression codes (geography too small, data not collected, etc.) resolved to human-readable reasons
-- A cell that holds text rather than a number keeps it, under `value`, so a null `estimate` says which of three things it is: `suppressed` is a number the Census withheld, a `value` alongside it is text (`GEO_ID` returns `"0500000US53033"`), and neither is an empty cell
-- Variable labels enriched from cache and surfaced alongside estimates
+- Requires FIPS codes (use `census_resolve_geography` for place names) and up to 50 variable codes per call; `geography_fips: "*"` returns every geography at the level within the parent, and each row carries both `geography_fips` and the nationally-unique `geography_geoid`
+- Level and parent are checked against the dataset's own geography metadata before querying — `parent_required` and `parent_not_accepted` name what's missing or unaccepted rather than surfacing a raw Census 400
+- Optional `predicates` map filters the business/`pep`/`dec` datasets (e.g., `{"NAICS2017": "5112"}`); a dimension left unset applies a Census-chosen default — an all-categories total on some datasets, a single category on others — echoed per row in `applied_filters`
+- A dataset that publishes more than one record per geography (`pep/charv`) returns multiple rows, each carrying a `record` field; pin one with `predicates` (e.g., `{"MONTH": "7"}`)
+- Suppression codes resolve to human-readable reasons; a null `estimate` means the value is either suppressed, a text cell (returned under `value`), or genuinely empty
 - Requires `CENSUS_API_KEY`
 
 ---
 
-### `census_compare_geographies`
+### `census_compare_geographies` <sub>tool</sub>
 
-Rank and compare variables across multiple geographies.
-
-- Fetches all geographies at a level (e.g., all WA counties) in one API call, then sorts and slices
-- Optional `within` parameter to constrain to a parent FIPS; omit for national comparison
-- Optional `geographies` list to filter to specific geographies — full GEOIDs (`"53033"`, `"06037"`) work across states; bare level codes (`"033"`) need `within` to disambiguate. Entries matching no row, and bare codes that matched more than one state, are named in a notice
-- Same pre-query level and parent validation as `census_query_data`, reported against `within` / `within_county`
-- Configurable sort variable, direction, and limit (default 50, max 500)
-- Same `predicates` map as `census_query_data`, applied to every geography — without it the ranking runs on whatever default the API picks, named in the notice and echoed per row in `applied_filters`
-- A dataset that publishes several records per geography is refused rather than ranked twice: a rank is a statement about one geography, so `pep/charv` without a pinned record fails with `ambiguous_rows` naming `MONTH` and the code to pass. With one pinned, each geography ranks once and the row says which record it is
-- Suppressed values sorted to end of results and labeled rather than passed through as negative sentinels
-- Same `value` field as `census_query_data` for a text cell; text has no ordering, so sorting on a column of it leaves every row tied
+- Ranks all geographies at a level, or a named `geographies` list of GEOIDs/bare level codes, in one call; `within`/`within_county` scope to a state/county, omit for a national comparison
+- Configurable `sort_by` variable, `sort_dir` (default `desc`), and `limit` (default 50, max 500); `total_count` reports how many geographies matched before the limit
+- Same `predicates` map, geography validation, and `applied_filters` default-echoing as `census_query_data`, applied to every geography in the ranking
+- A dataset that publishes more than one record per geography (`pep/charv`) fails with `ambiguous_rows` unless `predicates` pins one (e.g., `{"MONTH": "7"}`)
+- Suppressed values are labeled and sorted to the end rather than passed through as raw sentinels; a text value has no ordering, so sorting on it leaves rows tied
 - Requires `CENSUS_API_KEY`
 
 ---
 
 ## Features
 
-Built on [`@cyanheads/mcp-ts-core`](https://www.npmjs.com/package/@cyanheads/mcp-ts-core):
-
-- Declarative tool definitions — single file per tool, framework handles registration and validation
-- Unified error handling — handlers throw, framework catches, classifies, and formats with recovery hints
-- Structured logging with optional OpenTelemetry tracing
-- STDIO and Streamable HTTP transports
+Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): stdio and Streamable HTTP transports, pluggable auth (`none` / `jwt` / `oauth`), swappable storage (`in-memory`, `filesystem`, `Supabase`, `Cloudflare KV/R2/D1`), structured logging with optional OpenTelemetry tracing.
 
 Census-specific:
 
@@ -156,6 +151,23 @@ Agent-friendly output:
 ---
 
 ## Getting started
+
+### Public Hosted Instance
+
+A public instance is available at `https://census.caseyjhand.com/mcp` — no installation required. Point any MCP client at it via Streamable HTTP:
+
+```json
+{
+  "mcpServers": {
+    "census-mcp-server": {
+      "type": "streamable-http",
+      "url": "https://census.caseyjhand.com/mcp"
+    }
+  }
+}
+```
+
+### Self-Hosted / Local
 
 > **API key:** Register a free key at [api.census.gov/data/key_signup.html](https://api.census.gov/data/key_signup.html). Variable search and geography resolution work without a key; data queries (`census_query_data`, `census_compare_geographies`) require one.
 
@@ -225,7 +237,7 @@ MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 CENSUS_API_KEY=... bun run start:http
 
 ### Prerequisites
 
-- [Bun v1.3.0](https://bun.sh/) or higher (or Node.js v24+).
+- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
 - A Census API key — register free at [api.census.gov/data/key_signup.html](https://api.census.gov/data/key_signup.html). Required for `census_query_data` and `census_compare_geographies`; other tools work without it.
 
 ### Installation
@@ -265,7 +277,7 @@ cp .env.example .env
 | `CENSUS_DEFAULT_YEAR` | Default vintage year when no year is specified. | `2024` |
 | `CENSUS_VARIABLE_CACHE_TTL_HOURS` | Hours to cache variables.json per dataset+year in memory. | `24` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
-| `MCP_SESSION_MODE` | HTTP session mode: `stateful`, `stateless`, or `auto`. `auto` resolves to `stateful`; the Docker image sets `stateless`. | `auto` |
+| `MCP_SESSION_MODE` | HTTP session mode: `stateful`, `stateless`, or `auto`. The server declares `stateless` in `src/index.ts`; set this only to override it. | `stateless` |
 | `MCP_HTTP_PORT` | Port for HTTP server. | `3010` |
 | `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
 | `MCP_LOG_LEVEL` | Log level (`debug`, `info`, `notice`, `warning`, `error`). | `info` |
@@ -335,7 +347,7 @@ See [`CLAUDE.md`](./CLAUDE.md) for development guidelines and architectural rule
 
 ## Contributing
 
-Issues and pull requests are welcome. Run checks and tests before submitting:
+Issues are welcome. Run checks and tests before submitting:
 
 ```sh
 bun run devcheck

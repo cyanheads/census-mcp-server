@@ -102,12 +102,14 @@ export const censusSearchVariables = tool('census_search_variables', {
       reason: 'dataset_not_found',
       code: JsonRpcErrorCode.NotFound,
       when: 'Dataset code is not recognized.',
+      thrownBy: 'service',
       recovery: 'Call census_list_datasets to discover valid dataset codes like acs/acs5.',
     },
     {
       reason: 'year_not_available',
       code: JsonRpcErrorCode.ValidationError,
       when: 'The dataset does not serve the requested vintage year.',
+      thrownBy: 'service',
       recovery:
         'Retry with a year from available_years in census_list_datasets; the error names the years this dataset serves.',
     },
@@ -116,6 +118,7 @@ export const censusSearchVariables = tool('census_search_variables', {
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'Variable metadata could not be fetched or parsed from the Census API.',
       retryable: true,
+      thrownBy: 'service',
       recovery:
         'Retry the request; if persistent, the dataset and year combination may not be available.',
     },

@@ -159,6 +159,7 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
       reason: 'year_not_available',
       code: JsonRpcErrorCode.ValidationError,
       when: 'The dataset does not serve the requested vintage year.',
+      thrownBy: 'service',
       recovery:
         'Retry with a year from available_years in census_list_datasets; the error names the years this dataset serves.',
     },
@@ -188,6 +189,7 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'Census API returned an error or was unreachable.',
       retryable: true,
+      thrownBy: 'service',
       recovery:
         'Retry the request; if the error persists, the Census API may be temporarily unavailable.',
     },

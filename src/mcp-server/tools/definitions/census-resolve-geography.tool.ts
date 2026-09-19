@@ -74,6 +74,7 @@ export const censusResolveGeography = tool('census_resolve_geography', {
       reason: 'no_match',
       code: JsonRpcErrorCode.NotFound,
       when: 'Place name not recognized at any geography level tried for it.',
+      thrownBy: 'service',
       recovery:
         'Check the spelling, set geography_type to search a different level, or pass a full street address.',
     },
@@ -81,6 +82,7 @@ export const censusResolveGeography = tool('census_resolve_geography', {
       reason: 'ambiguous_name',
       code: JsonRpcErrorCode.ValidationError,
       when: 'Name matched more than one geography.',
+      thrownBy: 'service',
       recovery:
         'Take fips_summary from the candidate you want in the error, or re-call with the candidate name — tract candidates need county_fips instead, since they share a name.',
     },
@@ -88,6 +90,7 @@ export const censusResolveGeography = tool('census_resolve_geography', {
       reason: 'county_scope_unsupported',
       code: JsonRpcErrorCode.ValidationError,
       when: 'county_fips was combined with a street address, or with a geography_type — set or auto-detected — that does not sit within a county.',
+      thrownBy: 'service',
       recovery: 'Drop county_fips, or set geography_type to "county" or "tract" to use it.',
     },
     {
@@ -95,6 +98,7 @@ export const censusResolveGeography = tool('census_resolve_geography', {
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'Geography resolution endpoint was unreachable.',
       retryable: true,
+      thrownBy: 'service',
       recovery:
         'Retry the request — the Census geography endpoints are free-tier with no auth requirements.',
     },

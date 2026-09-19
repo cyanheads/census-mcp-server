@@ -153,6 +153,7 @@ export const censusQueryData = tool('census_query_data', {
       reason: 'missing_api_key',
       code: JsonRpcErrorCode.Unauthorized,
       when: 'CENSUS_API_KEY is not configured or the key is invalid.',
+      thrownBy: 'service',
       recovery:
         'Set the CENSUS_API_KEY environment variable and restart the server. Register a free key at api.census.gov/data/key_signup.html.',
     },
@@ -160,6 +161,7 @@ export const censusQueryData = tool('census_query_data', {
       reason: 'year_not_available',
       code: JsonRpcErrorCode.ValidationError,
       when: 'The dataset does not serve the requested vintage year.',
+      thrownBy: 'service',
       recovery:
         'Retry with a year from available_years in census_list_datasets; the error names the years this dataset serves.',
     },
@@ -167,6 +169,7 @@ export const censusQueryData = tool('census_query_data', {
       reason: 'variable_not_found',
       code: JsonRpcErrorCode.NotFound,
       when: 'One or more variable codes do not exist in the requested dataset and year.',
+      thrownBy: 'service',
       recovery:
         'Call census_search_variables or census_get_variable to confirm codes for this dataset and year.',
     },
@@ -175,6 +178,7 @@ export const censusQueryData = tool('census_query_data', {
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'The variable metadata endpoint returned an unparseable response for this dataset and year.',
       retryable: true,
+      thrownBy: 'service',
       recovery:
         'Retry the request; if it persists, the Census metadata endpoint is temporarily unavailable.',
     },
@@ -223,6 +227,7 @@ export const censusQueryData = tool('census_query_data', {
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'Census API returned an error or was unreachable.',
       retryable: true,
+      thrownBy: 'service',
       recovery:
         'Retry the request; if the error persists, the Census API may be temporarily unavailable.',
     },

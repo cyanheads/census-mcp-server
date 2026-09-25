@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.5.0](changelog/0.5.x/0.5.0.md) — 2026-09-25 · ⚠️ Breaking
+
+census_resolve_geography reaches census-designated places, ZIP codes as ZCTAs, and ecnbasic 2022 economic places, matches names case-insensitively with every state-suffix form and respelling retries, and returns an address's block group for census_query_data's new tract_fips scope.
+
 ## [0.4.0](changelog/0.4.x/0.4.0.md) — 2026-09-25 · ⚠️ Breaking
 
 census_query_data returns wildcard results 50 rows at a time with limit/offset paging; ACS sentinels and withheld business values decode to their published meanings; limit, sort_by, empty variables, and the variable count are validated before any Census request.

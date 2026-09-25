@@ -1,6 +1,6 @@
 # census-mcp-server - Directory Structure
 
-Generated on: 2026-09-25 09:55:40
+Generated on: 2026-09-25 12:42:04
 
 ```text
 census-mcp-server/
@@ -28,6 +28,7 @@ census-mcp-server/
 │   ├── 0.2.x/
 │   ├── 0.3.x/
 │   ├── 0.4.x/
+│   ├── 0.5.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md

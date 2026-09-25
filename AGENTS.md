@@ -244,7 +244,8 @@ src/
       geography-service.ts              # TIGERweb + Census Geocoder geography resolution
       types.ts                          # Geography types
     variable-cache/
-      variable-cache-service.ts         # In-process variables.json cache with keyword search
+      variable-cache-service.ts         # In-process variables.json cache, attribute columns, universes, dataset resolution
+      variable-search.ts                # Whole-word variable search and ranking rule
       types.ts                          # Variable types
   mcp-server/
     tools/variable-entry.ts             # Per-variable output entry + rendering shared by both data tools

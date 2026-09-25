@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.5.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/census-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/census-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/census-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.5.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/census-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/census-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/census-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.2-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -35,10 +35,10 @@ U.S. Census Bureau data — datasets, variables, and geography — via the Censu
 
 | Tool | Description |
 |:-----|:------------|
-| `census_list_datasets` | Browse available Census Bureau datasets (ACS5, ACS1, Population Estimates, Decennial, County Business Patterns, Economic Census, Nonemployer Statistics) with vintage years and dataset codes. |
+| `census_list_datasets` | Browse available Census Bureau datasets (ACS5 and ACS1 with their profile, subject, and comparison tables, ACS Supplemental Estimates and Selected Population Profiles, Population Estimates, Decennial, County Business Patterns, Economic Census, Nonemployer Statistics) with vintage years and dataset codes. |
 | `census_list_geographies` | List the geography levels supported by a dataset and year, with parent requirements and example FIPS values. |
 | `census_search_variables` | Keyword search across variable labels and concept groups. On ACS, returns estimate and margin-of-error codes together. |
-| `census_get_variable` | Fetch full metadata for one or more variable codes — label, concept, predicate type, universe, MOE sibling. |
+| `census_get_variable` | Fetch full metadata for one or more variable codes — label, concept, predicate type, universe, MOE sibling — including the annotation and flag columns the data tools accept. |
 | `census_list_predicate_values` | List the codes a filter dimension accepts (`EMPSZES`, `LFO`, `POPGROUP`, `NAICS2017`…), from the dataset dictionary or a live wildcard enumeration. |
 | `census_resolve_geography` | Convert place names (e.g., "King County, WA"), ZIP codes, or street addresses to Census FIPS identifiers via TIGERweb and Census Geocoder. |
 | `census_query_data` | Query a Census dataset for variables at a specific geography. Returns estimates with MOE, Census sentinel values and withheld business values resolved to their published meanings, and predicate filtering for the business datasets. |
@@ -51,11 +51,11 @@ U.S. Census Bureau data — datasets, variables, and geography — via the Censu
 ### `census_list_datasets` <sub>tool</sub>
 
 - Returns dataset codes, names, descriptions, and available vintage years
-- Covers ACS5, ACS5 Data Profiles, ACS5 Subject Tables, ACS1, ACS1 Data Profiles, Population Estimates, Decennial Redistricting (P.L. 94-171), Decennial DHC, County Business Patterns (`cbp`), Economic Census (`ecnbasic`), and Nonemployer Statistics (`nonemp`)
+- Covers ACS5 with its Data Profiles, Subject Tables, and Comparison Profiles; ACS1 with its Data Profiles, Subject Tables, Comparison Profiles, and Selected Population Profiles (`acs/acs1/spp`); ACS 1-Year Supplemental Estimates (`acs/acsse`); Population Estimates; the 2020 Decennial files — Redistricting (P.L. 94-171), DHC (`dec/dhc`), Demographic Profile (`dec/dp`), Supplemental DHC (`dec/sdhc`), and DDHC-A (`dec/ddhca`); County Business Patterns (`cbp`); Economic Census (`ecnbasic`); and Nonemployer Statistics (`nonemp`)
 - Each description names the filter predicates the dataset requires and the geography levels it publishes — both vary by dataset
 - Accepts an optional keyword filter
-- Dataset codes (e.g., `acs/acs5`) are the values to pass to other tools
-- `available_years` is exhaustive, not a sample: any other year fails with `year_not_available` before a request goes out, naming the years that do work. It is narrower than what the Census API hosts — `pep/charv` reaches its 2020-2022 estimates through the `YEAR` filter inside the 2023 vintage, and the `cbp`/`nonemp` vintages left out reject the `NAME` column every query here sends
+- Dataset codes (e.g., `acs/acs5`) are the values to pass to other tools. Every tool ignores their case and takes a two-part code by its last part alone (`acs5` is `acs/acs5`, `pl` is `dec/pl`), echoing the resolved code; three-part codes such as `acs/acs5/profile` must be given in full, and a bare `profile` fails naming the codes that end in it
+- `available_years` is exhaustive, not a sample: any other year fails with `year_not_available` before a request goes out, naming the years that do work. It is narrower than what the Census API hosts — `pep/charv` reaches its 2020-2022 estimates through the `YEAR` filter inside the 2023 vintage, the `cbp`/`nonemp` vintages left out reject the `NAME` column every query here sends, and the Census API answers `acs/acs1/spp` 2008 and 2010 with server errors
 
 ---
 
@@ -64,14 +64,16 @@ U.S. Census Bureau data — datasets, variables, and geography — via the Censu
 - Returns one row per geography level — `geography_level`, whether a parent is required, `required_parent_levels`, and an example FIPS value
 - `geography_level` values are the exact inputs to `geography_level` in `census_query_data` and `census_compare_geographies`
 - `year` defaults to the dataset's latest available vintage
-- `dataset_not_found` when the dataset code is unrecognized; `year_not_available` when the dataset has no geography data for the requested year
+- `dataset_not_found` when the dataset code is blank or unrecognized; `year_not_available` when the dataset has no geography data for the requested year
 
 ---
 
 ### `census_search_variables` <sub>tool</sub>
 
-- Full-text search across label and concept fields with relevance scoring (exact concept match > label match > partial)
-- On ACS datasets, returns estimate (E suffix) and margin-of-error (M suffix) codes together so both can be requested in one query — no other family publishes margins of error, and an E-final code there is an ordinary code
+- Whole-word search across label and concept: every query word must match (`rate` never matches "separated"), and when no variable contains them all, the variables with the most words come back with a notice saying so
+- Ranked by where the query appears — the label's last `!!` segment or the whole concept equal to it first, then the phrase in label and concept, label only, concept only — then by fewer `!!` segments, shorter concept, and code, so a table total leads its breakdown rows and an estimate leads its margin of error
+- A column shared across tables, such as `GEO_ID`, is matched on its label only and returned without a concept
+- On ACS datasets, returns estimate (E suffix) and margin-of-error (M suffix) codes together so both can be requested in one query — the ACS comparison profiles and the other families publish no margins of error, and an E-final code there is an ordinary code. A margin's label is the one the Census publishes (`Margin of Error!!Median household income…`), and search matches a margin on its estimate's label, so the two rank side by side
 - Also surfaces the predicate codes a dataset filters on, such as `NAICS2017` in `cbp`
 - `limit` is an integer from 1 to 100 (default 20) — out-of-range values are rejected, not clamped; `totalMatches` says how many matched before the limit
 - Cache-backed: variables.json is fetched once per dataset+year with a configurable TTL (default 24h)
@@ -80,8 +82,10 @@ U.S. Census Bureau data — datasets, variables, and geography — via the Censu
 
 ### `census_get_variable` <sub>tool</sub>
 
-- Accepts one or more variable codes (case-sensitive) and returns metadata in the same order — label, concept, predicate type, and universe when the dataset publishes one
-- On ACS datasets, returns `estimate_code`/`moe_code` sibling references; other families publish no margins of error and carry neither field
+- Accepts one or more variable codes (trimmed and matched regardless of case, then echoed in the dataset's own spelling) and returns metadata in the same order — label, concept, predicate type, and the table's universe when its `groups.json` entry publishes one
+- Resolves annotation and flag columns such as `B19013_001EA` and `EMP_F` from the Census per-variable endpoint, with `attribute_of` naming the column each belongs to and `attribute_type` its kind
+- A column shared across tables, such as `GEO_ID`, carries no concept — its published one joins every table's
+- On ACS datasets, returns `estimate_code`/`moe_code` sibling references, and a margin-of-error code carries its published label with `attribute_of` naming its estimate and `attribute_type` `MARGIN_OF_ERROR`; the comparison profiles and the other families publish no margins of error and carry none of these
 - Also resolves predicate/filter dimension codes (e.g., `NAICS2017`, `SEX`) to confirm a dimension exists in a dataset — `census_list_predicate_values` lists the values it accepts
 - `dataset` defaults to `acs/acs5`, `year` defaults to the dataset's latest available vintage
 - `variable_not_found` when a code isn't defined in the dataset and year
@@ -121,7 +125,7 @@ U.S. Census Bureau data — datasets, variables, and geography — via the Censu
 - Up to 49 variable codes per call, fewer on datasets where label or record columns are added: the Census API accepts 50 columns per request and every query also sends `NAME`. `too_many_variables` states the exact maximum before any request goes out. Codes are case-insensitive, and an unknown one is `variable_not_found`
 - Level and parent are checked against the dataset's own geography metadata before querying — `parent_required` and `parent_not_accepted` name what's missing or unaccepted rather than surfacing a raw Census 400
 - Optional `tract_fips` (exactly 6 digits, with a concrete `county_fips`) scopes a block-group or decennial block query to one tract, so the block group around an address is one call: `block group` `2` in `53`/`033`/`007101`
-- Optional `predicates` map filters the business/`pep`/`dec` datasets (e.g., `{"NAICS2017": "5112"}`); a dimension left unset applies a Census-chosen default — an all-categories total on some datasets, a single category on others — echoed per row in `applied_filters`. Keys are case-insensitive and a blank value counts as omitted; `"*"` returns one row per category, each labelled in `record`
+- Optional `predicates` map filters the business/`pep`/`dec` datasets and `acs/acs1/spp` (e.g., `{"NAICS2017": "5112"}`); a dimension left unset applies a Census-chosen default — an all-categories total on some datasets, a single category on others — echoed per row in `applied_filters`. Keys are case-insensitive and a blank value counts as omitted; `"*"` returns one row per category, each labelled in `record`
 - A dataset that publishes more than one record per geography (`pep/charv`) returns multiple rows, each carrying a `record` field; pin one with `predicates` (e.g., `{"MONTH": "7"}`)
 - ACS sentinel values resolve to the Census's published meanings, a controlled estimate's margin of error reads as `0`, and a median in an open-ended interval is flagged `open_ended`. On `cbp`, `ecnbasic`, and `nonemp`, a value the Census withheld (stored as `0` beside a flag such as `D`) is reported as suppressed with the flag's meaning. A null `estimate` means the value is either suppressed, a text cell (returned under `value`), or genuinely empty
 - Requires `CENSUS_API_KEY`

@@ -412,6 +412,26 @@ describe('censusListPredicateValues — dimensions with a published value list',
     expect(enrichment.truncated).toBe(true);
     expect(enrichment.totalCount).toBe(3);
     expect(enrichment.notice).toContain('Showing 2 of 3');
+    expect(enrichment.notice).toContain('raise limit (max 500)');
+  });
+
+  it('does not advise raising a limit already at its maximum', async () => {
+    mockFindVariable.mockResolvedValue(empszes);
+    mockFetchPredicateValues.mockResolvedValue(
+      Array.from({ length: 2003 }, (_, i) => ({
+        code: String(i).padStart(4, '0'),
+        label: `Code ${i}`,
+      })),
+    );
+
+    const ctx = createMockContext({ errors: censusListPredicateValues.errors });
+    const result = await censusListPredicateValues.handler(call({ limit: 500 }), ctx);
+
+    expect(result.values).toHaveLength(500);
+    const notice = getEnrichment(ctx).notice as string;
+    expect(notice).toContain('Showing 500 of 2003');
+    expect(notice).toContain('Narrow with query');
+    expect(notice).not.toMatch(/raise limit/i);
   });
 });
 

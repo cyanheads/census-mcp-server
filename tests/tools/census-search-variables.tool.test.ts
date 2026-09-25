@@ -73,17 +73,38 @@ describe('censusSearchVariables', () => {
     );
   });
 
-  it('caps limit at 100', async () => {
-    mockSearchVariables.mockResolvedValue({ variables: [], totalMatches: 0 });
+  it('rejects a limit above 100 at the schema rather than clamping it', () => {
+    expect(censusSearchVariables.input.safeParse({ query: 'income', limit: 101 }).success).toBe(
+      false,
+    );
+    expect(censusSearchVariables.input.safeParse({ query: 'income', limit: 100 }).success).toBe(
+      true,
+    );
+  });
+
+  it('passes limit 100 through and does not advise raising it once truncated there', async () => {
+    mockSearchVariables.mockResolvedValue({
+      variables: Array.from({ length: 100 }, (_, i) => ({
+        code: `B01001_${String(i).padStart(3, '0')}E`,
+        label: 'Sex by age',
+        concept: 'SEX BY AGE',
+        predicateType: 'int',
+      })),
+      totalMatches: 19423,
+    });
 
     const ctx = createMockContext({ errors: censusSearchVariables.errors });
-    const input = censusSearchVariables.input.parse({ query: 'income', limit: 999 });
+    const input = censusSearchVariables.input.parse({ query: 'income', limit: 100 });
     await censusSearchVariables.handler(input, ctx);
 
     expect(mockSearchVariables).toHaveBeenCalledWith(
       expect.objectContaining({ limit: 100 }),
       expect.anything(),
     );
+    const notice = getEnrichment(ctx).notice as string;
+    expect(notice).toContain('19423 variables matched');
+    expect(notice).toContain('Narrow the query');
+    expect(notice).not.toMatch(/raise limit/i);
   });
 
   it('returns empty variables list when no match', async () => {

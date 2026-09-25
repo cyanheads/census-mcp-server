@@ -14,7 +14,7 @@ import {
 export const censusSearchVariables = tool('census_search_variables', {
   title: 'Search Census Variables',
   description:
-    'Search Census variables by keyword across variable labels and concept groups. Returns variable codes with human-readable labels — use this to go from a concept like "median household income" to the variable code B19013_001E needed for data queries. On ACS datasets it returns both estimate (E suffix) and margin-of-error (M suffix) codes so you can request both; other dataset families publish no margins of error. Also use it to find the predicate codes a dataset filters on, such as NAICS2017 in cbp. When total_matches exceeds the limit, narrow the query to see more specific results.',
+    'Search Census variables by keyword across variable labels and concept groups. Returns variable codes with human-readable labels — use this to go from a concept like "median household income" to the variable code B19013_001E needed for data queries. On ACS datasets it returns both estimate (E suffix) and margin-of-error (M suffix) codes so you can request both; other dataset families publish no margins of error. Also use it to find the predicate codes a dataset filters on, such as NAICS2017 in cbp. When totalMatches exceeds the limit, narrow the query to see more specific results.',
   annotations: { readOnlyHint: true, openWorldHint: false },
   input: z.object({
     query: z
@@ -34,9 +34,12 @@ export const censusSearchVariables = tool('census_search_variables', {
       .describe('Vintage year to search (default: latest available for the dataset).'),
     limit: z
       .number()
+      .int()
+      .min(1)
+      .max(100)
       .optional()
       .describe(
-        'Maximum results to return (default: 20, max: 100). Increase if total_matches greatly exceeds the limit.',
+        'Maximum results to return (default: 20, max: 100). Increase if totalMatches greatly exceeds the limit.',
       ),
   }),
   output: z.object({
@@ -86,7 +89,7 @@ export const censusSearchVariables = tool('census_search_variables', {
     truncated: z
       .boolean()
       .optional()
-      .describe('True when total_matches exceeded the limit and results were cut off.'),
+      .describe('True when totalMatches exceeded the limit and results were cut off.'),
     shown: z.number().optional().describe('Number of variables returned after the limit.'),
     cap: z.number().optional().describe('The limit that was applied.'),
     notice: z
@@ -128,7 +131,7 @@ export const censusSearchVariables = tool('census_search_variables', {
     const dataset = input.dataset?.trim() || 'acs/acs5';
     const { defaultYear } = getDiscoveryConfig();
     const year = input.year ?? DATASET_LATEST_YEARS[dataset] ?? defaultYear;
-    const limit = Math.min(input.limit ?? 20, 100);
+    const limit = input.limit ?? 20;
 
     ctx.log.info('Searching Census variables', { query: input.query, dataset, year, limit });
 
@@ -148,7 +151,7 @@ export const censusSearchVariables = tool('census_search_variables', {
       ctx.enrich.truncated({
         shown: variables.length,
         cap: limit,
-        guidance: `${totalMatches} variables matched — ${totalMatches - variables.length} not shown. Narrow the query or raise limit (max 100).`,
+        guidance: `${totalMatches} variables matched — ${totalMatches - variables.length} not shown. ${limit < 100 ? 'Narrow the query or raise limit (max 100).' : 'Narrow the query to reach the rest.'}`,
       });
     }
 

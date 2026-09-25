@@ -103,7 +103,15 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
       .describe(
         'Industry code to scope the enumeration by, for dimensions the Census publishes per industry. On ecnbasic, TAXSTAT and TYPOP return only the all-establishments row until a NAICS sector is named — pass a sector code such as "62" (Health Care) or "42" (Wholesale Trade) and the result is complete for that industry alone. Ignored for dimensions with a published value list. Get sector codes by calling this tool on the dataset\'s own NAICS dimension. Blank is treated as omitted.',
       ),
-    limit: z.number().optional().describe('Maximum codes to return (default: 50, max: 500).'),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(500)
+      .optional()
+      .describe(
+        'Maximum codes to return (default: 50, max: 500). totalCount says how many matched.',
+      ),
   }),
   output: z.object({
     values: z
@@ -206,7 +214,7 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
 
     const { defaultYear } = getDiscoveryConfig();
     const year = input.year ?? DATASET_LATEST_YEARS[dataset] ?? defaultYear;
-    const limit = Math.min(input.limit ?? 50, 500);
+    const limit = input.limit ?? 50;
     const predicate = input.predicate.trim();
 
     ctx.log.info('Listing predicate values', { predicate, dataset, year });
@@ -334,7 +342,7 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
     }
     if (truncated) {
       notices.push(
-        `Showing ${values.length} of ${matched.length} codes. Narrow with query, or raise limit.`,
+        `Showing ${values.length} of ${matched.length} codes. Narrow with query${limit < 500 ? ', or raise limit (max 500)' : ' to reach the rest'}.`,
       );
     } else if (matched.length === 0) {
       // A keyword that matches only withheld codes is the sharpest version of this dimension's

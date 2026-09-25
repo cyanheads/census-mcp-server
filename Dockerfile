@@ -12,7 +12,7 @@
 # on an arm64 host. Building natively also removes emulation from the slowest
 # stage of a multi-arch build.
 # ==============================================================================
-FROM --platform=$BUILDPLATFORM oven/bun:1.4.0 AS build
+FROM --platform=$BUILDPLATFORM oven/bun:1.4.2 AS build
 
 WORKDIR /usr/src/app
 
@@ -38,7 +38,7 @@ RUN bun run build
 # application. It uses a slim base image and only includes production
 # dependencies and build artifacts.
 # ==============================================================================
-FROM oven/bun:1.4.0-slim AS production
+FROM oven/bun:1.4.2-slim AS production
 
 WORKDIR /usr/src/app
 
@@ -47,10 +47,12 @@ WORKDIR /usr/src/app
 ENV NODE_ENV=production
 
 # OCI image metadata (https://github.com/opencontainers/image-spec/blob/main/annotations.md)
+ARG APP_VERSION
 LABEL org.opencontainers.image.title="census-mcp-server"
 LABEL org.opencontainers.image.description="Query U.S. Census Bureau data, variables, and geography via MCP. STDIO or Streamable HTTP."
 LABEL org.opencontainers.image.source="https://github.com/cyanheads/census-mcp-server"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
+LABEL org.opencontainers.image.version="${APP_VERSION}"
 
 # Copy dependency manifests
 COPY package.json bun.lock ./

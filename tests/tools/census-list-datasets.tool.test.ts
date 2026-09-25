@@ -48,13 +48,13 @@ describe('censusListDatasets', () => {
 
   /**
    * These datasets publish levels census_resolve_geography cannot resolve a name to — zip code,
-   * congressional district, region, metropolitan division, economic place — so the catalog has to
-   * name the gap. `us` is a level of all three and resolves from no name at all, so even nonemp,
-   * whose named levels all resolve, cannot claim blanket coverage.
+   * congressional district, region, metropolitan division — so the catalog has to name the gap.
+   * `us` is a level of all three and resolves from no name at all, so even nonemp, whose named
+   * levels all resolve, cannot claim blanket coverage.
    */
   it.each([
     ['cbp', ['congressional district', 'zip code']],
-    ['ecnbasic', ['region', 'metropolitan division', 'economic place']],
+    ['ecnbasic', ['region', 'metropolitan division']],
     ['nonemp', []],
   ] as const)(
     'tells a caller which %s geography levels census_resolve_geography cannot reach',
@@ -76,6 +76,45 @@ describe('censusListDatasets', () => {
       }
     },
   );
+
+  const descriptionOf = async (id: string) => {
+    const result = await censusListDatasets.handler(
+      censusListDatasets.input.parse({}),
+      createMockContext(),
+    );
+    return result.datasets.find((d) => d.dataset_id === id)?.description ?? '';
+  };
+
+  it('names economic place among the ecnbasic levels a name resolves to', async () => {
+    const description = await descriptionOf('ecnbasic');
+    const resolvable = description.slice(
+      description.indexOf('census_resolve_geography'),
+      description.indexOf('census_resolve_geography') + 250,
+    );
+
+    expect(resolvable).toContain('economic place');
+    // 2017 and 2012 publish place, keyed by the plain 5-digit code, instead of economic place.
+    expect(description).toContain('2017 and 2012');
+    expect(description).toContain('5-digit');
+  });
+
+  it('gives the four region codes and says ecnbasic publishes regions for Construction only', async () => {
+    const description = await descriptionOf('ecnbasic');
+
+    for (const code of ['1 Northeast', '2 Midwest', '3 South', '4 West']) {
+      expect(description).toContain(code);
+    }
+    expect(description).toMatch(/region[^.]*Construction sector only/);
+  });
+
+  it('says how a cbp congressional district and zip code are coded', async () => {
+    const description = await descriptionOf('cbp');
+
+    expect(description).toContain('zero-padded district number');
+    expect(description).toContain('"00"');
+    expect(description).toContain('"98"');
+    expect(description).toMatch(/zip code is the 5-digit ZIP itself/);
+  });
 
   /**
    * Every query sends NAME in get=, and the older business vintages reject it with a 400 — cbp

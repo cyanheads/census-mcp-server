@@ -18,6 +18,8 @@ export const GEOGRAPHY_TYPES = [
   'metropolitan statistical area/micropolitan statistical area',
   'combined statistical area',
   'consolidated city',
+  'zip code tabulation area',
+  'economic place',
 ] as const;
 
 /** Census geography level a name can resolve to — one or more TIGERweb layers each. */
@@ -25,6 +27,13 @@ export type GeographyType = (typeof GEOGRAPHY_TYPES)[number];
 
 /** Resolved geography with FIPS identifiers. */
 export interface ResolvedGeography {
+  /** 1-digit block group within the tract — from a street address only. */
+  blockGroupFips?: string;
+  /**
+   * The place is a census-designated place — an unincorporated community the Census delineates
+   * for statistics — rather than an incorporated one. Absent for every other geography.
+   */
+  censusDesignatedPlace?: true;
   /** 3-digit county FIPS code (when applicable). */
   countyFips?: string;
   /** Pre-formatted FIPS value ready to pass as geography_fips to census_query_data. */
@@ -33,11 +42,15 @@ export interface ResolvedGeography {
   geographyType: GeographyType;
   /** Canonical name of the resolved geography. */
   name: string;
-  /** Place FIPS code (when applicable). */
+  /**
+   * 5-digit place FIPS code — the resolved place itself, or for a street address the
+   * incorporated place it sits in.
+   */
   placeFips?: string;
   /**
    * 2-digit state FIPS code. Absent for levels that sit outside the state hierarchy —
-   * a metropolitan or combined statistical area can span several states.
+   * a metropolitan or combined statistical area can span several states, and the ZCTA layer
+   * carries no state at all.
    */
   stateFips?: string;
   /** 6-digit tract FIPS code (when applicable). */
@@ -61,11 +74,15 @@ export interface TigerwebFeature {
     GEOID?: string;
     [key: string]: string | number | undefined;
   };
+  /** The row's shape, present only when a query asked for geometry — an ArcGIS polygon here. */
+  geometry?: unknown;
 }
 
 export interface TigerwebResponse {
   error?: { message: string };
   features?: TigerwebFeature[];
+  /** Coordinate system of any geometry in the response. */
+  spatialReference?: { wkid?: number };
 }
 
 /** Census Geocoder response shape. */
@@ -84,10 +101,16 @@ export interface GeocoderMatch {
     Counties?: Array<{ STATE: string; COUNTY: string }>;
     /** Census tracts include STATE, COUNTY, and TRACT. */
     'Census Tracts'?: Array<{ STATE: string; COUNTY: string; TRACT: string }>;
-    /** Block-level geography — also carries STATE, COUNTY, TRACT. */
-    '2020 Census Blocks'?: Array<{ STATE: string; COUNTY: string; TRACT: string }>;
+    /** Block-level geography — carries STATE, COUNTY, TRACT, and the 1-digit block group. */
+    '2020 Census Blocks'?: Array<{
+      STATE: string;
+      COUNTY: string;
+      TRACT: string;
+      BLKGRP?: string;
+      BLOCK?: string;
+    }>;
     /** Incorporated places carry STATE and PLACE (no COUNTY or TRACT). */
-    'Incorporated Places'?: Array<{ STATE: string; PLACE: string }>;
+    'Incorporated Places'?: Array<{ STATE: string; PLACE: string; NAME?: string }>;
   };
   matchedAddress: string;
 }

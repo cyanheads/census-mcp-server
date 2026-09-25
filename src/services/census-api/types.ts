@@ -56,6 +56,9 @@ export interface CensusGeographyLevel {
   wildcard?: string[];
 }
 
+/** A parent level a caller can scope a data query by — the ones the `in=` clause expresses. */
+export type SuppliedParent = 'state' | 'county' | 'tract';
+
 /** Outcome of pre-validating a geography level + parent combination against a dataset. */
 export type GeographyCheck =
   | {
@@ -75,8 +78,8 @@ export type GeographyCheck =
     }
   | {
       status: 'parent_not_accepted';
-      /** Supplied parents the level does not name — `state`, `county`, or both. */
-      unacceptedParents: string[];
+      /** Supplied parents the level does not name. */
+      unacceptedParents: SuppliedParent[];
       /** Every parent the level does name, in hierarchy order. Empty when it takes none. */
       acceptedParents: string[];
     };

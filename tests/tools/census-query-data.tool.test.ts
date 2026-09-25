@@ -39,6 +39,15 @@ vi.mock('@/config/server-config.js', () => ({
   })),
 }));
 
+/** The error a handler call rejects with. */
+const failureOf = async (
+  input: Parameters<typeof censusQueryData.handler>[0],
+  ctx: Parameters<typeof censusQueryData.handler>[1],
+) => {
+  const run = async () => censusQueryData.handler(input, ctx);
+  return run().catch((e: unknown) => e);
+};
+
 const mockQueryData = vi.fn();
 const mockCheckGeography = vi.fn();
 const mockLookupVariables = vi.fn();
@@ -301,6 +310,27 @@ describe('censusQueryData', () => {
     expect(mockQueryData).not.toHaveBeenCalled();
   });
 
+  it('parent_required for a ZCTA never says census_resolve_geography returns its state', async () => {
+    mockCheckGeography.mockResolvedValue({ status: 'parent_required', missingParents: ['state'] });
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['B01003_001E'],
+      geography_level: 'zip code tabulation area',
+      geography_fips: '98109',
+      year: 2019,
+    });
+    const run = async () => censusQueryData.handler(input, ctx);
+    const err = await run().catch((e: unknown) => e);
+    const { data } = err as { data: { reason: string; recovery: { hint: string } } };
+
+    expect(data.reason).toBe('parent_required');
+    expect(data.recovery.hint).toContain('parent_fips');
+    expect(data.recovery.hint).not.toContain('returns it as state_fips');
+    expect(data.recovery.hint).toContain('no state_fips');
+    expect(mockQueryData).not.toHaveBeenCalled();
+  });
+
   it('parent_required names county_fips when the county parent is missing', async () => {
     mockCheckGeography.mockResolvedValue({ status: 'parent_required', missingParents: ['county'] });
 
@@ -319,6 +349,26 @@ describe('censusQueryData', () => {
   it('parent_required offers the wildcard when the missing parent has no input', async () => {
     mockCheckGeography.mockResolvedValue({
       status: 'parent_required',
+      missingParents: ['county subdivision'],
+      wildcardRelaxes: true,
+    });
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'subminor civil division',
+      geography_fips: '12345',
+      parent_fips: '72',
+      county_fips: '127',
+    });
+    await expect(censusQueryData.handler(input, ctx)).rejects.toMatchObject({
+      data: { recovery: { hint: expect.stringContaining('geography_fips to "*"') } },
+    });
+  });
+
+  it('parent_required names tract_fips, not the wildcard, for a single block group', async () => {
+    mockCheckGeography.mockResolvedValue({
+      status: 'parent_required',
       missingParents: ['tract'],
       wildcardRelaxes: true,
     });
@@ -327,13 +377,145 @@ describe('censusQueryData', () => {
     const input = censusQueryData.input.parse({
       variables: ['B19013_001E'],
       geography_level: 'block group',
-      geography_fips: '1',
+      geography_fips: '2',
       parent_fips: '53',
       county_fips: '033',
     });
-    await expect(censusQueryData.handler(input, ctx)).rejects.toMatchObject({
-      data: { recovery: { hint: expect.stringContaining('geography_fips to "*"') } },
+    const err = await failureOf(input, ctx);
+    const hint = (err as { data: { recovery: { hint: string } } }).data.recovery.hint;
+
+    expect(hint).toContain('add tract_fips');
+    expect(hint).toContain('census_resolve_geography');
+    expect(hint).not.toContain('"*"');
+    expect(mockQueryData).not.toHaveBeenCalled();
+  });
+
+  it('parent_required asks for a concrete county when county_fips is "*" under a tract', async () => {
+    mockCheckGeography.mockResolvedValue({
+      status: 'parent_required',
+      missingParents: ['county'],
+      wildcardRelaxes: false,
     });
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'block group',
+      geography_fips: '2',
+      parent_fips: '53',
+      county_fips: '*',
+      tract_fips: '007101',
+    });
+    const err = await failureOf(input, ctx);
+    const hint = (err as { data: { recovery: { hint: string } } }).data.recovery.hint;
+
+    expect(hint).toContain('county_fips');
+    expect(hint).toContain('instead of "*"');
+    expect(mockQueryData).not.toHaveBeenCalled();
+  });
+
+  it('passes tract_fips to the geography check and the data query, unpadded', async () => {
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'Block Group 2; Census Tract 71.01; King County; Washington',
+        geographyFips: '2',
+        geographyGeoid: '530330071012',
+        variables: { B19013_001E: { estimate: 136034, label: 'B19013_001E', suppressed: false } },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'block group',
+      geography_fips: '2',
+      parent_fips: '53',
+      county_fips: '033',
+      tract_fips: '007101',
+    });
+    await censusQueryData.handler(input, ctx);
+
+    expect(mockCheckGeography).toHaveBeenCalledWith(
+      expect.objectContaining({ countyFips: '033', tractFips: '007101' }),
+      expect.anything(),
+    );
+    expect(mockQueryData).toHaveBeenCalledWith(
+      expect.objectContaining({ countyFips: '033', tractFips: '007101' }),
+      expect.anything(),
+    );
+  });
+
+  it('reads a blank tract_fips as omitted', async () => {
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'King County, Washington',
+        geographyFips: '033',
+        geographyGeoid: '53033',
+        variables: { B19013_001E: { estimate: 1, label: 'B19013_001E', suppressed: false } },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'county',
+      geography_fips: '033',
+      parent_fips: '53',
+      tract_fips: '',
+    });
+    await censusQueryData.handler(input, ctx);
+
+    expect(mockCheckGeography.mock.calls[0]?.[0]).not.toHaveProperty('tractFips');
+    expect(mockQueryData.mock.calls[0]?.[0]).not.toHaveProperty('tractFips');
+  });
+
+  it.each(['007101', ''])('accepts tract_fips %j at the schema', (tract_fips) => {
+    expect(
+      censusQueryData.input.safeParse({
+        variables: ['B19013_001E'],
+        geography_level: 'block group',
+        geography_fips: '2',
+        tract_fips,
+      }).success,
+    ).toBe(true);
+  });
+
+  it.each(['*', '7101', '71.01', '0071011', ' 007101'])(
+    'rejects tract_fips %j at the schema — a tract is exactly 6 digits',
+    (tract_fips) => {
+      expect(
+        censusQueryData.input.safeParse({
+          variables: ['B19013_001E'],
+          geography_level: 'block group',
+          geography_fips: '2',
+          tract_fips,
+        }).success,
+      ).toBe(false);
+    },
+  );
+
+  it('parent_not_accepted names tract_fips as the input to drop', async () => {
+    mockCheckGeography.mockResolvedValue({
+      status: 'parent_not_accepted',
+      unacceptedParents: ['tract'],
+      acceptedParents: ['state', 'county'],
+    });
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'tract',
+      geography_fips: '007101',
+      parent_fips: '53',
+      county_fips: '033',
+      tract_fips: '007101',
+    });
+    const err = await failureOf(input, ctx);
+    const hint = (err as { data: { recovery: { hint: string } } }).data.recovery.hint;
+
+    expect(hint).toContain('Drop tract_fips');
+    expect(hint).not.toContain('county_fips');
+    expect(mockQueryData).not.toHaveBeenCalled();
   });
 
   it('parent_required says the level is out of reach when no wildcard would help', async () => {

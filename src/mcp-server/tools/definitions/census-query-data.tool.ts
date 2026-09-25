@@ -21,7 +21,7 @@ import {
   padFips,
   planQueryColumns,
 } from '@/services/census-api/census-api-service.js';
-import type { CensusDataRow } from '@/services/census-api/types.js';
+import type { CensusDataRow, SuppliedParent } from '@/services/census-api/types.js';
 import {
   DATASET_LATEST_YEARS,
   defaultLabelColumnsFor,
@@ -37,6 +37,13 @@ import {
 
 /** Most rows one call can return — the `limit` input's maximum. */
 const MAX_LIMIT = 500;
+
+/** The input that supplies each parent a query can be scoped by. */
+const SCOPE_INPUTS = {
+  state: 'parent_fips',
+  county: 'county_fips',
+  tract: 'tract_fips',
+} as const satisfies Record<SuppliedParent, string>;
 
 /**
  * Put rows in the order pages are cut from: GEOID, then the code of each record column in column
@@ -146,6 +153,18 @@ export const censusQueryData = tool('census_query_data', {
       .optional()
       .describe(
         'County FIPS code when querying tracts or block groups within a specific county (e.g., "033" for King County within WA). Required for tract and block-group queries scoped to a county — use alongside parent_fips (state). census_resolve_geography returns this as county_fips. Pass "*" to span every county in the state, which is the only way a block-group query reaches a whole state. Blank is treated as omitted.',
+      ),
+    tract_fips: z
+      .union([
+        z.literal(''),
+        z
+          .string()
+          .regex(/^\d{6}$/)
+          .describe('Exactly 6 digits — never padded here, and never "*".'),
+      ])
+      .optional()
+      .describe(
+        'Census tract code scoping the query to one tract (e.g., "007101" for Census Tract 71.01), for the levels that sit within a tract — block group on acs/acs5, block group and block on dec/pl. census_resolve_geography returns it as tract_fips, and for a street address also returns the block_group_fips to pass as geography_fips. A tract code is unique only within its county, so it needs parent_fips and a concrete county_fips (not "*"). It is exactly 6 digits and is not padded, since "7101" and "71" do not name one tract. A level that does not sit within a tract rejects it. Blank is treated as omitted.',
       ),
     predicates: z
       .record(z.string(), z.string())
@@ -296,14 +315,14 @@ export const censusQueryData = tool('census_query_data', {
     {
       reason: 'parent_required',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The geography level requires a parent FIPS code but parent_fips was not provided, or a tract/block-group level requires county_fips but it was omitted.',
+      when: 'The geography level requires a parent FIPS code but parent_fips was not provided, a tract/block-group level requires county_fips but it was omitted, a single block group requires tract_fips, or tract_fips was set without a concrete county_fips.',
       recovery:
-        'Add parent_fips (state FIPS) from census_resolve_geography state_fips. For tract or block-group levels also add county_fips from census_resolve_geography county_fips.',
+        'Add parent_fips (state FIPS) from census_resolve_geography state_fips. For tract or block-group levels also add county_fips from census_resolve_geography county_fips, and for a single block group add tract_fips.',
     },
     {
       reason: 'parent_not_accepted',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'parent_fips or county_fips names a parent the geography level does not sit within.',
+      when: 'parent_fips, county_fips, or tract_fips names a parent the geography level does not sit within.',
       recovery:
         'Drop the parent this level does not name. Levels such as zip code tabulation area, urban area, and metropolitan statistical area/micropolitan statistical area are queried with no parent at all; census_list_geographies shows the parents each level takes.',
     },
@@ -380,6 +399,9 @@ export const censusQueryData = tool('census_query_data', {
     // scope rather than a code and passes through unpadded.
     const parentFips = padFips(input.parent_fips, 2);
     const countyFips = padFips(input.county_fips, 3);
+    // A tract has no fixed-width shorthand to pad from — "7101" and "71" are both Tract 71.01 as a
+    // person writes it — so the schema takes exactly 6 digits and only a blank is read here.
+    const tractFips = input.tract_fips || undefined;
 
     // Validate the level and its parents against the dataset's own geography.json before
     // spending a data query the Census API would reject with an opaque 400.
@@ -391,6 +413,7 @@ export const censusQueryData = tool('census_query_data', {
         geographyFips: input.geography_fips,
         ...(parentFips !== undefined && { parentFips }),
         ...(countyFips !== undefined && { countyFips }),
+        ...(tractFips !== undefined && { tractFips }),
       },
       ctx,
     );
@@ -411,15 +434,27 @@ export const censusQueryData = tool('census_query_data', {
 
     if (check.status === 'parent_required') {
       const missing = check.missingParents;
-      const steps = missing.map((parent) =>
-        parent === 'state'
-          ? 'add parent_fips (census_resolve_geography returns it as state_fips)'
-          : parent === 'county'
-            ? 'add county_fips (census_resolve_geography returns it as county_fips)'
-            : check.wildcardRelaxes
-              ? `drop the ${parent} scope by setting geography_fips to "*", which returns every ${input.geography_level} under the parents you did supply`
-              : `scope the query by ${parent}, which this tool has no input for — call census_list_geographies and pick a level whose only parents are state and county`,
-      );
+      const stepFor = (parent: string) => {
+        if (parent === 'state') {
+          // The resolver's ZCTA layer has no STATE, so it cannot supply this parent.
+          return input.geography_level === 'zip code tabulation area'
+            ? "add parent_fips set to the 2-digit FIPS of the ZCTA's state — census_resolve_geography returns no state_fips for a ZCTA, so resolve the state's name for it"
+            : 'add parent_fips (census_resolve_geography returns it as state_fips)';
+        }
+        if (parent === 'county') {
+          // A tract code repeats across counties, so a tract scope needs the one it sits in.
+          return countyFips === '*'
+            ? 'set county_fips to the 3-digit county the tract sits in instead of "*" (census_resolve_geography returns it as county_fips)'
+            : 'add county_fips (census_resolve_geography returns it as county_fips)';
+        }
+        if (parent === 'tract') {
+          return 'add tract_fips (census_resolve_geography returns it as tract_fips, and for a street address also returns the block group as block_group_fips)';
+        }
+        return check.wildcardRelaxes
+          ? `drop the ${parent} scope by setting geography_fips to "*", which returns every ${input.geography_level} under the parents you did supply`
+          : `scope the query by ${parent}, which this tool has no input for — call census_list_geographies and pick a level whose only parents are state, county, and tract`;
+      };
+      const steps = missing.map(stepFor);
       throw ctx.fail(
         'parent_required',
         `Geography level "${input.geography_level}" in ${dataset} (${year}) must be scoped by ${missing.join(' and ')}.`,
@@ -434,9 +469,7 @@ export const censusQueryData = tool('census_query_data', {
     }
 
     if (check.status === 'parent_not_accepted') {
-      const inputs = check.unacceptedParents.map((parent) =>
-        parent === 'state' ? 'parent_fips' : 'county_fips',
-      );
+      const inputs = check.unacceptedParents.map((parent) => SCOPE_INPUTS[parent]);
       const scope =
         check.acceptedParents.length > 0
           ? `it sits within ${check.acceptedParents.join(' and ')} only`
@@ -524,6 +557,7 @@ export const censusQueryData = tool('census_query_data', {
         geographyFips: input.geography_fips,
         ...(parentFips !== undefined && { parentFips }),
         ...(countyFips !== undefined && { countyFips }),
+        ...(tractFips !== undefined && { tractFips }),
         ...(Object.keys(predicates).length > 0 && { predicates }),
         ...(Object.keys(defaultLabelColumns).length > 0 && { defaultLabelColumns }),
         ...(Object.keys(recordColumns).length > 0 && { recordColumns }),
@@ -620,12 +654,17 @@ export const censusQueryData = tool('census_query_data', {
     }
     if (truncated) {
       // A scope input narrows only when the level takes that parent and the query left it open.
-      // Without geography metadata nothing is known about the parents, so none is suggested.
+      // Without geography metadata nothing is known about the parents, so none is suggested. A
+      // tract sits inside one county, so it is offered only once the county is concrete — with
+      // the county open, narrowing to one is the step that comes first.
       const accepted = check.acceptedParents ?? [];
       const open = (fips: string | undefined) => fips === undefined || fips === '*';
       const openScopes = [
         ...(accepted.includes('state') && open(parentFips) ? ['parent_fips'] : []),
         ...(accepted.includes('county') && open(countyFips) ? ['county_fips'] : []),
+        ...(accepted.includes('tract') && !open(countyFips) && tractFips === undefined
+          ? ['tract_fips']
+          : []),
       ];
       notices.push(
         describePage({

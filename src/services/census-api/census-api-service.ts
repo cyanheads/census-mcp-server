@@ -20,6 +20,7 @@ import type {
   CensusRawResponse,
   CensusVariableValue,
   GeographyCheck,
+  SuppliedParent,
 } from './types.js';
 import {
   ACS_CONTROLLED_MOE,
@@ -393,6 +394,8 @@ export class CensusApiService {
       parentFips?: string;
       /** County FIPS code — required when querying tracts or block groups within a specific county. */
       countyFips?: string;
+      /** 6-digit tract code — scopes a block-group or block query to one tract of the county. */
+      tractFips?: string;
       /**
        * Dataset-specific filter values sent as extra query parameters, keyed by variable code
        * (e.g. `{ NAICS2017: '5112' }`). Omitting one the dataset requires is not an error
@@ -417,13 +420,13 @@ export class CensusApiService {
     const varList = getColumnsFor(params).join(',');
     const forClause = `${params.geographyLevel}:${params.geographyFips}`;
 
-    // Build compound in= clause: county FIPS requires state FIPS as the outer scope.
+    // Build compound in= clause, outermost scope first: state, then county, then tract.
+    // checkGeography has already refused a tract without a concrete county.
     let inClause = '';
     if (params.parentFips) {
       inClause = `&in=state:${params.parentFips}`;
-      if (params.countyFips) {
-        inClause += `%20county:${params.countyFips}`;
-      }
+      if (params.countyFips) inClause += `%20county:${params.countyFips}`;
+      if (params.tractFips) inClause += `%20tract:${params.tractFips}`;
     }
 
     const predicateKeys = Object.keys(params.predicates ?? {});
@@ -522,6 +525,8 @@ export class CensusApiService {
       parentFips?: string;
       /** County FIPS, when supplied by the caller. */
       countyFips?: string;
+      /** Tract code, when supplied by the caller. */
+      tractFips?: string;
     },
     ctx: Context,
   ): Promise<GeographyCheck> {
@@ -545,18 +550,20 @@ export class CensusApiService {
     const underWildcard = cutoff >= 0 ? required.slice(0, cutoff) : required;
     const effective = params.geographyFips === '*' ? underWildcard : required;
 
-    // state and county are the only parents the `in=` clause can express.
-    const supplied = new Set<string>();
-    if (params.parentFips) supplied.add('state');
-    if (params.countyFips) supplied.add('county');
+    // state, county, and tract are the only parents the `in=` clause can express.
+    const supplied: SuppliedParent[] = [];
+    if (params.parentFips) supplied.push('state');
+    if (params.countyFips) supplied.push('county');
+    if (params.tractFips) supplied.push('tract');
+    const unsupplied = (name: string) => !supplied.some((parent) => parent === name);
 
-    const missingParents = effective.filter((name) => !supplied.has(name));
+    const missingParents = effective.filter(unsupplied);
     if (missingParents.length > 0) {
       // A concrete target can demand parents (e.g. block group needs its tract) that a `*`
       // target would not — worth telling the caller, since `*` is an input they control.
       const wildcardRelaxes =
         params.geographyFips !== '*' &&
-        underWildcard.filter((name) => !supplied.has(name)).length < missingParents.length;
+        underWildcard.filter(unsupplied).length < missingParents.length;
 
       return { status: 'parent_required', missingParents, wildcardRelaxes };
     }
@@ -565,9 +572,15 @@ export class CensusApiService {
     // `in=` clause the Census API answers with an opaque 400. Acceptance is a property of
     // the level, so it is checked against the full `requires` list rather than `effective` —
     // the `*` wildcard relaxes which parents are mandatory, never which ones are allowed.
-    const unacceptedParents = [...supplied].filter((name) => !required.includes(name));
+    const unacceptedParents = supplied.filter((name) => !required.includes(name));
     if (unacceptedParents.length > 0) {
       return { status: 'parent_not_accepted', unacceptedParents, acceptedParents: required };
+    }
+
+    // A tract code is unique only inside its county, and the Census API answers `county:*` under
+    // a concrete tract with a 400 ("wildcard mismatch"), so a `*` county counts as no county here.
+    if (params.tractFips && params.countyFips === '*') {
+      return { status: 'parent_required', missingParents: ['county'], wildcardRelaxes: false };
     }
 
     return { status: 'ok', acceptedParents: required };

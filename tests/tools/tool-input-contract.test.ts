@@ -231,3 +231,42 @@ describe('bounded count inputs', () => {
     },
   );
 });
+
+/**
+ * A tract code is exactly 6 digits with no padding and no wildcard: `*` under a concrete block
+ * group is an upstream 400, and "7101" or "71" could each mean Tract 71.01 or another tract.
+ */
+describe('census_query_data tract_fips', () => {
+  const base = {
+    variables: ['B19013_001E'],
+    geography_level: 'block group',
+    geography_fips: '2',
+    parent_fips: '53',
+    county_fips: '033',
+  };
+
+  it.each(['*', '7101', '0071011', '71.01'])(
+    'rejects %j as an InvalidParams envelope naming tract_fips',
+    async (tract_fips) => {
+      const { isError, text, code, data } = errorOf(
+        await runToolContract(censusQueryData, { ...base, tract_fips } as never),
+      );
+
+      expect(isError).toBe(true);
+      expect(code).toBe(INVALID_PARAMS);
+      expect(data.issues).toEqual(
+        expect.arrayContaining([expect.objectContaining({ path: ['tract_fips'] })]),
+      );
+      expect(text).toContain('tract_fips');
+    },
+  );
+
+  it('publishes the 6-digit pattern and the blank alternative', () => {
+    const schema = censusQueryData.input.toJSONSchema() as {
+      properties: Record<string, { anyOf?: Array<{ const?: string; pattern?: string }> }>;
+    };
+    const variants = schema.properties.tract_fips?.anyOf ?? [];
+
+    expect(variants.map((v) => v.const ?? v.pattern)).toEqual(['', '^\\d{6}$']);
+  });
+});

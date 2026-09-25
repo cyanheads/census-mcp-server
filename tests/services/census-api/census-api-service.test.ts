@@ -136,6 +136,32 @@ describe('CensusApiService.parseResponse — GEOID composition', () => {
     expect(rows[0]?.geographyGeoid).toBe('53033000101' + '1');
   });
 
+  it('scopes a block group by its tract after the county in the in= clause', async () => {
+    queue([
+      ['NAME', 'B19013_001E', 'state', 'county', 'tract', 'block group'],
+      [
+        'Block Group 2; Census Tract 71.01; King County; Washington',
+        '136034',
+        '53',
+        '033',
+        '007101',
+        '2',
+      ],
+    ]);
+
+    const rows = await query('block group', {
+      geographyFips: '2',
+      parentFips: '53',
+      countyFips: '033',
+      tractFips: '007101',
+    });
+
+    expect(requestedUrls[0]).toContain(
+      '&for=block%20group%3A2&in=state:53%20county:033%20tract:007101&',
+    );
+    expect(rows.map((r) => r.geographyGeoid)).toEqual(['530330071012']);
+  });
+
   it('leaves a single-column level GEOID equal to its bare FIPS', async () => {
     queue([
       ['NAME', 'B19013_001E', 'zip code tabulation area'],
@@ -651,7 +677,12 @@ const geographyJson = {
 
 const check = (
   geographyLevel: string,
-  params: { geographyFips?: string; parentFips?: string; countyFips?: string } = {},
+  params: {
+    geographyFips?: string;
+    parentFips?: string;
+    countyFips?: string;
+    tractFips?: string;
+  } = {},
 ) =>
   service.checkGeography(
     {
@@ -661,6 +692,7 @@ const check = (
       geographyFips: params.geographyFips ?? '*',
       ...(params.parentFips !== undefined && { parentFips: params.parentFips }),
       ...(params.countyFips !== undefined && { countyFips: params.countyFips }),
+      ...(params.tractFips !== undefined && { tractFips: params.tractFips }),
     },
     createMockContext(),
   );
@@ -805,6 +837,59 @@ describe('CensusApiService.checkGeography', () => {
       status: 'parent_required',
       missingParents: ['state'],
     });
+  });
+
+  describe('a tract scope', () => {
+    const bgScope = { parentFips: '53', countyFips: '033', tractFips: '007101' };
+
+    it('satisfies the tract parent a single block group needs', async () => {
+      await expect(check('block group', { ...bgScope, geographyFips: '2' })).resolves.toEqual({
+        status: 'ok',
+        acceptedParents: ['state', 'county', 'tract'],
+      });
+    });
+
+    it('narrows a wildcard block-group query to one tract', async () => {
+      await expect(check('block group', bgScope)).resolves.toEqual({
+        status: 'ok',
+        acceptedParents: ['state', 'county', 'tract'],
+      });
+    });
+
+    it.each(['2', '*'])('requires the county a tract sits in (block group %s)', async (fips) => {
+      await expect(
+        check('block group', { geographyFips: fips, parentFips: '53', tractFips: '007101' }),
+      ).resolves.toEqual({
+        status: 'parent_required',
+        missingParents: ['county'],
+        wildcardRelaxes: false,
+      });
+    });
+
+    /** Upstream answers `county:* tract:007101` with HTTP 400 "wildcard mismatch". */
+    it('requires a concrete county, not "*", under a tract scope', async () => {
+      await expect(
+        check('block group', { ...bgScope, countyFips: '*', geographyFips: '2' }),
+      ).resolves.toEqual({
+        status: 'parent_required',
+        missingParents: ['county'],
+        wildcardRelaxes: false,
+      });
+    });
+
+    it.each([
+      ['tract', bgScope, ['state', 'county']],
+      ['county', { parentFips: '53', tractFips: '007101' }, ['state']],
+    ])(
+      'rejects a tract scope on the %s level, which does not sit in a tract',
+      async (level, scope, accepted) => {
+        await expect(check(level, scope)).resolves.toEqual({
+          status: 'parent_not_accepted',
+          unacceptedParents: ['tract'],
+          acceptedParents: accepted,
+        });
+      },
+    );
   });
 
   it('defers to the data call when the dataset+year has no geography metadata', async () => {

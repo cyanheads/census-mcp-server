@@ -1698,3 +1698,224 @@ describe('census_compare_geographies refuses a ranking it cannot make', () => {
     expect(calls).toHaveLength(0);
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// #42 — a tract scope reaches one block group
+// ---------------------------------------------------------------------------------------------
+
+describe('census_query_data scopes block groups by tract_fips', () => {
+  /** King County block groups, two to a tract, answered the way the Census API scopes them. */
+  const kingTracts = Array.from({ length: 40 }, (_, i) => String(100 + i * 100).padStart(6, '0'));
+  const blockGroups = [...kingTracts, '007101'].flatMap((tract) => [`${tract}1`, `${tract}2`]);
+
+  const serveBlockGroups = () => {
+    routes.push({
+      match: (u) => u.pathname === `${at('acs/acs5', 2024)}/variables.json`,
+      respond: () => ({ variables: acsVariables }),
+    });
+    routes.push({
+      match: (u) => u.pathname === `${at('acs/acs5', 2024)}/geography.json`,
+      respond: () => ({
+        fips: [
+          { name: 'state', geoLevelDisplay: '040' },
+          {
+            name: 'county',
+            geoLevelDisplay: '050',
+            requires: ['state'],
+            wildcard: ['state'],
+            optionalWithWCFor: 'state',
+          },
+          {
+            name: 'tract',
+            geoLevelDisplay: '140',
+            requires: ['state', 'county'],
+            wildcard: ['county'],
+            optionalWithWCFor: 'county',
+          },
+          {
+            name: 'block group',
+            geoLevelDisplay: '150',
+            requires: ['state', 'county', 'tract'],
+            wildcard: ['county', 'tract'],
+            optionalWithWCFor: 'tract',
+          },
+        ],
+      }),
+    });
+    serveData('acs/acs5', 2024, (url) => {
+      const header = getList(url);
+      const target = url.searchParams.get('for')?.split(':')[1] ?? '*';
+      const tract = /tract:(\d{6})/.exec(url.searchParams.get('in') ?? '')?.[1];
+      const pick = blockGroups.filter(
+        (bg) => (!tract || bg.startsWith(tract)) && (target === '*' || bg.endsWith(target)),
+      );
+      return [
+        [...header, 'state', 'county', 'tract', 'block group'],
+        ...pick.map((bg) => [
+          ...header.map((h) =>
+            h === 'NAME'
+              ? `Block Group ${bg.slice(6)}; Census Tract ${Number(bg.slice(0, 6)) / 100}; King County; Washington`
+              : bg === '0071012'
+                ? '136034'
+                : '1000',
+          ),
+          '53',
+          '033',
+          bg.slice(0, 6),
+          bg.slice(6),
+        ]),
+      ];
+    });
+  };
+
+  const kingBlockGroups = (overrides: Record<string, unknown> = {}) => ({
+    variables: ['B19013_001E'],
+    geography_level: 'block group',
+    geography_fips: '2',
+    parent_fips: '53',
+    county_fips: '033',
+    tract_fips: '007101',
+    ...overrides,
+  });
+
+  it('returns the one block group a tract scope names, on both surfaces', async () => {
+    serveBlockGroups();
+
+    const result = await runToolContract(censusQueryData, kingBlockGroups());
+
+    expect(result.isError).toBeFalsy();
+    const out = paged(result);
+    expect(out.rows.map((r) => r.geography_geoid)).toEqual(['530330071012']);
+    expect(out.rows[0]?.variables.B19013_001E?.estimate).toBe(136034);
+    expect(out.totalCount).toBe(1);
+    expect(dataCalls('acs/acs5', 2024)[0]?.searchParams.get('in')).toBe(
+      'state:53 county:033 tract:007101',
+    );
+    const text = textOf(result);
+    expect(text).toContain('`530330071012`');
+    expect(text).toContain('136,034');
+  });
+
+  it('returns every block group in the tract for "*"', async () => {
+    serveBlockGroups();
+
+    const out = paged(
+      await runToolContract(censusQueryData, kingBlockGroups({ geography_fips: '*' })),
+    );
+
+    expect(out.rows.map((r) => r.geography_geoid)).toEqual(['530330071011', '530330071012']);
+    expect(out.truncated).toBe(false);
+  });
+
+  it('answers an offset past the tract with no rows and no narrower scope to offer', async () => {
+    serveBlockGroups();
+
+    const result = await runToolContract(
+      censusQueryData,
+      kingBlockGroups({ geography_fips: '*', offset: 5 }),
+    );
+
+    expect(result.isError).toBeFalsy();
+    const out = paged(result);
+    expect(out.rows).toEqual([]);
+    expect(out.totalCount).toBe(2);
+    expect(out.notice).toContain('offset 5');
+    expect(out.notice).toMatch(/offset below 2/);
+    expect(out.notice).not.toContain('narrow the scope');
+    expect(dataCalls('acs/acs5', 2024)[0]?.searchParams.get('in')).toBe(
+      'state:53 county:033 tract:007101',
+    );
+    expect(textOf(result)).toContain('**0 geography rows**');
+  });
+
+  it.each([
+    ['omitted', {}],
+    ['"*"', { county_fips: '*' }],
+  ])(
+    'refuses a tract scope whose county_fips is %s with parent_required, before the data call',
+    async (_label, county) => {
+      serveBlockGroups();
+      const { county_fips: _drop, ...scope } = kingBlockGroups();
+
+      const result = await runToolContract(censusQueryData, { ...scope, ...county });
+
+      expect(result.isError).toBe(true);
+      const error = errorOf(result);
+      expect(error.data.reason).toBe('parent_required');
+      expect(error.data.missingParents).toEqual(['county']);
+      expect(String((error.data.recovery as { hint: string }).hint)).toContain('county_fips');
+      expect(textOf(result)).toContain('county_fips');
+      expect(dataCalls('acs/acs5', 2024)).toHaveLength(0);
+    },
+  );
+
+  it.each([
+    ['tract', '007101'],
+    ['county', '033'],
+  ])('refuses tract_fips on the %s level with parent_not_accepted', async (level, fips) => {
+    serveBlockGroups();
+
+    const result = await runToolContract(
+      censusQueryData,
+      kingBlockGroups({
+        geography_level: level,
+        geography_fips: fips,
+        ...(level === 'county' && { county_fips: '' }),
+      }),
+    );
+
+    expect(result.isError).toBe(true);
+    const error = errorOf(result);
+    expect(error.data.reason).toBe('parent_not_accepted');
+    expect(error.data.unacceptedParents).toEqual(['tract']);
+    expect(textOf(result)).toContain('Drop tract_fips');
+    expect(dataCalls('acs/acs5', 2024)).toHaveLength(0);
+  });
+
+  it('names tract_fips, not the wildcard, when a single block group has no tract', async () => {
+    serveBlockGroups();
+
+    const result = await runToolContract(censusQueryData, kingBlockGroups({ tract_fips: '' }));
+
+    const error = errorOf(result);
+    expect(error.data.reason).toBe('parent_required');
+    expect(error.data.missingParents).toEqual(['tract']);
+    expect(textOf(result)).toContain('tract_fips');
+    expect(textOf(result)).not.toContain('geography_fips to "*"');
+  });
+
+  it('offers tract_fips as a narrowing scope when a county-wide list is truncated', async () => {
+    serveBlockGroups();
+
+    const out = paged(
+      await runToolContract(
+        censusQueryData,
+        kingBlockGroups({ geography_fips: '*', tract_fips: '' }),
+      ),
+    );
+
+    expect(out.totalCount).toBe(blockGroups.length);
+    expect(out.truncated).toBe(true);
+    expect(out.notice).toContain('narrow the scope with tract_fips');
+    expect(out.notice).not.toContain('county_fips');
+  });
+
+  it('never offers tract_fips once the tract is set, or while the county is open', async () => {
+    serveBlockGroups();
+
+    const statewide = paged(
+      await runToolContract(
+        censusQueryData,
+        kingBlockGroups({ geography_fips: '*', county_fips: '*', tract_fips: '' }),
+      ),
+    );
+    expect(statewide.notice).toContain('narrow the scope with county_fips');
+    expect(statewide.notice).not.toContain('tract_fips');
+
+    const oneTract = paged(
+      await runToolContract(censusQueryData, kingBlockGroups({ geography_fips: '*', limit: 1 })),
+    );
+    expect(oneTract.truncated).toBe(true);
+    expect(oneTract.notice).not.toContain('narrow the scope');
+  });
+});

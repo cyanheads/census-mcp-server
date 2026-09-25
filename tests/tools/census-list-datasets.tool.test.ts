@@ -249,6 +249,80 @@ describe('censusListDatasets', () => {
     );
   });
 
+  it.each([
+    ['dec/dhc', [2020]],
+    ['dec/dp', [2020]],
+    ['dec/sdhc', [2020]],
+    [
+      'acs/acs1/subject',
+      [2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024],
+    ],
+    ['acs/acs5/cprofile', [2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024]],
+    [
+      'acs/acs1/cprofile',
+      [2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024],
+    ],
+    ['acs/acsse', [2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024]],
+    [
+      'acs/acs1/spp',
+      [2009, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024],
+    ],
+  ])('lists %s with the vintages it serves, on both surfaces (#43, #52)', async (id, years) => {
+    const result = await censusListDatasets.handler(
+      censusListDatasets.input.parse({}),
+      createMockContext(),
+    );
+    const entry = result.datasets.find((d) => d.dataset_id === id);
+
+    expect(entry?.available_years).toEqual(years);
+    const text = (censusListDatasets.format!(result)[0] as { text: string }).text;
+    expect(text).toContain(`**ID:** \`${id}\``);
+    expect(text).toContain(`**Years:** ${years.join(', ')}`);
+  });
+
+  /** The dec/ddhca entry used to carry dec/dhc's title, so the two read as the same product. */
+  it('names dec/dhc and dec/ddhca as two different files (#43)', async () => {
+    const result = await censusListDatasets.handler(
+      censusListDatasets.input.parse({}),
+      createMockContext(),
+    );
+    const name = (id: string) => result.datasets.find((d) => d.dataset_id === id)?.name;
+
+    expect(name('dec/ddhca')).toBe(
+      'Detailed Demographic and Housing Characteristics File A (DDHC-A)',
+    );
+    expect(name('dec/dhc')).toContain('Demographic and Housing Characteristics');
+    expect(name('dec/dhc')).not.toBe(name('dec/ddhca'));
+    expect(new Set(result.datasets.map((d) => d.name)).size).toBe(result.datasets.length);
+  });
+
+  it('says the comparison profiles carry no margins of error (#52)', async () => {
+    for (const id of ['acs/acs5/cprofile', 'acs/acs1/cprofile']) {
+      expect(await descriptionOf(id)).toMatch(/no margins? of error/i);
+    }
+  });
+
+  it('names the acs/acs1/spp default, the group lookup, and the vintages left out (#52)', async () => {
+    const description = await descriptionOf('acs/acs1/spp');
+
+    expect(description).toContain('POPGROUP');
+    expect(description).toContain('Total population');
+    expect(description).toContain('census_list_predicate_values');
+    expect(description).toContain('2008');
+    expect(description).toContain('2010');
+  });
+
+  it('says acs/acsse reaches smaller geographies than the 1-year estimates (#52)', async () => {
+    expect(await descriptionOf('acs/acsse')).toContain('20,000');
+  });
+
+  it('carries the 65,000 population restriction and missing 2020 on acs/acs1/subject (#43)', async () => {
+    const description = await descriptionOf('acs/acs1/subject');
+
+    expect(description).toContain('65,000');
+    expect(description).toContain('2020');
+  });
+
   it('includes dec/pl dataset with correct years', async () => {
     const ctx = createMockContext();
     const result = await censusListDatasets.handler(censusListDatasets.input.parse({}), ctx);

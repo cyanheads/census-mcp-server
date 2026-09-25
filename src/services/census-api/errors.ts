@@ -22,6 +22,26 @@ export function formatYears(years: number[]): string {
   return runs.map(([start, end]) => (start === end ? `${start}` : `${start}-${end}`)).join(', ');
 }
 
+/** Most levels a `geography_not_supported` message spells out; `acs/acs5` publishes 65. */
+const LEVELS_NAMED_LIMIT = 12;
+
+/**
+ * Message for a geography level a dataset and vintage do not publish. A short level list is
+ * spelled out, so a caller that sees only the text answer can retry without another call; a
+ * long one is counted and left to `census_list_geographies`.
+ */
+export function levelNotSupportedMessage(
+  level: string,
+  dataset: string,
+  year: number,
+  availableLevels: string[],
+): string {
+  const head = `Geography level "${level}" does not exist in ${dataset} (${year}).`;
+  return availableLevels.length <= LEVELS_NAMED_LIMIT
+    ? `${head} Available levels: ${availableLevels.join(', ')}.`
+    : `${head} It publishes ${availableLevels.length} geography levels; census_list_geographies lists them.`;
+}
+
 /**
  * The vintage a query named is not one this server can query the dataset for.
  *

@@ -1919,3 +1919,174 @@ describe('census_query_data scopes block groups by tract_fips', () => {
     expect(oneTract.notice).not.toContain('narrow the scope');
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// #43, #52 — added datasets
+// ---------------------------------------------------------------------------------------------
+
+describe('the added datasets answer on both surfaces', () => {
+  /**
+   * acs/acs1/spp 2012 through 2017 label POPGROUP through POPGROUP_TTL. Requesting it is what names
+   * the default the API applied when the query leaves POPGROUP unset.
+   */
+  it('census_query_data names the acs/acs1/spp POPGROUP default through POPGROUP_TTL (#52)', async () => {
+    serveMetadata('acs/acs1/spp', 2012, {
+      S0201_001E: {
+        label: 'Estimate!!TOTAL NUMBER OF RACES REPORTED!!Total population',
+        concept: 'SELECTED POPULATION PROFILE IN THE UNITED STATES',
+        predicateType: 'int',
+        group: 'S0201',
+      },
+      POPGROUP: {
+        label: 'Race/Ethnic Group',
+        required: 'default displayed',
+        predicateType: 'string',
+        group: 'S0201PR,S0201',
+        attributes: 'POPGROUP_TTL',
+      },
+      GEOCOMP: {
+        label: 'GEO_ID Component',
+        required: 'default displayed',
+        predicateType: 'string',
+      },
+    });
+    serveData('acs/acs1/spp', 2012, () => [
+      ['NAME', 'S0201_001E', 'POPGROUP_TTL', 'state'],
+      ['Washington', '6897012', 'Total population', '53'],
+    ]);
+
+    const result = await runToolContract(censusQueryData, {
+      variables: ['S0201_001E'],
+      geography_level: 'state',
+      geography_fips: '53',
+      dataset: 'acs/acs1/spp',
+      year: 2012,
+    });
+
+    expect(getList(dataCalls('acs/acs1/spp', 2012)[0])).toContain('POPGROUP_TTL');
+    const [row] = structured(result).rows;
+    expect(row?.variables.S0201_001E?.estimate).toBe(6897012);
+    expect(row?.applied_filters).toEqual({ POPGROUP: 'Total population' });
+    expect(structured(result).notice).toContain(
+      'POPGROUP (Race/Ethnic Group) — the API applied "Total population"',
+    );
+    const text = textOf(result);
+    expect(text).toContain('**Applied filter defaults:** POPGROUP = Total population');
+    expect(text).toContain('6,897,012');
+  });
+
+  /** The comparison profiles publish no margins, but keep the ACS sentinel meanings. */
+  it('census_query_data decodes an acs/acs1/cprofile sentinel with its ACS meaning (#52)', async () => {
+    serveMetadata('acs/acs1/cprofile', 2024, {
+      CP03_2020_062E: {
+        label: '2020 Estimates!!Median household income (dollars)',
+        concept: 'Comparative Economic Characteristics',
+        predicateType: 'int',
+        group: 'CP03',
+      },
+      GEOCOMP: {
+        label: 'GEO_ID Component',
+        required: 'default displayed',
+        predicateType: 'string',
+      },
+    });
+    serveData('acs/acs1/cprofile', 2024, () => [
+      ['NAME', 'CP03_2020_062E', 'state'],
+      ['Washington', '-888888888', '53'],
+    ]);
+
+    const result = await runToolContract(censusQueryData, {
+      variables: ['CP03_2020_062E'],
+      geography_level: 'state',
+      geography_fips: '53',
+      dataset: 'acs/acs1/cprofile',
+    });
+
+    const value = structured(result).rows[0]?.variables.CP03_2020_062E;
+    expect(value).toMatchObject({
+      estimate: null,
+      suppressed: true,
+      suppression_reason: 'Not applicable or not available',
+    });
+    expect(textOf(result)).toContain('Not applicable or not available');
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// #32 — dataset-code case and shorthand
+// ---------------------------------------------------------------------------------------------
+
+describe('a dataset code resolves regardless of case, padding, or a bare acs5/acs1', () => {
+  const serveWashington = () => {
+    serveMetadata('acs/acs5', 2024, acsVariables);
+    serveData('acs/acs5', 2024, () => [
+      ['NAME', 'B19013_001E', 'state'],
+      ['Washington', '103748', '53'],
+    ]);
+  };
+
+  const enrichmentOf = (result: { structuredContent?: unknown }) =>
+    result.structuredContent as { dataset?: string; year?: number };
+
+  it.each(['acs5', 'ACS5', 'ACS/ACS5', ' acs5 '])(
+    'census_query_data resolves %j to acs/acs5 and echoes the canonical code',
+    async (dataset) => {
+      serveWashington();
+
+      const result = await runToolContract(censusQueryData, {
+        variables: ['B19013_001E'],
+        geography_level: 'state',
+        geography_fips: '53',
+        dataset,
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(dataCalls('acs/acs5', 2024)).toHaveLength(1);
+      expect(enrichmentOf(result)).toMatchObject({ dataset: 'acs/acs5', year: 2024 });
+      expect(textOf(result)).toContain('acs/acs5');
+    },
+  );
+
+  it.each(['acs5', 'ACS5', 'ACS/ACS5', ' acs5 '])(
+    'census_compare_geographies resolves %j to acs/acs5 and echoes the canonical code',
+    async (dataset) => {
+      serveWashington();
+
+      const result = await runToolContract(censusCompareGeographies, {
+        variables: ['B19013_001E'],
+        geography_level: 'state',
+        dataset,
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(dataCalls('acs/acs5', 2024)).toHaveLength(1);
+      expect(enrichmentOf(result)).toMatchObject({ dataset: 'acs/acs5', year: 2024 });
+    },
+  );
+
+  it.each([
+    ['census_query_data', censusQueryData, { geography_fips: '53' }],
+    ['census_compare_geographies', censusCompareGeographies, {}],
+  ] as const)(
+    '%s names both profile datasets for a bare "profile", before any request',
+    async (_name, definition, scope) => {
+      const result = await runToolContract(
+        definition as typeof censusQueryData,
+        {
+          variables: ['B19013_001E'],
+          geography_level: 'state',
+          dataset: 'profile',
+          ...scope,
+        } as never,
+      );
+
+      const error = errorOf(result);
+      expect(error.code).toBe(JsonRpcErrorCode.NotFound);
+      expect(error.data).toMatchObject({ reason: 'dataset_not_found' });
+      const text = textOf(result);
+      expect(text).toContain('acs/acs5/profile');
+      expect(text).toContain('acs/acs1/profile');
+      expect(calls).toHaveLength(0);
+    },
+  );
+});

@@ -526,9 +526,28 @@ describe('censusCompareGeographies', () => {
     });
     await expect(censusCompareGeographies.handler(input, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.ValidationError,
+      message: expect.stringContaining('Available levels: us, state, county.'),
       data: { reason: 'geography_not_supported', availableLevels: ['us', 'state', 'county'] },
     });
     expect(mockQueryData).not.toHaveBeenCalled();
+  });
+
+  it('names a long level list by count instead of spelling it out in the message', async () => {
+    const availableLevels = Array.from({ length: 13 }, (_, i) => `level ${i}`);
+    mockCheckGeography.mockResolvedValue({ status: 'level_not_supported', availableLevels });
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'tract',
+      dataset: 'acs/acs1',
+    });
+    const error = await Promise.resolve(censusCompareGeographies.handler(input, ctx)).catch(
+      (e: unknown) => e,
+    );
+    expect((error as Error).message).toContain('13 geography levels');
+    expect((error as Error).message).not.toContain('level 0');
+    expect(error).toMatchObject({ data: { availableLevels } });
   });
 
   it('no_data recovery does not tell an acs/acs5 caller to switch to acs/acs5', async () => {

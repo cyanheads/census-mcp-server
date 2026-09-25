@@ -15,8 +15,8 @@ import type { CensusPredicateValue } from '@/services/census-api/types.js';
 import {
   DATASET_LATEST_YEARS,
   getVariableCacheService,
-  KNOWN_DATASETS,
   NON_FILTERING_PREDICATES,
+  resolveDataset,
 } from '@/services/variable-cache/variable-cache-service.js';
 
 /** Filter dimensions carrying an industry classification, whose value scopes the others. */
@@ -74,12 +74,12 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
     predicate: z
       .string()
       .describe(
-        'Filter dimension code to enumerate (e.g., "EMPSZES", "LFO", "POPGROUP", "NAICS2017"). Case-sensitive. The response notice of census_query_data names the dimensions a dataset declares, and census_search_variables finds them by keyword.',
+        'Filter dimension code to enumerate (e.g., "EMPSZES", "LFO", "POPGROUP", "NAICS2017"). Trimmed and uppercased, and the response echoes that spelling. The response notice of census_query_data names the dimensions a dataset declares, and census_search_variables finds them by keyword.',
       ),
     dataset: z
       .string()
       .describe(
-        'Dataset the dimension belongs to (e.g., "cbp", "nonemp", "ecnbasic", "dec/ddhca", "pep/charv"). Use census_list_datasets to discover valid values. Dimension codes are vintage-specific, so the dataset and year must match the query the values are for.',
+        'Dataset the dimension belongs to (e.g., "cbp", "nonemp", "ecnbasic", "dec/ddhca", "pep/charv", "acs/acs1/spp"). Use census_list_datasets to discover valid values. Case is ignored, and a two-part code can be given by its last part alone — "ddhca" is dec/ddhca, "charv" is pep/charv. Three-part codes such as acs/acs1/spp must be given in full. The response echoes the resolved code. Dimension codes are vintage-specific, so the dataset and year must match the query the values are for.',
       ),
     year: z
       .number()
@@ -160,7 +160,8 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
     {
       reason: 'dataset_not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'Dataset code is not recognized.',
+      when: 'Dataset code is missing or not recognized, even after case and shorthand resolution.',
+      thrownBy: 'service',
       recovery: 'Call census_list_datasets to discover valid dataset codes like cbp or nonemp.',
     },
     {
@@ -204,18 +205,12 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
   ],
 
   async handler(input, ctx) {
-    const dataset = input.dataset.trim();
-    if (!KNOWN_DATASETS.has(dataset)) {
-      throw ctx.fail('dataset_not_found', `Unknown dataset: "${dataset}".`, {
-        dataset,
-        ...ctx.recoveryFor('dataset_not_found'),
-      });
-    }
-
+    const dataset = resolveDataset(input.dataset);
     const { defaultYear } = getDiscoveryConfig();
     const year = input.year ?? DATASET_LATEST_YEARS[dataset] ?? defaultYear;
     const limit = input.limit ?? 50;
-    const predicate = input.predicate.trim();
+    // Every supported dataset names its dimensions in uppercase, as the data tools assume.
+    const predicate = input.predicate.trim().toUpperCase();
 
     ctx.log.info('Listing predicate values', { predicate, dataset, year });
 
@@ -329,7 +324,7 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
     }
     if (withheld.length > 0) {
       notices.push(
-        `${dataset} (${year}) declares ${withheld.length + all.length} ${predicate} codes and publishes rows for ${all.length} of them; only those are listed. The rest belong to the wider classification the value map is shared from and return nothing at any geography. A single geography, or a more detailed table, can publish fewer still.`,
+        `${dataset} (${year}) declares ${(withheld.length + all.length).toLocaleString('en-US')} ${predicate} codes and publishes rows for ${all.length.toLocaleString('en-US')} of them; only those are listed. The rest belong to the wider classification the value map is shared from and return nothing at any geography. A single geography, or a more detailed table, can publish fewer still.`,
       );
     } else if (unchecked === 'per_industry') {
       notices.push(
@@ -342,7 +337,7 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
     }
     if (truncated) {
       notices.push(
-        `Showing ${values.length} of ${matched.length} codes. Narrow with query${limit < 500 ? ', or raise limit (max 500)' : ' to reach the rest'}.`,
+        `Showing ${values.length} of ${matched.length.toLocaleString('en-US')} codes. Narrow with query${limit < 500 ? ', or raise limit (max 500)' : ' to reach the rest'}.`,
       );
     } else if (matched.length === 0) {
       // A keyword that matches only withheld codes is the sharpest version of this dimension's

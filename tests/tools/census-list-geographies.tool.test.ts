@@ -12,9 +12,9 @@ vi.mock('@/services/census-api/census-api-service.js', () => ({
   getCensusApiService: vi.fn(),
 }));
 
-vi.mock('@/services/variable-cache/variable-cache-service.js', () => ({
-  DATASET_LATEST_YEARS: { 'acs/acs5': 2024 },
-  KNOWN_DATASETS: new Set(['acs/acs5', 'acs/acs1', 'acs/acs5/profile', 'dec/pl']),
+vi.mock('@/services/variable-cache/variable-cache-service.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/services/variable-cache/variable-cache-service.js')>()),
+  DATASET_LATEST_YEARS: { 'acs/acs5': 2024, 'dec/pl': 2020 },
 }));
 
 vi.mock('@/config/server-config.js', () => ({
@@ -63,6 +63,54 @@ describe('censusListGeographies', () => {
     await expect(censusListGeographies.handler(input, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.NotFound,
       data: { reason: 'dataset_not_found' },
+    });
+  });
+
+  /** The only tool of the six that took its dataset untrimmed (#32). */
+  it.each(['acs5', 'ACS5', 'ACS/ACS5', ' acs5 ', ' acs/acs5 '])(
+    'resolves %j to acs/acs5 and echoes the canonical code (#32)',
+    async (dataset) => {
+      mockFetchGeographyLevels.mockResolvedValue([
+        { name: 'state', geoLevelDisplay: '040', requires: [] },
+      ]);
+
+      const ctx = createMockContext({ errors: censusListGeographies.errors });
+      await censusListGeographies.handler(censusListGeographies.input.parse({ dataset }), ctx);
+
+      expect(mockFetchGeographyLevels).toHaveBeenCalledWith('acs/acs5', 2024, expect.anything());
+      expect(getEnrichment(ctx)).toMatchObject({ dataset: 'acs/acs5', year: 2024 });
+    },
+  );
+
+  it('takes its default year from the resolved code (#32)', async () => {
+    mockFetchGeographyLevels.mockResolvedValue([
+      { name: 'state', geoLevelDisplay: '040', requires: [] },
+    ]);
+
+    const ctx = createMockContext({ errors: censusListGeographies.errors });
+    await censusListGeographies.handler(censusListGeographies.input.parse({ dataset: 'PL' }), ctx);
+
+    expect(mockFetchGeographyLevels).toHaveBeenCalledWith('dec/pl', 2020, expect.anything());
+  });
+
+  it('rejects a blank dataset as a missing code, before any request (#32)', async () => {
+    const ctx = createMockContext({ errors: censusListGeographies.errors });
+    const input = censusListGeographies.input.parse({ dataset: '  ' });
+
+    await expect(censusListGeographies.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      message: expect.stringMatching(/no dataset code/i),
+      data: { reason: 'dataset_not_found' },
+    });
+    expect(mockFetchGeographyLevels).not.toHaveBeenCalled();
+  });
+
+  it('names both profile datasets for a bare "profile" (#32)', async () => {
+    const ctx = createMockContext({ errors: censusListGeographies.errors });
+    const input = censusListGeographies.input.parse({ dataset: 'profile' });
+
+    await expect(censusListGeographies.handler(input, ctx)).rejects.toMatchObject({
+      message: expect.stringMatching(/acs\/acs5\/profile and acs\/acs1\/profile/),
     });
   });
 

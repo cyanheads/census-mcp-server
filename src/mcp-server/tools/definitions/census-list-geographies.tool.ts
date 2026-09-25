@@ -9,7 +9,7 @@ import { getDiscoveryConfig } from '@/config/server-config.js';
 import { getCensusApiService } from '@/services/census-api/census-api-service.js';
 import {
   DATASET_LATEST_YEARS,
-  KNOWN_DATASETS,
+  resolveDataset,
 } from '@/services/variable-cache/variable-cache-service.js';
 
 export const censusListGeographies = tool('census_list_geographies', {
@@ -21,7 +21,7 @@ export const censusListGeographies = tool('census_list_geographies', {
     dataset: z
       .string()
       .describe(
-        'Dataset code (e.g., "acs/acs5", "acs/acs1"). Use census_list_datasets to discover valid values.',
+        'Dataset code (e.g., "acs/acs5", "acs/acs1"). Use census_list_datasets to discover valid values. Case is ignored, and a two-part code can be given by its last part alone — "acs5" is acs/acs5, "pl" is dec/pl. Three-part codes such as acs/acs5/profile must be given in full. The response echoes the resolved code.',
       ),
     year: z
       .number()
@@ -67,7 +67,8 @@ export const censusListGeographies = tool('census_list_geographies', {
     {
       reason: 'dataset_not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'Dataset code is not recognized.',
+      when: 'Dataset code is missing or not recognized, even after case and shorthand resolution.',
+      thrownBy: 'service',
       recovery: 'Call census_list_datasets to discover valid dataset codes like acs/acs5.',
     },
     {
@@ -79,30 +80,21 @@ export const censusListGeographies = tool('census_list_geographies', {
   ],
 
   async handler(input, ctx) {
-    if (!KNOWN_DATASETS.has(input.dataset)) {
-      throw ctx.fail('dataset_not_found', `Unknown dataset: "${input.dataset}"`, {
-        ...ctx.recoveryFor('dataset_not_found'),
-      });
-    }
-
+    const dataset = resolveDataset(input.dataset);
     const { defaultYear } = getDiscoveryConfig();
-    const year = input.year ?? DATASET_LATEST_YEARS[input.dataset] ?? defaultYear;
+    const year = input.year ?? DATASET_LATEST_YEARS[dataset] ?? defaultYear;
 
-    ctx.log.info('Listing geography levels', { dataset: input.dataset, year });
+    ctx.log.info('Listing geography levels', { dataset, year });
 
     const service = getCensusApiService();
-    const levels = await service.fetchGeographyLevels(input.dataset, year, ctx);
+    const levels = await service.fetchGeographyLevels(dataset, year, ctx);
 
     if (levels.length === 0) {
-      throw ctx.fail(
-        'year_not_available',
-        `No geography data found for ${input.dataset} (${year})`,
-        {
-          dataset: input.dataset,
-          year,
-          ...ctx.recoveryFor('year_not_available'),
-        },
-      );
+      throw ctx.fail('year_not_available', `No geography data found for ${dataset} (${year})`, {
+        dataset,
+        year,
+        ...ctx.recoveryFor('year_not_available'),
+      });
     }
 
     const result = levels.map((level) => {
@@ -130,7 +122,7 @@ export const censusListGeographies = tool('census_list_geographies', {
       };
     });
 
-    ctx.enrich({ dataset: input.dataset, year, totalLevels: result.length });
+    ctx.enrich({ dataset, year, totalLevels: result.length });
 
     return { geography_levels: result };
   },

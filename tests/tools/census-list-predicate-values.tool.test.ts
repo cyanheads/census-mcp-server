@@ -265,6 +265,26 @@ describe('censusListPredicateValues — dimensions with a published value list',
     expect(enrichment.notice).toContain('declares 3 POPGROUP codes and publishes rows for 2');
   });
 
+  it('groups the thousands in the declared and published counts', async () => {
+    const codes = Array.from({ length: 5545 }, (_, i) => String(1000 + i));
+    mockFindVariable.mockResolvedValue({
+      ...popgroup,
+      values: Object.fromEntries(codes.map((code) => [code, `Group ${code}`])),
+    });
+    mockFindPublicationProbe.mockResolvedValue('T01001_001N');
+    mockFetchPredicateValues.mockResolvedValue(codes.slice(0, 1200).map((code) => ({ code })));
+
+    const ctx = createMockContext({ errors: censusListPredicateValues.errors });
+    await censusListPredicateValues.handler(
+      call({ predicate: 'POPGROUP', dataset: 'dec/ddhca' }),
+      ctx,
+    );
+
+    expect(getEnrichment(ctx).notice).toContain(
+      'declares 5,545 POPGROUP codes and publishes rows for 1,200',
+    );
+  });
+
   /**
    * The reported failure in full: a caller searching for the total finds a code named exactly
    * that, queries it, and gets nothing back. Suppressing the code is only half an answer — the
@@ -429,7 +449,7 @@ describe('censusListPredicateValues — dimensions with a published value list',
 
     expect(result.values).toHaveLength(500);
     const notice = getEnrichment(ctx).notice as string;
-    expect(notice).toContain('Showing 500 of 2003');
+    expect(notice).toContain('Showing 500 of 2,003');
     expect(notice).toContain('Narrow with query');
     expect(notice).not.toMatch(/raise limit/i);
   });

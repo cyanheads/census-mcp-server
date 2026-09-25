@@ -43,6 +43,36 @@ const DATASETS = [
       'ACS 1-year data profiles with DP-prefix codes. Same coverage restriction as ACS1 (65K+ population geographies only).',
   },
   {
+    datasetId: 'acs/acs1/subject',
+    name: 'ACS 1-Year Subject Tables',
+    description:
+      'ACS 1-year subject tables with S-prefix codes, organized by topic (income, poverty, education, housing). Same coverage restriction as ACS1 (geographies with 65,000+ population only), and no 2020 vintage, since the 2020 ACS1 was not released.',
+  },
+  {
+    datasetId: 'acs/acs5/cprofile',
+    name: 'ACS 5-Year Comparison Profiles',
+    description:
+      "ACS 5-year profile lines for the latest period beside the non-overlapping period five years earlier, with CP-prefix codes whose middle segment names the end year of the period — CP03_2024_062E is 2020–2024 median household income and CP03_2019_062E the same line for 2015–2019, both in the vintage year's dollars. The comparison profiles publish no margins of error: no M code exists for any estimate. Geography levels are us, state, county, place, and metropolitan/micropolitan statistical area, with no tract level.",
+  },
+  {
+    datasetId: 'acs/acs1/cprofile',
+    name: 'ACS 1-Year Comparison Profiles',
+    description:
+      'ACS 1-year profile lines for the vintage year beside the four years before it, with CP-prefix codes whose middle segment names the year — CP03_2024_062E is 2024 median household income. The 2020 columns come back as not applicable, since the 2020 ACS1 was not released. The comparison profiles publish no margins of error: no M code exists for any estimate. Same coverage restriction as ACS1 (geographies with 65,000+ population only).',
+  },
+  {
+    datasetId: 'acs/acsse',
+    name: 'ACS 1-Year Supplemental Estimates',
+    description:
+      'A small set of ACS 1-year tables with K-prefix codes (e.g., K200101_001E, total population by sex), published for geographies with 20,000+ population — smaller areas than the 1-year estimates reach, with far fewer tables. Estimates carry margins of error at the matching M code. No 2020 vintage.',
+  },
+  {
+    datasetId: 'acs/acs1/spp',
+    name: 'ACS 1-Year Selected Population Profiles',
+    description:
+      'ACS 1-year S0201 profiles (e.g., S0201_001E, total population) for one race, ethnic, ancestry, or tribal group at a time. Every value is scoped by the predicate POPGROUP, and a query that omits it is answered for "Total population" — each row names the group under applied_filters. census_list_predicate_values on POPGROUP finds a group code by keyword, such as "filipino". Coverage follows the 1-year estimates, and a group is published only where it is large enough. The 2008 and 2010 vintages exist upstream but are not listed: the Census API answers them with server errors.',
+  },
+  {
     datasetId: 'pep/charv',
     name: 'Population Estimates Program',
     description:
@@ -55,8 +85,26 @@ const DATASETS = [
       'Decennial Census population and housing unit counts used for congressional redistricting. Most granular geography coverage.',
   },
   {
+    datasetId: 'dec/dhc',
+    name: 'Decennial Census Demographic and Housing Characteristics File (DHC)',
+    description:
+      '2020 Census counts by age, sex, race, Hispanic origin, household type, and tenure, down to the block for many tables — the file for questions dec/pl cannot answer, such as population by age and sex for a tract (P12_001N is the total of that table). No filter dimension, so each geography comes back on one row.',
+  },
+  {
+    datasetId: 'dec/dp',
+    name: 'Decennial Census Demographic Profile',
+    description:
+      '2020 Census profile of population and housing characteristics. Each line is published as a count with the C suffix (DP1_0001C, total population) and a percent with the P suffix (DP1_0001P).',
+  },
+  {
+    datasetId: 'dec/sdhc',
+    name: 'Decennial Census Supplemental Demographic and Housing Characteristics File (S-DHC)',
+    description:
+      '2020 Census household and family characteristics for the nation and the states only — geography levels us and state. Each cell is published three ways: the estimated count in its COL1 code (e.g., PH7_COL1_R1, population in occupied housing units) and the low and high ends of its 90% interval in the matching COL2 and COL3 codes.',
+  },
+  {
     datasetId: 'dec/ddhca',
-    name: 'Decennial Census Demographic and Housing Characteristics',
+    name: 'Detailed Demographic and Housing Characteristics File A (DDHC-A)',
     description:
       'Detailed demographic and housing characteristics from the Decennial Census, published per detailed race and ethnic group. Every value is scoped by the predicate POPGROUP, and there is no code for all groups combined — the "Total population" code 001 that appears in the dataset dictionary returns nothing at any level. A query that omits POPGROUP is answered with one group the API picks rather than an error, so read the applied_filters label on each row before treating a number as a population total, and use dec/pl P1_001N when the total is what is wanted. census_list_predicate_values on POPGROUP finds a group code by keyword.',
   },
@@ -83,7 +131,7 @@ const DATASETS = [
 export const censusListDatasets = tool('census_list_datasets', {
   title: 'List Census Datasets',
   description:
-    'Browse available Census Bureau datasets with their supported vintage years. Use as the starting point when the right dataset is unknown — ACS5, ACS1, population estimates, decennial census, and the business datasets (County Business Patterns, Economic Census, Nonemployer Statistics) serve different use cases. Pass the dataset_id value to the dataset parameter in other census tools. Each description names the predicates a dataset requires and the geography levels it publishes, both of which vary by dataset.',
+    'Browse available Census Bureau datasets with their supported vintage years. Use as the starting point when the right dataset is unknown — ACS5, ACS1, and their profile, subject, and comparison tables, population estimates, the decennial census files, and the business datasets (County Business Patterns, Economic Census, Nonemployer Statistics) serve different use cases. Pass the dataset_id value to the dataset parameter in other census tools. Each description names the predicates a dataset requires and the geography levels it publishes, both of which vary by dataset.',
   annotations: { readOnlyHint: true, openWorldHint: false },
   input: z.object({
     filter: z
@@ -108,7 +156,7 @@ export const censusListDatasets = tool('census_list_datasets', {
             available_years: z
               .array(z.number())
               .describe(
-                'Vintage years this dataset can be queried for. Passing any other year to census_query_data, census_compare_geographies, or census_search_variables fails with year_not_available rather than returning data — the list is exhaustive, not a sample. It is narrower than what the Census API hosts: pep/charv publishes its 2020-2022 estimates inside the 2023 vintage under the YEAR filter, and the cbp and nonemp vintages left out reject the NAME column every query here sends.',
+                'Vintage years this dataset can be queried for. Passing any other year to census_query_data, census_compare_geographies, or census_search_variables fails with year_not_available rather than returning data — the list is exhaustive, not a sample. It is narrower than what the Census API hosts: pep/charv publishes its 2020-2022 estimates inside the 2023 vintage under the YEAR filter, the cbp and nonemp vintages left out reject the NAME column every query here sends, and the Census API answers the acs/acs1/spp 2008 and 2010 vintages with server errors.',
               ),
           })
           .describe('A single Census dataset entry.'),

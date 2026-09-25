@@ -21,6 +21,7 @@ import {
   padFips,
   planQueryColumns,
 } from '@/services/census-api/census-api-service.js';
+import { levelNotSupportedMessage } from '@/services/census-api/errors.js';
 import type { CensusDataRow, SuppliedParent } from '@/services/census-api/types.js';
 import {
   DATASET_LATEST_YEARS,
@@ -30,8 +31,8 @@ import {
   describeUnsetPredicates,
   flagColumnsFor,
   getVariableCacheService,
-  KNOWN_DATASETS,
   recordLabelColumnsFor,
+  resolveDataset,
   wildcardColumnsFor,
 } from '@/services/variable-cache/variable-cache-service.js';
 
@@ -112,13 +113,13 @@ function describePage(page: {
 export const censusQueryData = tool('census_query_data', {
   title: 'Query Census Data',
   description:
-    'Query a Census dataset for one or more variables at a specific geography. Accepts FIPS codes for the target geography — use census_resolve_geography to convert place names to FIPS when needed. On ACS datasets, labeled estimates and margin-of-error values are returned together, and the negative sentinel values the Census writes for an estimate or margin of error it cannot publish are decoded into the meanings the Census gives them rather than passed through as raw numbers. A value cbp, ecnbasic, or nonemp withheld is stored as 0 beside a flag, and is reported as withheld, with the meaning of its flag, rather than as a zero. Pass geography_fips as "*" for every geography at the level within the parent: rows come back in GEOID order, up to limit per call (default 50, max 500), with totalCount giving how many matched and offset reaching the rest — the order is not a ranking, so use census_compare_geographies to rank. On the business datasets (cbp, ecnbasic, nonemp), pep/charv, and dec/ddhca, use predicates to filter by industry, size class, or population group — a query that omits one is answered with a default the Census API picks, which is an all-categories total on some dimensions and a single category on others. Each row names the defaults that were applied in applied_filters, and census_list_predicate_values enumerates the codes a dimension accepts. One geography can also come back on more than one row: pep/charv publishes an April estimates base alongside its July estimate, and each row carries a record field saying which it is.',
+    'Query a Census dataset for one or more variables at a specific geography. Accepts FIPS codes for the target geography — use census_resolve_geography to convert place names to FIPS when needed. On ACS datasets, labeled estimates and margin-of-error values are returned together (the comparison profiles publish no margins), and the negative sentinel values the Census writes for an estimate or margin of error it cannot publish are decoded into the meanings the Census gives them rather than passed through as raw numbers. A value cbp, ecnbasic, or nonemp withheld is stored as 0 beside a flag, and is reported as withheld, with the meaning of its flag, rather than as a zero. Pass geography_fips as "*" for every geography at the level within the parent: rows come back in GEOID order, up to limit per call (default 50, max 500), with totalCount giving how many matched and offset reaching the rest — the order is not a ranking, so use census_compare_geographies to rank. On the business datasets (cbp, ecnbasic, nonemp), pep/charv, dec/ddhca, and acs/acs1/spp, use predicates to filter by industry, size class, or population group — a query that omits one is answered with a default the Census API picks, which is an all-categories total on some dimensions and a single category on others. Each row names the defaults that were applied in applied_filters, and census_list_predicate_values enumerates the codes a dimension accepts. One geography can also come back on more than one row: pep/charv publishes an April estimates base alongside its July estimate, and each row carries a record field saying which it is.',
   annotations: { readOnlyHint: true, openWorldHint: false },
   input: z.object({
     variables: z
       .array(z.string())
       .describe(
-        'Variable codes to retrieve (e.g., ["B19013_001E", "B19013_001M"]). Codes are uppercased before the request, so "b19013_001e" reads as B19013_001E and the response is keyed by the uppercase code. At most 49 per call: the Census API accepts 50 columns per request and every query also sends NAME. On datasets where a label column is added for each filter dimension left unset, or record columns are added (cbp, ecnbasic, nonemp, pep/charv, dec/ddhca), the maximum is lower, and too_many_variables states the exact number for the query. Use census_search_variables to find codes. On ACS datasets only, each estimate has a margin-of-error counterpart at the same code with the E suffix swapped for M — request both to get the margin alongside the estimate. Other dataset families (pep, dec, cbp, ecnbasic, nonemp) publish no margins of error, and an E-final code there is an ordinary code with no M sibling. A code can also name a text column rather than a measure — GEO_ID, on every dataset, is the nationally unique geography identifier and comes back under value with estimate null, which is the code to request when a stable join key is what is wanted.',
+        'Variable codes to retrieve (e.g., ["B19013_001E", "B19013_001M"]). Codes are uppercased before the request, so "b19013_001e" reads as B19013_001E and the response is keyed by the uppercase code. At most 49 per call: the Census API accepts 50 columns per request and every query also sends NAME. On datasets where a label column is added for each filter dimension left unset, or record columns are added (cbp, ecnbasic, nonemp, pep/charv, dec/ddhca, acs/acs1/spp), the maximum is lower, and too_many_variables states the exact number for the query. Use census_search_variables to find codes. On ACS datasets only, apart from the comparison profiles (acs/acs5/cprofile, acs/acs1/cprofile), which publish none, each estimate has a margin-of-error counterpart at the same code with the E suffix swapped for M — request both to get the margin alongside the estimate. Other dataset families (pep, dec, cbp, ecnbasic, nonemp) publish no margins of error, and an E-final code there is an ordinary code with no M sibling. A code can also name a text column rather than a measure — GEO_ID, on every dataset, is the nationally unique geography identifier and comes back under value with estimate null, which is the code to request when a stable join key is what is wanted.',
       ),
     geography_level: z
       .string()
@@ -170,13 +171,13 @@ export const censusQueryData = tool('census_query_data', {
       .record(z.string(), z.string())
       .optional()
       .describe(
-        'Filter values keyed by variable code, sent as extra query parameters — e.g. {"NAICS2017": "5112"} to count only software publishers in cbp. The business datasets (cbp, ecnbasic, nonemp), pep/charv, and dec/ddhca declare filter dimensions such as industry (NAICS2017/NAICS2022), legal form (LFO), size class (EMPSZES/RCPSZES), tax status (TAXSTAT), operation type (TYPOP), sex (SEX), age (AGE), and population group (POPGROUP). Leaving one unset is not an error: the Census API substitutes its own default, which is the all-categories total on cbp NAICS2017 but a single population group on dec/ddhca POPGROUP and a single sector on ecnbasic NAICS2022 — so an unfiltered value can read like a total without being one. Every unset dimension is named in the response notice and its applied default is echoed per row in applied_filters. Keys are matched case-insensitively, and a blank value is treated as omitted. A value of "*" returns one row per category of that dimension for each geography, each row labelled with its category in record (e.g. {"NAICS2017": "*"} gives King County one row per industry) — a breakdown that can run to over a thousand rows. Code names vary by dataset and vintage — cbp 2023 uses NAICS2017 while nonemp 2023 uses NAICS2022 — so read them from the notice or from census_search_variables. Call census_list_predicate_values for the codes a dimension accepts; NAICS values are standard North American Industry Classification System codes at any depth (51 information, 5112 software publishers).',
+        'Filter values keyed by variable code, sent as extra query parameters — e.g. {"NAICS2017": "5112"} to count only software publishers in cbp. The business datasets (cbp, ecnbasic, nonemp), pep/charv, dec/ddhca, and acs/acs1/spp declare filter dimensions such as industry (NAICS2017/NAICS2022), legal form (LFO), size class (EMPSZES/RCPSZES), tax status (TAXSTAT), operation type (TYPOP), sex (SEX), age (AGE), and population group (POPGROUP). Leaving one unset is not an error: the Census API substitutes its own default, which is the all-categories total on cbp NAICS2017 but a single population group on dec/ddhca POPGROUP and a single sector on ecnbasic NAICS2022 — so an unfiltered value can read like a total without being one. Every unset dimension is named in the response notice and its applied default is echoed per row in applied_filters. Keys are matched case-insensitively, and a blank value is treated as omitted. A value of "*" returns one row per category of that dimension for each geography, each row labelled with its category in record (e.g. {"NAICS2017": "*"} gives King County one row per industry) — a breakdown that can run to over a thousand rows. Code names vary by dataset and vintage — cbp 2023 uses NAICS2017 while nonemp 2023 uses NAICS2022 — so read them from the notice or from census_search_variables. Call census_list_predicate_values for the codes a dimension accepts; NAICS values are standard North American Industry Classification System codes at any depth (51 information, 5112 software publishers).',
       ),
     dataset: z
       .string()
       .optional()
       .describe(
-        'Dataset to query (default: "acs/acs5"). Use census_list_datasets to discover valid values.',
+        'Dataset to query (default: "acs/acs5"). Use census_list_datasets to discover valid values. Case is ignored, and a two-part code can be given by its last part alone — "acs5" is acs/acs5, "pl" is dec/pl. Three-part codes such as acs/acs5/profile must be given in full. The response echoes the resolved code.',
       ),
     year: z
       .number()
@@ -270,7 +271,8 @@ export const censusQueryData = tool('census_query_data', {
     {
       reason: 'dataset_not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'Dataset code is not recognized.',
+      when: 'Dataset code is not recognized, even after case and shorthand resolution.',
+      thrownBy: 'service',
       recovery: 'Call census_list_datasets to discover valid dataset codes like acs/acs5.',
     },
     {
@@ -367,14 +369,7 @@ export const censusQueryData = tool('census_query_data', {
       );
     }
 
-    const dataset = input.dataset?.trim() || 'acs/acs5';
-    if (!KNOWN_DATASETS.has(dataset)) {
-      throw ctx.fail(
-        'dataset_not_found',
-        `Unknown dataset: "${dataset}". Call census_list_datasets to discover valid dataset codes.`,
-        { dataset, ...ctx.recoveryFor('dataset_not_found') },
-      );
-    }
+    const dataset = resolveDataset(input.dataset, 'acs/acs5');
     const { defaultYear } = getDiscoveryConfig();
     const year = input.year ?? DATASET_LATEST_YEARS[dataset] ?? defaultYear;
 
@@ -421,7 +416,7 @@ export const censusQueryData = tool('census_query_data', {
     if (check.status === 'level_not_supported') {
       throw ctx.fail(
         'geography_not_supported',
-        `Geography level "${input.geography_level}" does not exist in ${dataset} (${year}).`,
+        levelNotSupportedMessage(input.geography_level, dataset, year, check.availableLevels),
         {
           dataset,
           year,

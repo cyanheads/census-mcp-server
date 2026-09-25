@@ -41,7 +41,7 @@ U.S. Census Bureau data — datasets, variables, and geography — via the Censu
 | `census_get_variable` | Fetch full metadata for one or more variable codes — label, concept, predicate type, universe, MOE sibling. |
 | `census_list_predicate_values` | List the codes a filter dimension accepts (`EMPSZES`, `LFO`, `POPGROUP`, `NAICS2017`…), from the dataset dictionary or a live wildcard enumeration. |
 | `census_resolve_geography` | Convert place names (e.g., "King County, WA") or street addresses to Census FIPS identifiers via TIGERweb and Census Geocoder. |
-| `census_query_data` | Query a Census dataset for variables at a specific geography. Returns estimates with MOE, suppression codes resolved to readable reasons, and predicate filtering for the business datasets. |
+| `census_query_data` | Query a Census dataset for variables at a specific geography. Returns estimates with MOE, Census sentinel values and withheld business values resolved to their published meanings, and predicate filtering for the business datasets. |
 | `census_compare_geographies` | Rank and compare variables across multiple geographies — all counties in a state, all states nationally, or a named set. Sorted table output, with the same predicate filtering. |
 
 ---
@@ -73,7 +73,7 @@ U.S. Census Bureau data — datasets, variables, and geography — via the Censu
 - Full-text search across label and concept fields with relevance scoring (exact concept match > label match > partial)
 - On ACS datasets, returns estimate (E suffix) and margin-of-error (M suffix) codes together so both can be requested in one query — no other family publishes margins of error, and an E-final code there is an ordinary code
 - Also surfaces the predicate codes a dataset filters on, such as `NAICS2017` in `cbp`
-- Configurable limit (default 20, max 100); `total_matches` indicates how many matched before the limit
+- `limit` is an integer from 1 to 100 (default 20) — out-of-range values are rejected, not clamped; `totalMatches` says how many matched before the limit
 - Cache-backed: variables.json is fetched once per dataset+year with a configurable TTL (default 24h)
 
 ---
@@ -92,7 +92,7 @@ U.S. Census Bureau data — datasets, variables, and geography — via the Censu
 
 - Two routes, picked by where the answer lives: a dimension with a published value list is read from the dataset dictionary, one without is enumerated live by wildcarding it on the data endpoint. `NAICS*` and `POPGROUP` always publish one (thousands of codes — narrow them with `query`); on the current vintages `EMPSZES`, `LFO`, `RCPSZES`, `TAXSTAT`, and `TYPOP` publish none, so the live route is the only place their codes appear
 - A dictionary value list is a classification shared across Census products, not a record of what one dataset serves — `dec/ddhca` declares 5,543 `POPGROUP` codes and publishes 2,996, `cbp` declares 6,694 `NAICS2017` codes and publishes 2,003. The declared list is checked against the dataset's own published rows and the dead codes are dropped; `source` says whether that check ran and the notice says how many were withheld
-- Keyword `query` matches code and label; results are sorted by code and a truncated list is disclosed rather than passed off as complete (default limit 50, max 500)
+- Keyword `query` matches code and label; results are sorted by code and a truncated list is disclosed rather than passed off as complete (`limit` an integer from 1 to 500, default 50; `totalCount` says how many matched)
 - `ecnbasic` publishes `TAXSTAT` and `TYPOP` per industry, so `within_naics` scopes the enumeration — and the notice says the result is complete for that industry alone
 - Live enumerations are cached per dataset, year, dimension, industry scope, and probe measure
 
@@ -111,11 +111,13 @@ U.S. Census Bureau data — datasets, variables, and geography — via the Censu
 
 ### `census_query_data` <sub>tool</sub>
 
-- Requires FIPS codes (use `census_resolve_geography` for place names) and up to 50 variable codes per call; `geography_fips: "*"` returns every geography at the level within the parent, and each row carries both `geography_fips` and the nationally-unique `geography_geoid`
+- Requires FIPS codes (use `census_resolve_geography` for place names); `geography_fips: "*"` returns every geography at the level within the parent, and each row carries both `geography_fips` and the nationally-unique `geography_geoid`
+- A wildcard returns up to `limit` rows (default 50, max 500) in GEOID order, and `offset` pages through the rest; `totalCount` and `truncated` say how many rows matched, and the notice names the range returned and the next `offset`. Every row counts, including each `pep/charv` record and each category of a `"*"` predicate
+- Up to 49 variable codes per call, fewer on datasets where label or record columns are added: the Census API accepts 50 columns per request and every query also sends `NAME`. `too_many_variables` states the exact maximum before any request goes out. Codes are case-insensitive, and an unknown one is `variable_not_found`
 - Level and parent are checked against the dataset's own geography metadata before querying — `parent_required` and `parent_not_accepted` name what's missing or unaccepted rather than surfacing a raw Census 400
-- Optional `predicates` map filters the business/`pep`/`dec` datasets (e.g., `{"NAICS2017": "5112"}`); a dimension left unset applies a Census-chosen default — an all-categories total on some datasets, a single category on others — echoed per row in `applied_filters`
+- Optional `predicates` map filters the business/`pep`/`dec` datasets (e.g., `{"NAICS2017": "5112"}`); a dimension left unset applies a Census-chosen default — an all-categories total on some datasets, a single category on others — echoed per row in `applied_filters`. Keys are case-insensitive and a blank value counts as omitted; `"*"` returns one row per category, each labelled in `record`
 - A dataset that publishes more than one record per geography (`pep/charv`) returns multiple rows, each carrying a `record` field; pin one with `predicates` (e.g., `{"MONTH": "7"}`)
-- Suppression codes resolve to human-readable reasons; a null `estimate` means the value is either suppressed, a text cell (returned under `value`), or genuinely empty
+- ACS sentinel values resolve to the Census's published meanings, a controlled estimate's margin of error reads as `0`, and a median in an open-ended interval is flagged `open_ended`. On `cbp`, `ecnbasic`, and `nonemp`, a value the Census withheld (stored as `0` beside a flag such as `D`) is reported as suppressed with the flag's meaning. A null `estimate` means the value is either suppressed, a text cell (returned under `value`), or genuinely empty
 - Requires `CENSUS_API_KEY`
 
 ---
@@ -123,10 +125,11 @@ U.S. Census Bureau data — datasets, variables, and geography — via the Censu
 ### `census_compare_geographies` <sub>tool</sub>
 
 - Ranks all geographies at a level, or a named `geographies` list of GEOIDs/bare level codes, in one call; `within`/`within_county` scope to a state/county, omit for a national comparison
-- Configurable `sort_by` variable, `sort_dir` (default `desc`), and `limit` (default 50, max 500); `total_count` reports how many geographies matched before the limit
-- Same `predicates` map, geography validation, and `applied_filters` default-echoing as `census_query_data`, applied to every geography in the ranking
-- A dataset that publishes more than one record per geography (`pep/charv`) fails with `ambiguous_rows` unless `predicates` pins one (e.g., `{"MONTH": "7"}`)
-- Suppressed values are labeled and sorted to the end rather than passed through as raw sentinels; a text value has no ordering, so sorting on it leaves rows tied
+- Ranks on one variable's value: `sort_by` (default the first code; it must be one of the requested codes, or the call fails with `sort_by_not_requested`), `sort_dir` (default `desc`), and `limit` (an integer from 1 to 500, default 50); `totalCount` reports how many geographies matched before the limit
+- A count ranks by size, not rate — rank a published percentage for a rate, e.g. `S1701_C03_001E` (percent below poverty, `acs/acs5/subject`) or `DP04_0047PE` (percent renter-occupied, `acs/acs5/profile`), both available down to tract
+- Same `predicates` map, variable limit, geography validation, and `applied_filters` default-echoing as `census_query_data`, applied to every geography in the ranking
+- A dataset that publishes more than one record per geography (`pep/charv`), or a `"*"` predicate, fails with `ambiguous_rows` unless `predicates` pins one (e.g., `{"MONTH": "7"}`)
+- Suppressed values carry the same reasons as `census_query_data` and sort to the end in either direction, withheld business values included; a text value has no ordering, so sorting on it leaves rows tied, and the notice says the rows are not ranked
 - Requires `CENSUS_API_KEY`
 
 ---
@@ -145,7 +148,7 @@ Census-specific:
 Agent-friendly output:
 
 - Workflow-oriented tool surface — `fips_summary` and `state_fips` return values are ready to pass as `geography_fips` and `parent_fips` to the next tool
-- Suppression codes decoded — Census negative sentinel values (e.g., `-666666666`) surfaced as human-readable reasons instead of raw numbers
+- Suppression codes decoded — Census negative sentinel values (e.g., `-666666666`) and business-dataset withholding flags (e.g., `D`) surfaced as their published meanings instead of raw numbers or false zeros
 - Recovery hints on errors — ambiguous geography names include candidate lists; missing API key errors include registration URL
 
 ---

@@ -238,6 +238,7 @@ src/
   services/
     census-api/
       census-api-service.ts             # Census Data API client — queries, suppression mapping
+      errors.ts                         # Upstream HTTP failure classification (year_not_available, variable_not_found)
       types.ts                          # Census data types
     geography/
       geography-service.ts              # TIGERweb + Census Geocoder geography resolution
@@ -246,6 +247,7 @@ src/
       variable-cache-service.ts         # In-process variables.json cache with keyword search
       types.ts                          # Variable types
   mcp-server/
+    tools/variable-entry.ts             # Per-variable output entry + rendering shared by both data tools
     tools/definitions/
       census-list-datasets.tool.ts
       census-list-geographies.tool.ts

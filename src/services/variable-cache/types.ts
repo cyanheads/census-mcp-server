@@ -12,6 +12,12 @@ export interface CensusVariable {
   /** Corresponding estimate variable code when this is a MOE variable. */
   estimateCode?: string;
   /**
+   * Flag column published beside this measure (e.g. "RCPTOT_F"), on the business datasets. A
+   * withheld value holds `0` in the measure and a symbol in this column, so the column has to be
+   * read for the number to mean anything. Present on numeric measures only.
+   */
+  flagAttribute?: string;
+  /**
    * Table the variable belongs to, as variables.json names it (e.g. "T01001" on `dec/ddhca`,
    * "CB2300CBP" on `cbp`), or `"N/A"` for the geography and metadata columns that belong to no
    * table. Which table a query reads decides how many of a dimension's codes come back, so this

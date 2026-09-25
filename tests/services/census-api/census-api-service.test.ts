@@ -8,10 +8,16 @@ import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   CensusApiService,
+  describeColumnBudget,
+  describeColumnLimit,
   getCensusApiService,
+  getColumnsFor,
   initCensusApiService,
+  normalizePredicates,
+  normalizeVariableCodes,
   observeRecordValues,
   padFips,
+  planQueryColumns,
 } from '@/services/census-api/census-api-service.js';
 
 vi.mock('@/config/server-config.js', () => ({
@@ -23,7 +29,11 @@ vi.mock('@/config/server-config.js', () => ({
   })),
 }));
 
-/** Bodies handed out in call order; a request past the end sees an empty response. */
+/**
+ * Bodies handed out in call order. A queued `Response` is served as-is, which is how a non-2xx
+ * status and its body are staged; anything else is served as a 200 JSON body. A request past the
+ * end of the queue rejects, so a test cannot pass on a request it never staged.
+ */
 let responses: unknown[] = [];
 /** Every URL the service requested, in order. */
 let requestedUrls: string[] = [];
@@ -42,7 +52,9 @@ beforeEach(() => {
     'fetch',
     vi.fn((url: string | URL) => {
       requestedUrls.push(String(url));
-      const body = responses.shift() ?? [];
+      if (responses.length === 0) return Promise.reject(new Error('unmocked fetch'));
+      const body = responses.shift();
+      if (body instanceof Response) return Promise.resolve(body);
       return Promise.resolve(
         new Response(JSON.stringify(body), {
           status: 200,
@@ -52,6 +64,10 @@ beforeEach(() => {
     }),
   );
 });
+
+/** The `get=` list of the n-th request, decoded and split. */
+const getColumns = (n = 0) =>
+  decodeURIComponent(requestedUrls[n]?.match(/[?&]get=([^&]*)/)?.[1] ?? '').split(',');
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -284,7 +300,9 @@ describe('CensusApiService.parseResponse — GEOID composition', () => {
     expect(rows[0]?.geographyGeoid).toBe('0100100');
     expect(rows[0]?.variables.B19013_001E?.suppressed).toBe(true);
     expect(rows[0]?.variables.B19013_001E?.estimate).toBeNull();
-    expect(rows[0]?.variables.B19013_001E?.suppressionReason).toContain('Not available');
+    expect(rows[0]?.variables.B19013_001E?.suppressionReason).toMatch(
+      /too few sample observations/i,
+    );
   });
 });
 
@@ -653,11 +671,11 @@ describe('CensusApiService.checkGeography', () => {
   });
 
   it('accepts a level with no parent requirements', async () => {
-    await expect(check('state')).resolves.toEqual({ status: 'ok' });
+    await expect(check('state')).resolves.toEqual({ status: 'ok', acceptedParents: [] });
   });
 
   it('accepts a wildcard county query with no parent — the API infers the state', async () => {
-    await expect(check('county')).resolves.toEqual({ status: 'ok' });
+    await expect(check('county')).resolves.toEqual({ status: 'ok', acceptedParents: ['state'] });
   });
 
   it('requires the state parent for a concrete county FIPS', async () => {
@@ -687,7 +705,10 @@ describe('CensusApiService.checkGeography', () => {
   });
 
   it('accepts a wildcard tract query scoped by state — county is optional under a wildcard', async () => {
-    await expect(check('tract', { parentFips: '53' })).resolves.toEqual({ status: 'ok' });
+    await expect(check('tract', { parentFips: '53' })).resolves.toEqual({
+      status: 'ok',
+      acceptedParents: ['state', 'county'],
+    });
   });
 
   it('requires both state and county for a wildcard block-group query', async () => {
@@ -701,6 +722,7 @@ describe('CensusApiService.checkGeography', () => {
   it('accepts a block-group query scoped by state and county', async () => {
     await expect(check('block group', { parentFips: '53', countyFips: '033' })).resolves.toEqual({
       status: 'ok',
+      acceptedParents: ['state', 'county', 'tract'],
     });
   });
 
@@ -719,7 +741,7 @@ describe('CensusApiService.checkGeography', () => {
   });
 
   it('matches the level name case-insensitively', async () => {
-    await expect(check('County')).resolves.toEqual({ status: 'ok' });
+    await expect(check('County')).resolves.toEqual({ status: 'ok', acceptedParents: ['state'] });
   });
 
   /**
@@ -765,10 +787,10 @@ describe('CensusApiService.checkGeography', () => {
   it('still accepts a parent the wildcard made optional', async () => {
     await expect(
       check('tract', { geographyFips: '*', parentFips: '53', countyFips: '033' }),
-    ).resolves.toEqual({ status: 'ok' });
+    ).resolves.toEqual({ status: 'ok', acceptedParents: ['state', 'county'] });
     await expect(
       check('block group', { geographyFips: '*', parentFips: '53', countyFips: '033' }),
-    ).resolves.toEqual({ status: 'ok' });
+    ).resolves.toEqual({ status: 'ok', acceptedParents: ['state', 'county', 'tract'] });
   });
 
   /**
@@ -792,6 +814,7 @@ describe('CensusApiService.checkGeography', () => {
       'fetch',
       vi.fn(() => Promise.resolve(new Response('', { status: 404 }))),
     );
+    // With no metadata there is no list of parents to report either.
     await expect(check('tract')).resolves.toEqual({ status: 'ok' });
   });
 });
@@ -1025,5 +1048,747 @@ describe('CensusApiService accessor', () => {
   it('returns the initialized singleton', () => {
     initCensusApiService();
     expect(getCensusApiService()).toBeInstanceOf(CensusApiService);
+  });
+});
+
+/**
+ * The Census estimate and annotation values table
+ * (census.gov/data/developers/data-sets/acs-1year/notes-on-acs-estimate-and-annotation-values.html)
+ * is the source for every meaning below. Rows are real King County / Harris County / Alabama
+ * responses captured from `acs/acs5` and `acs/acs1/subject` 2024.
+ */
+describe('CensusApiService.parseResponse — ACS sentinel values', () => {
+  const acs = (
+    header: string[],
+    row: Array<string | null>,
+    variables: string[],
+    dataset = 'acs/acs5',
+    level = 'tract',
+  ) => {
+    queue([header, row]);
+    return service.queryData(
+      {
+        variables,
+        geographyLevel: level,
+        geographyFips: '*',
+        parentFips: '53',
+        dataset,
+        year: 2024,
+      },
+      createMockContext(),
+    );
+  };
+
+  /**
+   * Subject and profile percent columns write the sentinels as floats. An exact string lookup
+   * resolved `-666666666` and left `-666666666.0` in the same row suppressed with no reason.
+   */
+  it('resolves a decimal sentinel to the same reason as its integer form', async () => {
+    const rows = await acs(
+      [
+        'NAME',
+        'S1701_C03_001E',
+        'S1701_C03_001M',
+        'S1903_C03_001E',
+        'S1903_C03_001M',
+        'state',
+        'county',
+        'tract',
+      ],
+      [
+        'Census Tract 9901; King County; Washington',
+        '-666666666.0',
+        '-222222222.0',
+        '-666666666',
+        '-222222222',
+        '53',
+        '033',
+        '990100',
+      ],
+      ['S1701_C03_001E', 'S1701_C03_001M', 'S1903_C03_001E', 'S1903_C03_001M'],
+      'acs/acs5/subject',
+    );
+
+    const v = rows[0]?.variables ?? {};
+    expect(v.S1701_C03_001E?.suppressionReason).toBeDefined();
+    expect(v.S1701_C03_001E?.suppressionReason).toBe(v.S1903_C03_001E?.suppressionReason);
+    expect(v.S1701_C03_001M?.suppressionReason).toBe(v.S1903_C03_001M?.suppressionReason);
+    expect(v.S1701_C03_001E?.suppressionReason).toMatch(/could not be computed|not computable/i);
+    expect(v.S1701_C03_001M?.suppressionReason).toMatch(/margin of error/i);
+  });
+
+  it('words each sentinel the way the Census table defines it', async () => {
+    const rows = await acs(
+      ['NAME', 'A_001E', 'A_002E', 'A_003E', 'A_004M', 'A_005M', 'state', 'county'],
+      [
+        'Calhoun County, Alabama',
+        '-666666666',
+        '-999999999',
+        '-888888888',
+        '-222222222',
+        '-333333333',
+        '01',
+        '015',
+      ],
+      ['A_001E', 'A_002E', 'A_003E', 'A_004M', 'A_005M'],
+      'acs/acs1/subject',
+      'county',
+    );
+
+    const v = rows[0]?.variables ?? {};
+    expect(v.A_001E?.suppressionReason).toMatch(/too few sample observations/i);
+    expect(v.A_002E?.suppressionReason).toMatch(/cannot be displayed/i);
+    expect(v.A_003E?.suppressionReason).toMatch(/not applicable or not available/i);
+    expect(v.A_004M?.suppressionReason).toMatch(/margin of error.*too few sample observations/i);
+    expect(v.A_005M?.suppressionReason).toMatch(/open-ended/i);
+    // None of the wrong meanings the lookup used to carry survive.
+    const reasons = Object.values(v).map((x) => x.suppressionReason ?? '');
+    for (const wrong of [/revised or superseded/i, /geography too small/i, /^Not applicable$/]) {
+      expect(reasons.some((r) => wrong.test(r))).toBe(false);
+    }
+    for (const x of Object.values(v)) {
+      expect(x.suppressed).toBe(true);
+      expect(x.estimate).toBeNull();
+    }
+  });
+
+  /**
+   * `-555555555` means the estimate is controlled to an independent count and "the margin of
+   * error may be treated as zero" — the 2009 vintage writes the same county MOE as a literal 0.
+   */
+  it('reads a controlled-estimate MOE as zero and pairs it with its estimate', async () => {
+    const rows = await acs(
+      ['NAME', 'B01003_001E', 'B01003_001M', 'B01003_001EA', 'B01003_001MA', 'state', 'county'],
+      ['King County, Washington', '2287171', '-555555555', null, '*****', '53', '033'],
+      ['B01003_001E', 'B01003_001M', 'B01003_001EA', 'B01003_001MA'],
+      'acs/acs5',
+      'county',
+    );
+
+    const v = rows[0]?.variables ?? {};
+    expect(v.B01003_001M).toMatchObject({ estimate: 0, suppressed: false });
+    expect(v.B01003_001M?.suppressionReason).toBeUndefined();
+    expect(v.B01003_001E).toMatchObject({ estimate: 2287171, moe: 0, suppressed: false });
+    // The annotation column is text and stays text.
+    expect(v.B01003_001MA).toMatchObject({ estimate: null, value: '*****', suppressed: false });
+  });
+
+  /**
+   * A median in an open-ended interval is published as the interval's boundary (`250001` for
+   * "250,000+", `9999` for "10,000-"), and only the `-333333333` MOE says so. The figure is kept —
+   * it is a bound on the true median and ranks correctly as one — and the estimate is flagged.
+   */
+  it('keeps a top-coded median and marks it open-ended when its MOE is -333333333', async () => {
+    const rows = await acs(
+      [
+        'NAME',
+        'B19013_001E',
+        'B19013_001M',
+        'B19013_001EA',
+        'B19013_001MA',
+        'state',
+        'county',
+        'tract',
+      ],
+      [
+        'Census Tract 41.01; King County; Washington',
+        '250001',
+        '-333333333',
+        '250,000+',
+        '***',
+        '53',
+        '033',
+        '004101',
+      ],
+      ['B19013_001E', 'B19013_001M', 'B19013_001EA', 'B19013_001MA'],
+    );
+
+    const v = rows[0]?.variables ?? {};
+    expect(v.B19013_001E).toMatchObject({
+      estimate: 250001,
+      moe: null,
+      openEnded: true,
+      suppressed: false,
+    });
+    expect(v.B19013_001M?.suppressed).toBe(true);
+    expect(v.B19013_001M?.suppressionReason).toMatch(/open-ended/i);
+    expect(v.B19013_001EA).toMatchObject({ value: '250,000+', suppressed: false });
+    expect(v.B19013_001EA?.suppressionReason).toBeUndefined();
+  });
+
+  it('marks a bottom-coded median open-ended the same way', async () => {
+    const rows = await acs(
+      ['NAME', 'B25077_001E', 'B25077_001M', 'state', 'county', 'tract'],
+      ['Census Tract 4320.06; Harris County; Texas', '9999', '-333333333', '48', '201', '432006'],
+      ['B25077_001E', 'B25077_001M'],
+    );
+
+    expect(rows[0]?.variables.B25077_001E).toMatchObject({ estimate: 9999, openEnded: true });
+  });
+
+  it('leaves an ordinary estimate and MOE pair unmarked', async () => {
+    const rows = await acs(
+      ['NAME', 'B19013_001E', 'B19013_001M', 'state', 'county', 'tract'],
+      ['Census Tract 1.01; King County; Washington', '69577', '14341', '53', '033', '000101'],
+      ['B19013_001E', 'B19013_001M'],
+    );
+
+    expect(rows[0]?.variables.B19013_001E).toEqual({
+      estimate: 69577,
+      moe: 14341,
+      label: 'B19013_001E',
+      suppressed: false,
+    });
+  });
+
+  /**
+   * The table is the ACS one. Other families withhold through flag columns rather than negative
+   * sentinels, so a value that low outside ACS is still withheld — but with no borrowed meaning,
+   * and a `-555555555` there is not a controlled MOE.
+   */
+  it('keeps the ACS meanings, zero MOE, and open_ended off the other families', async () => {
+    queue([
+      ['NAME', 'POP', 'POPM', 'state'],
+      ['Washington', '-666666666', '-555555555', '53'],
+    ]);
+    const rows = await service.queryData(
+      {
+        variables: ['POP', 'POPM'],
+        geographyLevel: 'state',
+        geographyFips: '53',
+        dataset: 'pep/charv',
+        year: 2023,
+      },
+      createMockContext(),
+    );
+
+    for (const code of ['POP', 'POPM']) {
+      expect(rows[0]?.variables[code]).toMatchObject({ estimate: null, suppressed: true });
+      expect(rows[0]?.variables[code]?.suppressionReason).toBeUndefined();
+    }
+  });
+
+  it('never resolves a text cell to a sentinel reason', async () => {
+    const rows = await acs(
+      ['NAME', 'DP02_0070E', 'B19013_001EA', 'GEO_ID', 'state', 'county'],
+      ['King County, Washington', '(X)', '250,000+', '0500000US53033', '53', '033'],
+      ['DP02_0070E', 'B19013_001EA', 'GEO_ID'],
+      'acs/acs5/profile',
+      'county',
+    );
+
+    const v = rows[0]?.variables ?? {};
+    expect(v.DP02_0070E).toMatchObject({ value: '(X)', suppressed: false });
+    expect(v.B19013_001EA).toMatchObject({ value: '250,000+', suppressed: false });
+    expect(v.GEO_ID).toMatchObject({ value: '0500000US53033', suppressed: false });
+    for (const code of ['DP02_0070E', 'B19013_001EA', 'GEO_ID']) {
+      expect(v[code]?.suppressionReason).toBeUndefined();
+      expect(v[code]?.estimate).toBeNull();
+    }
+  });
+});
+
+describe('CensusApiService.queryData — unknown variable rejection', () => {
+  const rejectWith = (body: string, status = 400) =>
+    new Response(body, { status, headers: { 'content-type': 'text/plain' } });
+
+  it('reports an unknown variable the caller sent as variable_not_found, without retrying', async () => {
+    queue(rejectWith("error: unknown variable 'B19013_001X'"));
+
+    const error = await query('county', {
+      variables: ['B19013_001X'],
+      geographyFips: '033',
+      parentFips: '53',
+    }).then(
+      () => undefined,
+      (err: { code: number; data: Record<string, unknown>; message: string }) => err,
+    );
+
+    expect(error?.code).toBe(-32001);
+    expect(error?.data).toMatchObject({
+      reason: 'variable_not_found',
+      missingCodes: ['B19013_001X'],
+      dataset: 'acs/acs5',
+      year: 2023,
+    });
+    expect(error?.message).toContain('B19013_001X');
+    expect(error?.data).toMatchObject({
+      recovery: { hint: expect.stringContaining('census_search_variables') },
+    });
+    expect(error?.data.retryable).not.toBe(true);
+    expect(requestedUrls).toHaveLength(1);
+  });
+
+  it.each([
+    ["error: unknown predicate variable: 'FOO'"],
+    ['error: unknown/unsupported geography hierarchy'],
+    ["error: 'get' is limited to 50 variables"],
+  ])('keeps a different 400 (%s) on upstream_error', async (body) => {
+    queue(rejectWith(body));
+
+    await expect(query('county', { geographyFips: '033', parentFips: '53' })).rejects.toMatchObject(
+      {
+        data: { reason: 'upstream_error', status: 400, upstreamMessage: body },
+      },
+    );
+  });
+
+  /**
+   * NAME, label, record, and flag columns are the server's own additions. Naming one of them as
+   * the caller's missing code would send the caller hunting for a code they never passed.
+   */
+  it('does not blame the caller for an unknown column the server added', async () => {
+    queue(rejectWith("error: unknown variable 'NAME'"));
+
+    await expect(query('county', { geographyFips: '033', parentFips: '53' })).rejects.toMatchObject(
+      {
+        data: { reason: 'upstream_error' },
+      },
+    );
+  });
+
+  it('still retries a 5xx and reports it as upstream_error when it persists', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      queue(
+        rejectWith('upstream unavailable', 503),
+        rejectWith('upstream unavailable', 503),
+        rejectWith('upstream unavailable', 503),
+        rejectWith('upstream unavailable', 503),
+      );
+      const pending = query('county', { geographyFips: '033', parentFips: '53' }).then(
+        () => undefined,
+        (err: { code: number; data: Record<string, unknown> }) => err,
+      );
+      await vi.advanceTimersByTimeAsync(60_000);
+      const error = await pending;
+
+      expect(error?.code).toBe(-32000);
+      expect(error?.data).toMatchObject({ reason: 'upstream_error', status: 503 });
+      expect(requestedUrls.length).toBeGreaterThan(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+/**
+ * The business datasets withhold a cell by writing `0` in the measure and a symbol in its `_F`
+ * column. Rows are the live `ecnbasic` 2022 `NAICS2022=622` (hospitals) response for Washington
+ * counties: Chelan's receipts are withheld (`D`), Pierce's employment is withheld with a range
+ * (`j` = 10,000 to 24,999 employees).
+ */
+describe('CensusApiService.parseResponse — business-dataset flag columns', () => {
+  const ecnbasic = async (rows: Array<Array<string | null>>) => {
+    queue([
+      ['NAME', 'ESTAB', 'RCPTOT', 'EMP', 'RCPTOT_F', 'EMP_F', 'NAICS2022', 'state', 'county'],
+      ...rows,
+    ]);
+    return service.queryData(
+      {
+        variables: ['ESTAB', 'RCPTOT', 'EMP'],
+        geographyLevel: 'county',
+        geographyFips: '*',
+        parentFips: '53',
+        predicates: { NAICS2022: '622' },
+        flagColumns: { RCPTOT: 'RCPTOT_F', EMP: 'EMP_F' },
+        dataset: 'ecnbasic',
+        year: 2022,
+      },
+      createMockContext(),
+    );
+  };
+
+  it('reports a withheld cell as suppressed with the flag meaning, never as a zero', async () => {
+    const rows = await ecnbasic([
+      ['Chelan County, Washington', '4', '0', '2955', 'D', null, '622', '53', '007'],
+      ['Pierce County, Washington', '11', '0', '0', 'D', 'j', '622', '53', '053'],
+      ['King County, Washington', '25', '14293515', '54853', null, null, '622', '53', '033'],
+    ]);
+
+    const [chelan, pierce, king] = rows;
+    expect(chelan?.variables.RCPTOT).toMatchObject({
+      estimate: null,
+      suppressed: true,
+      flag: { code: 'D' },
+    });
+    expect(chelan?.variables.RCPTOT?.suppressionReason).toMatch(/withheld to avoid disclosing/i);
+    // Unflagged cells beside it keep their numbers.
+    expect(chelan?.variables.EMP).toMatchObject({ estimate: 2955, suppressed: false });
+    expect(chelan?.variables.EMP?.flag).toBeUndefined();
+    expect(chelan?.variables.ESTAB?.estimate).toBe(4);
+
+    expect(pierce?.variables.EMP).toMatchObject({
+      estimate: null,
+      suppressed: true,
+      flag: { code: 'j' },
+    });
+    expect(pierce?.variables.EMP?.suppressionReason).toContain('10,000 to 24,999 employees');
+
+    expect(king?.variables.RCPTOT).toMatchObject({ estimate: 14293515, suppressed: false });
+    expect(king?.variables.RCPTOT?.flag).toBeUndefined();
+
+    // The flag columns are neither geography columns nor variables of their own.
+    expect(rows.map((r) => r.geographyGeoid)).toEqual(['53007', '53053', '53033']);
+    expect(chelan?.variables).not.toHaveProperty('RCPTOT_F');
+    expect(getColumns()).toEqual(['NAME', 'ESTAB', 'RCPTOT', 'EMP', 'RCPTOT_F', 'EMP_F']);
+  });
+
+  /** `s` (relative standard error above 40%) annotates a published figure — ecnbasic 2012 WA ESTAB 53. */
+  it('keeps a published figure whose flag is a quality note and carries the note', async () => {
+    const rows = await ecnbasic([
+      ['Somewhere, Washington', '53', '1200', '40', 's', null, '622', '53', '999'],
+    ]);
+
+    expect(rows[0]?.variables.RCPTOT).toMatchObject({
+      estimate: 1200,
+      suppressed: false,
+      flag: { code: 's' },
+    });
+    expect(rows[0]?.variables.RCPTOT?.flag?.meaning).toMatch(/relative standard error/i);
+  });
+
+  it('treats a symbol with no published meaning as withheld rather than trusting the zero', async () => {
+    const rows = await ecnbasic([
+      ['Somewhere, Washington', '3', '0', '12', '~', null, '622', '53', '999'],
+    ]);
+
+    expect(rows[0]?.variables.RCPTOT).toMatchObject({
+      estimate: null,
+      suppressed: true,
+      flag: { code: '~' },
+    });
+    expect(rows[0]?.variables.RCPTOT?.suppressionReason).toContain('"~"');
+  });
+
+  /**
+   * The range columns publish their answer in the flag and hold `0` in the measure: `ecnbasic`
+   * `RCPTOT_IMP` ("Range indicating percent … imputed") carries a digit band, and `cbp` `EMP_N`
+   * ("Noise range for number of employees") a noise letter. Values are from the live `ecnbasic`
+   * 2022 King County (NAICS2022=62) and `cbp` 2023 King County responses.
+   */
+  it('reads the zero beside a range flag as a range, not as the number 0', async () => {
+    queue([
+      ['NAME', 'RCPTOT', 'RCPTOT_IMP', 'EMP_N', 'RCPTOT_IMP_F', 'EMP_N_F', 'state', 'county'],
+      ['King County, Washington', '31688958', '0', '0', '2', 'G', '53', '033'],
+    ]);
+    const rows = await service.queryData(
+      {
+        variables: ['RCPTOT', 'RCPTOT_IMP', 'EMP_N'],
+        geographyLevel: 'county',
+        geographyFips: '033',
+        parentFips: '53',
+        flagColumns: { RCPTOT_IMP: 'RCPTOT_IMP_F', EMP_N: 'EMP_N_F' },
+        dataset: 'ecnbasic',
+        year: 2022,
+      },
+      createMockContext(),
+    );
+
+    const v = rows[0]?.variables ?? {};
+    expect(v.RCPTOT_IMP).toMatchObject({ estimate: null, suppressed: true, flag: { code: '2' } });
+    expect(v.RCPTOT_IMP?.suppressionReason).toMatch(/range.*20% to less than 30%/i);
+    expect(v.EMP_N).toMatchObject({ estimate: null, suppressed: true, flag: { code: 'G' } });
+    expect(v.EMP_N?.suppressionReason).toMatch(/range.*less than 2%/i);
+    expect(v.RCPTOT).toMatchObject({ estimate: 31688958, suppressed: false });
+  });
+
+  it('keeps a nonzero figure a range flag rides beside, and carries the flag', async () => {
+    const rows = await ecnbasic([
+      ['Somewhere, Washington', '53', '1200', '40', 'H', null, '622', '53', '999'],
+    ]);
+
+    expect(rows[0]?.variables.RCPTOT).toMatchObject({
+      estimate: 1200,
+      suppressed: false,
+      flag: { code: 'H' },
+    });
+  });
+});
+
+/**
+ * A predicate value of `*` turns the dimension into a group-by. The API echoes the dimension's
+ * code on every row; its own `_LABEL`/`_DESC` column adds the label without changing which rows
+ * come back (1,552 rows for King County `NAICS2017=*` either way).
+ */
+describe('CensusApiService.queryData — wildcarded dimensions', () => {
+  it('labels each per-category row with the code and label of its category', async () => {
+    queue([
+      ['NAME', 'ESTAB', 'NAICS2017_LABEL', 'NAICS2017', 'LFO', 'EMPSZES', 'state', 'county'],
+      [
+        'King County, Washington',
+        '93517',
+        'Total for all sectors',
+        '00',
+        '001',
+        '001',
+        '53',
+        '033',
+      ],
+      [
+        'King County, Washington',
+        '177',
+        'Agriculture, forestry, fishing and hunting',
+        '11',
+        '001',
+        '001',
+        '53',
+        '033',
+      ],
+      [
+        'King County, Washington',
+        '12',
+        'Support activities for crop production',
+        '1151',
+        '001',
+        '001',
+        '53',
+        '033',
+      ],
+    ]);
+
+    const rows = await service.queryData(
+      {
+        variables: ['ESTAB'],
+        geographyLevel: 'county',
+        geographyFips: '033',
+        parentFips: '53',
+        predicates: { NAICS2017: '*', LFO: '001', EMPSZES: '001' },
+        wildcardColumns: [{ code: 'NAICS2017', labelColumn: 'NAICS2017_LABEL' }],
+        dataset: 'cbp',
+        year: 2023,
+      },
+      createMockContext(),
+    );
+
+    expect(rows.map((r) => r.record)).toEqual([
+      { NAICS2017: { code: '00', label: 'Total for all sectors' } },
+      { NAICS2017: { code: '11', label: 'Agriculture, forestry, fishing and hunting' } },
+      { NAICS2017: { code: '1151', label: 'Support activities for crop production' } },
+    ]);
+    expect(rows.map((r) => r.geographyGeoid)).toEqual(['53033', '53033', '53033']);
+    expect(rows[1]?.variables).toEqual({
+      ESTAB: { estimate: 177, label: 'ESTAB', suppressed: false },
+    });
+    // Only the label column is requested; the code arrives as the predicate echo.
+    expect(getColumns()).toEqual(['NAME', 'ESTAB', 'NAICS2017_LABEL']);
+  });
+
+  it('falls back to the code for a dimension that publishes no label column', async () => {
+    queue([
+      ['NAME', 'POP', 'MONTH', 'MONTH_DESC', 'YEAR', 'state'],
+      ['Washington', '7724566', '7', 'July', '2020', '53'],
+      ['Washington', '7812880', '7', 'July', '2023', '53'],
+    ]);
+
+    const rows = await service.queryData(
+      {
+        variables: ['POP'],
+        geographyLevel: 'state',
+        geographyFips: '53',
+        predicates: { MONTH: '7', YEAR: '*' },
+        recordColumns: { MONTH: 'MONTH_DESC' },
+        wildcardColumns: [{ code: 'YEAR' }],
+        dataset: 'pep/charv',
+        year: 2023,
+      },
+      createMockContext(),
+    );
+
+    expect(rows.map((r) => r.record)).toEqual([
+      { MONTH: { code: '7', label: 'July' }, YEAR: { code: '2020', label: '2020' } },
+      { MONTH: { code: '7', label: 'July' }, YEAR: { code: '2023', label: '2023' } },
+    ]);
+    expect(rows.map((r) => r.geographyGeoid)).toEqual(['53', '53']);
+    expect(getColumns()).toEqual(['NAME', 'POP', 'MONTH', 'MONTH_DESC']);
+  });
+});
+
+describe('normalizePredicates', () => {
+  it('uppercases keys, trims values, and drops a blank value as omitted', () => {
+    expect(normalizePredicates({ naics2017: ' 5112 ', LFO: '', EMPSZES: '   ', sex: '1' })).toEqual(
+      { predicates: { NAICS2017: '5112', SEX: '1' }, wildcards: [] },
+    );
+  });
+
+  it('names the dimensions a "*" value wildcards', () => {
+    expect(normalizePredicates({ NAICS2017: '*', year: ' * ', LFO: '001' })).toEqual({
+      predicates: { NAICS2017: '*', YEAR: '*', LFO: '001' },
+      wildcards: ['NAICS2017', 'YEAR'],
+    });
+  });
+
+  it('reads an absent map as no predicates', () => {
+    expect(normalizePredicates(undefined)).toEqual({ predicates: {}, wildcards: [] });
+  });
+});
+
+/**
+ * The Census API rejects a `get=` list longer than 50 columns (NAME + 49 codes succeeds, NAME + 50
+ * fails), and every column this server adds counts toward it.
+ */
+describe('planQueryColumns', () => {
+  const codes = (n: number) =>
+    Array.from({ length: n }, (_, i) => `B01001_${String(i + 1).padStart(3, '0')}E`);
+
+  it('fits NAME plus 49 codes and refuses the 50th', () => {
+    expect(planQueryColumns({ variables: codes(49) })).toMatchObject({ status: 'ok' });
+    expect(planQueryColumns({ variables: codes(50) })).toEqual({
+      status: 'over_limit',
+      columnCount: 51,
+      maxVariables: 49,
+      addedColumns: ['NAME'],
+    });
+  });
+
+  it('counts the default-label and record columns the service adds', () => {
+    const columns = {
+      defaultLabelColumns: { POPGROUP: 'POPGROUP_LABEL' },
+      recordColumns: { MONTH: 'MONTH_DESC' },
+    };
+
+    expect(planQueryColumns({ variables: codes(46), ...columns })).toMatchObject({ status: 'ok' });
+    expect(planQueryColumns({ variables: codes(47), ...columns })).toEqual({
+      status: 'over_limit',
+      columnCount: 51,
+      maxVariables: 46,
+      addedColumns: ['NAME', 'POPGROUP_LABEL', 'MONTH', 'MONTH_DESC'],
+    });
+  });
+
+  /**
+   * Wildcard label and flag columns are the server's own extras. Adding them must never turn a
+   * request that fit into one that fails, so they take what is left and the rest is reported.
+   */
+  it('fits optional label and flag columns into what is left, and reports the rest', () => {
+    const plan = planQueryColumns({
+      variables: ['ESTAB', 'EMP', 'PAYANN', ...codes(44)],
+      defaultLabelColumns: { LFO: 'LFO_LABEL' },
+      wildcardColumns: [{ code: 'NAICS2017', labelColumn: 'NAICS2017_LABEL' }],
+      flagColumns: { ESTAB: 'ESTAB_F', EMP: 'EMP_F', PAYANN: 'PAYANN_F' },
+    });
+
+    // NAME + 47 codes + LFO_LABEL = 49, so one optional column fits.
+    expect(plan).toEqual({
+      status: 'ok',
+      wildcardColumns: [{ code: 'NAICS2017', labelColumn: 'NAICS2017_LABEL' }],
+      flagColumns: {},
+      unlabelledWildcards: [],
+      uncheckedFlags: ['ESTAB', 'EMP', 'PAYANN'],
+    });
+  });
+
+  it('keeps every optional column when there is room', () => {
+    expect(
+      planQueryColumns({
+        variables: ['ESTAB', 'EMP'],
+        wildcardColumns: [{ code: 'NAICS2017', labelColumn: 'NAICS2017_LABEL' }, { code: 'YEAR' }],
+        flagColumns: { ESTAB: 'ESTAB_F', EMP: 'EMP_F' },
+      }),
+    ).toEqual({
+      status: 'ok',
+      wildcardColumns: [{ code: 'NAICS2017', labelColumn: 'NAICS2017_LABEL' }, { code: 'YEAR' }],
+      flagColumns: { ESTAB: 'ESTAB_F', EMP: 'EMP_F' },
+      unlabelledWildcards: [],
+      uncheckedFlags: [],
+    });
+  });
+
+  it('builds the same get= list queryData sends', () => {
+    expect(
+      getColumnsFor({
+        variables: ['ESTAB'],
+        defaultLabelColumns: { LFO: 'LFO_LABEL' },
+        recordColumns: { MONTH: 'MONTH_DESC' },
+        wildcardColumns: [{ code: 'NAICS2017', labelColumn: 'NAICS2017_LABEL' }, { code: 'YEAR' }],
+        flagColumns: { ESTAB: 'ESTAB_F' },
+      }),
+    ).toEqual(['NAME', 'ESTAB', 'LFO_LABEL', 'MONTH', 'MONTH_DESC', 'NAICS2017_LABEL', 'ESTAB_F']);
+  });
+
+  /**
+   * A caller can name a column the server would add anyway — `MONTH_DESC` on pep/charv, a flag
+   * column, a dimension's label column. The Census API needs it once, so it is sent and counted
+   * once, and the per-call maximum is not lowered by a column that costs nothing extra.
+   */
+  it('sends and counts a column the caller also requests once', () => {
+    const columns = {
+      variables: ['POP', 'MONTH_DESC', 'EMP_F', 'NAICS2017_LABEL', 'POP'],
+      recordColumns: { MONTH: 'MONTH_DESC' },
+      wildcardColumns: [{ code: 'NAICS2017', labelColumn: 'NAICS2017_LABEL' }],
+      flagColumns: { EMP: 'EMP_F' },
+    };
+
+    expect(getColumnsFor(columns)).toEqual([
+      'NAME',
+      'POP',
+      'MONTH_DESC',
+      'EMP_F',
+      'NAICS2017_LABEL',
+      'MONTH',
+    ]);
+  });
+
+  it('does not charge a record, label, or flag column the caller already requested', () => {
+    // NAME + MONTH + MONTH_DESC leaves 47 codes; naming MONTH_DESC among them costs nothing.
+    expect(
+      planQueryColumns({
+        variables: [...codes(47), 'MONTH_DESC'],
+        recordColumns: { MONTH: 'MONTH_DESC' },
+      }),
+    ).toMatchObject({ status: 'ok' });
+
+    // NAME + 49 codes is full; the flag and label columns the caller named are already in it.
+    expect(
+      planQueryColumns({
+        variables: [...codes(47), 'EMP_F', 'NAICS2017_LABEL'],
+        wildcardColumns: [{ code: 'NAICS2017', labelColumn: 'NAICS2017_LABEL' }],
+        flagColumns: { EMP: 'EMP_F' },
+      }),
+    ).toEqual({
+      status: 'ok',
+      wildcardColumns: [{ code: 'NAICS2017', labelColumn: 'NAICS2017_LABEL' }],
+      flagColumns: { EMP: 'EMP_F' },
+      unlabelledWildcards: [],
+      uncheckedFlags: [],
+    });
+  });
+});
+
+describe('normalizeVariableCodes', () => {
+  it('trims, uppercases, drops blanks, and keeps the first of any repeat', () => {
+    expect(normalizeVariableCodes([' b19013_001e', '', '  ', 'B19013_001E', 'geo_id'])).toEqual([
+      'B19013_001E',
+      'GEO_ID',
+    ]);
+  });
+});
+
+describe('column-limit wording', () => {
+  it('states the per-call maximum and the columns that lower it', () => {
+    expect(describeColumnLimit(50, { maxVariables: 49, addedColumns: ['NAME'] })).toBe(
+      '50 variable codes requested, but this query can carry at most 49: the Census API accepts 50 columns per request, and every query also sends NAME.',
+    );
+    expect(
+      describeColumnLimit(47, {
+        maxVariables: 46,
+        addedColumns: ['NAME', 'EMPSZES_LABEL', 'LFO_LABEL', 'NAICS2017_LABEL'],
+      }),
+    ).toContain('at most 46');
+  });
+
+  it('names the codes whose flags went unchecked and the dimensions left unlabelled', () => {
+    const text = describeColumnBudget({
+      uncheckedFlags: ['EMP', 'PAYANN'],
+      unlabelledWildcards: ['NAICS2017'],
+    });
+
+    expect(text).toContain('Flags were not checked for EMP, PAYANN');
+    expect(text).toContain('reads as 0');
+    expect(text).toContain('label column of NAICS2017');
+  });
+
+  it('says nothing when every optional column fit', () => {
+    expect(describeColumnBudget({ uncheckedFlags: [], unlabelledWildcards: [] })).toBeUndefined();
   });
 });

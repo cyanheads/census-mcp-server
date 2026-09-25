@@ -4,7 +4,7 @@
  * @module services/census-api/errors
  */
 
-import { McpError, validationError } from '@cyanheads/mcp-ts-core/errors';
+import { McpError, notFound, validationError } from '@cyanheads/mcp-ts-core/errors';
 
 /**
  * Render a year list with contiguous runs collapsed — `[2005…2019, 2021…2024]` reads as
@@ -79,6 +79,12 @@ function upstreamMessage(body: unknown): string | undefined {
 const RETRYABLE_STATUSES = new Set([408, 425, 429, 502, 503, 504]);
 
 /**
+ * The Census API's rejection of a `get=` column it does not publish. Anchored on both ends so
+ * `error: unknown predicate variable: 'FOO'` — a filter key, not a column — does not match.
+ */
+const UNKNOWN_VARIABLE = /^error: unknown variable '([^']+)'$/;
+
+/**
  * Translate a thrown Census API fetch failure.
  *
  * `fetchWithTimeout` attaches the first 500 bytes of the response body to `data.body` and
@@ -91,15 +97,31 @@ const RETRYABLE_STATUSES = new Set([408, 425, 429, 502, 503, 504]);
  * A 404 on a vintage the catalog does not list is `year_not_available`. A 404 on one it does
  * list is not — the years were validated before the request, so the catalog has drifted from the
  * API and answering "no such vintage" while naming that vintage as available says nothing a
- * caller can act on. Every other status keeps the status-mapped code it already had, which is
- * what decides whether `withRetry` tries again. Anything that is not an HTTP failure (timeout,
- * abort, network error) is returned unchanged for its own handling.
+ * caller can act on.
+ *
+ * A 400 reading `error: unknown variable '<code>'` that names one of `requestedCodes` is
+ * `variable_not_found`. The upstream rejection is the authority on which columns exist:
+ * `variables.json` lists the annotation and flag columns the API accepts only inside each entry's
+ * `attributes` string, so a pre-check against it would refuse `B19013_001EA`, `EMP_F`, and every
+ * other column of that kind. A code the caller did not send — `NAME`, or a label, record, or flag
+ * column the server added — stays `upstream_error`, since naming it as the caller's mistake would
+ * send them looking for a code they never passed. The API names only the first unknown column.
+ *
+ * Every other status keeps the status-mapped code it already had, which is what decides whether
+ * `withRetry` tries again. Anything that is not an HTTP failure (timeout, abort, network error)
+ * is returned unchanged for its own handling.
  *
  * Returns the error to throw rather than throwing, so the call site reads as a `throw`.
  */
 export function censusHttpError(
   error: unknown,
-  scope: { dataset: string; year: number; availableYears?: number[] | undefined },
+  scope: {
+    dataset: string;
+    year: number;
+    availableYears?: number[] | undefined;
+    /** Variable codes the caller supplied, the only ones an unknown-variable rejection can blame. */
+    requestedCodes?: readonly string[] | undefined;
+  },
 ): unknown {
   if (!(error instanceof McpError) || error.data?.errorSource !== 'FetchHttpError') return error;
 
@@ -119,6 +141,25 @@ export function censusHttpError(
   }
 
   const upstream = upstreamMessage(body);
+
+  const unknownCode = status === 400 ? upstream?.match(UNKNOWN_VARIABLE)?.[1] : undefined;
+  if (unknownCode && scope.requestedCodes?.includes(unknownCode)) {
+    return notFound(
+      `Variable code not found in ${scope.dataset} (${scope.year}): ${unknownCode}.`,
+      {
+        reason: 'variable_not_found',
+        missingCodes: [unknownCode],
+        dataset: scope.dataset,
+        year: scope.year,
+        status,
+        upstreamMessage: upstream,
+        recovery: {
+          hint: `Call census_search_variables to find valid codes for ${scope.dataset} (${scope.year}), or census_get_variable to confirm one. The Census API names only the first unknown code in a request, so check the others before retrying.`,
+        },
+      },
+    );
+  }
+
   const retryable = status === undefined || RETRYABLE_STATUSES.has(status) || status >= 500;
 
   return new McpError(

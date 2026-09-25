@@ -21,9 +21,17 @@ import type {
   CensusVariableValue,
   GeographyCheck,
 } from './types.js';
-import { SUPPRESSION_CODES } from './types.js';
+import {
+  ACS_CONTROLLED_MOE,
+  ACS_OPEN_ENDED_MOE,
+  ACS_SENTINEL_REASONS,
+  CENSUS_FLAGS,
+} from './types.js';
 
 const CENSUS_API_BASE = 'https://api.census.gov/data';
+
+/** The Census API rejects a request whose `get=` list names more than this many columns. */
+const GET_COLUMN_LIMIT = 50;
 
 /**
  * Zero-pad a fixed-width parent FIPS code to the width the Census API matches on, returning
@@ -37,6 +45,208 @@ export function padFips(value: string | undefined, width: number): string | unde
   const trimmed = value?.trim();
   if (!trimmed) return;
   return trimmed === '*' ? trimmed : trimmed.padStart(width, '0');
+}
+
+/**
+ * Canonicalize caller variable codes. Every supported dataset names its columns in uppercase and
+ * the Census API matches `get=` case-sensitively — `b19013_001e` is a 400 — so uppercasing maps a
+ * code onto the one spelling that answers, and the response is keyed by that spelling. A blank
+ * code names no column, so it is dropped the way a blank scope input is, and a repeat is dropped
+ * because the response is keyed by code and can hold each one once.
+ */
+export function normalizeVariableCodes(codes: readonly string[]): string[] {
+  return [...new Set(codes.map((code) => code.trim().toUpperCase()).filter(Boolean))];
+}
+
+/**
+ * Canonicalize a caller's predicate map. Keys are uppercased, since no supported dataset defines a
+ * lowercase variable and `naics2017` has exactly one meaning. Values are trimmed, and a blank value
+ * is dropped: the Census API reads `NAICS2017=` as a group-by over every category, the same as
+ * `*`, while a blank is what a form-based client sends for a field it left empty — and "blank is
+ * treated as omitted" is the rule the scope inputs already follow.
+ *
+ * `*` stays. A per-category breakdown of one geography is a real query, so its dimensions are
+ * returned as `wildcards` for the rows to be labelled with the category each one is.
+ */
+export function normalizePredicates(input: Record<string, string> | undefined): {
+  predicates: Record<string, string>;
+  wildcards: string[];
+} {
+  const predicates: Record<string, string> = {};
+  for (const [key, value] of Object.entries(input ?? {})) {
+    const trimmed = value.trim();
+    if (trimmed) predicates[key.trim().toUpperCase()] = trimmed;
+  }
+  return {
+    predicates,
+    wildcards: Object.keys(predicates).filter((code) => predicates[code] === '*'),
+  };
+}
+
+/**
+ * A dimension a predicate set to `*`. The API echoes its code on every row; `labelColumn` is the
+ * dimension's own `_LABEL`/`_DESC` attribute, requested alongside when the dataset publishes one.
+ */
+export interface WildcardColumn {
+  code: string;
+  labelColumn?: string;
+}
+
+/** Every family of column a data query can put in `get=`, beyond `NAME`. */
+export interface QueryColumns {
+  /** Label attribute per filter dimension the query left unset, keyed by dimension code. */
+  defaultLabelColumns?: Record<string, string>;
+  /** Flag column per measure, keyed by the measure's code (e.g. `{ RCPTOT: 'RCPTOT_F' }`). */
+  flagColumns?: Record<string, string>;
+  /** Label column per record dimension, keyed by dimension code; both are requested. */
+  recordColumns?: Record<string, string>;
+  /** The caller's variable codes. */
+  variables: string[];
+  /** Dimensions a predicate set to `*`; only their label columns are requested. */
+  wildcardColumns?: WildcardColumn[];
+}
+
+/**
+ * The `get=` list a query sends, in order. `queryData` builds its request from this and
+ * `planQueryColumns` counts it, so the count cannot drift from what goes over the wire.
+ *
+ * Each column appears once. A caller can name a column the server adds anyway — `MONTH_DESC` on
+ * `pep/charv`, a flag or label column — and sending it twice would spend a second slot of the
+ * 50-column limit on nothing.
+ */
+export function getColumnsFor(columns: QueryColumns): string[] {
+  return [
+    ...new Set([
+      'NAME',
+      ...columns.variables,
+      ...Object.values(columns.defaultLabelColumns ?? {}),
+      ...Object.entries(columns.recordColumns ?? {}).flat(),
+      ...(columns.wildcardColumns ?? []).flatMap((w) => (w.labelColumn ? [w.labelColumn] : [])),
+      ...Object.values(columns.flagColumns ?? {}),
+    ]),
+  ];
+}
+
+/** Outcome of fitting a query's columns under `GET_COLUMN_LIMIT`. */
+export type ColumnPlan =
+  | {
+      status: 'over_limit';
+      /** Columns the query would need, counting every one the server adds. */
+      columnCount: number;
+      /** Most variable codes this query can carry once the added columns are counted. */
+      maxVariables: number;
+      /** The columns the server adds that count against the limit: NAME, label, and record columns. */
+      addedColumns: string[];
+    }
+  | {
+      status: 'ok';
+      /** Wildcard dimensions to send, each with its label column only when it fit. */
+      wildcardColumns: WildcardColumn[];
+      /** Flag columns that fit. */
+      flagColumns: Record<string, string>;
+      /** Wildcarded dimensions whose label column did not fit — their rows carry the code alone. */
+      unlabelledWildcards: string[];
+      /** Measures whose flag column did not fit — a withheld value among them cannot be told apart. */
+      uncheckedFlags: string[];
+    };
+
+/**
+ * Fit a query's columns under the Census API's 50-column `get=` limit.
+ *
+ * `NAME`, the caller's codes, and the default-label and record columns are sent whatever the
+ * dataset, so they decide whether the query can run at all; past the limit, the plan says how many
+ * codes it can carry instead. Wildcard label columns and then flag columns are extras: they take
+ * whatever room is left, in that order, and the ones that do not fit are named rather than sent.
+ * Adding them never turns a query that fit into one the API rejects.
+ */
+export function planQueryColumns(columns: QueryColumns): ColumnPlan {
+  const { wildcardColumns = [], flagColumns = {}, ...fixed } = columns;
+  const required = getColumnsFor(fixed);
+  if (required.length > GET_COLUMN_LIMIT) {
+    const addedColumns = getColumnsFor({ ...fixed, variables: [] });
+    return {
+      status: 'over_limit',
+      columnCount: required.length,
+      maxVariables: GET_COLUMN_LIMIT - addedColumns.length,
+      addedColumns,
+    };
+  }
+
+  let room = GET_COLUMN_LIMIT - required.length;
+  // An optional column already on the list — the caller named it — costs nothing more to keep.
+  const sent = new Set(required);
+  const fits = (column: string) => {
+    if (sent.has(column)) return true;
+    if (room === 0) return false;
+    sent.add(column);
+    room--;
+    return true;
+  };
+
+  const fittedWildcards: WildcardColumn[] = [];
+  const unlabelledWildcards: string[] = [];
+  for (const wildcard of wildcardColumns) {
+    if (!wildcard.labelColumn || fits(wildcard.labelColumn)) {
+      fittedWildcards.push(wildcard);
+    } else {
+      fittedWildcards.push({ code: wildcard.code });
+      unlabelledWildcards.push(wildcard.code);
+    }
+  }
+
+  const fittedFlags: Record<string, string> = {};
+  const uncheckedFlags: string[] = [];
+  for (const [code, column] of Object.entries(flagColumns)) {
+    if (fits(column)) {
+      fittedFlags[code] = column;
+    } else {
+      uncheckedFlags.push(code);
+    }
+  }
+
+  return {
+    status: 'ok',
+    wildcardColumns: fittedWildcards,
+    flagColumns: fittedFlags,
+    unlabelledWildcards,
+    uncheckedFlags,
+  };
+}
+
+/** Word a query that would exceed the column limit, naming the real per-call maximum and why. */
+export function describeColumnLimit(
+  requested: number,
+  plan: { maxVariables: number; addedColumns: string[] },
+): string {
+  const added = plan.addedColumns.filter((column) => column !== 'NAME');
+  const addedPart =
+    added.length > 0
+      ? `, plus the ${added.length} label and record column${added.length === 1 ? '' : 's'} added for this dataset (${added.join(', ')})`
+      : '';
+  return `${requested} variable codes requested, but this query can carry at most ${plan.maxVariables}: the Census API accepts ${GET_COLUMN_LIMIT} columns per request, and every query also sends NAME${addedPart}.`;
+}
+
+/**
+ * Word what the column limit left out of a query that still ran, or `undefined` when nothing was.
+ * A missing flag column is the serious one: a value the Census withheld reads as a real `0`
+ * without it, so the codes it covers are named.
+ */
+export function describeColumnBudget(plan: {
+  uncheckedFlags: string[];
+  unlabelledWildcards: string[];
+}): string | undefined {
+  const parts: string[] = [];
+  if (plan.uncheckedFlags.length > 0) {
+    parts.push(
+      `Flags were not checked for ${plan.uncheckedFlags.join(', ')}: the Census API accepts ${GET_COLUMN_LIMIT} columns per request and this one had no room left for their flag columns, so a value the Census withheld there reads as 0 rather than as withheld. Query those codes in a call with fewer variables to check them.`,
+    );
+  }
+  if (plan.unlabelledWildcards.length > 0) {
+    parts.push(
+      `No room was left under the ${GET_COLUMN_LIMIT}-column limit for the label column of ${plan.unlabelledWildcards.join(', ')}, so each row's record carries that category's code as its label. Query fewer variables to get the labels.`,
+    );
+  }
+  return parts.length > 0 ? parts.join(' ') : undefined;
 }
 
 /**
@@ -83,23 +293,71 @@ export function observeRecordValues(
  * property of the whole column — the older ACS profile vintages write "not applicable" as the
  * literal `"(X)"` in a column that is a number everywhere else, which reaches the caller as that
  * annotation rather than as an unexplained null.
+ *
+ * A number below −100,000,000 is a Census sentinel, never a measurement. On ACS it resolves by
+ * numeric value against the Census table, so the float form the subject and profile percent
+ * columns use (`-666666666.0`) reads like the integer one, and the controlled-estimate MOE
+ * (`-555555555`) is the number zero the Census says to treat it as. Outside ACS the value is still
+ * withheld, but carries no reason: that table is ACS's, and the other families withhold through
+ * flag columns instead.
  */
-function readValue(rawValue: string | null, varCode: string): CensusVariableValue {
-  const suppressionReason =
-    rawValue !== null && Object.hasOwn(SUPPRESSION_CODES, rawValue)
-      ? SUPPRESSION_CODES[rawValue]
-      : undefined;
+function readValue(rawValue: string | null, varCode: string, acs: boolean): CensusVariableValue {
   const text = rawValue?.trim() ?? '';
   const numValue = text === '' ? null : Number(text);
   const isNumber = numValue !== null && !Number.isNaN(numValue);
-  const suppressed = suppressionReason !== undefined || (isNumber && numValue < -100_000_000);
+
+  if (acs && numValue === ACS_CONTROLLED_MOE) {
+    return { estimate: 0, label: varCode, suppressed: false };
+  }
+
+  const suppressed = isNumber && numValue < -100_000_000;
+  const suppressionReason = acs && isNumber ? ACS_SENTINEL_REASONS.get(numValue) : undefined;
 
   return {
     estimate: suppressed || !isNumber ? null : numValue,
     label: varCode,
     suppressed,
     ...(suppressionReason && { suppressionReason }),
-    ...(!suppressed && !isNumber && text !== '' && { value: text }),
+    ...(!isNumber && text !== '' && { value: text }),
+  };
+}
+
+/**
+ * Apply the business-dataset flag published beside a measure. A withheld cell holds `0` in the
+ * measure, so the flag is the only thing that separates it from a real zero: a withholding symbol
+ * replaces the number with a suppression, and an annotating one (revised, a high relative standard
+ * error) keeps the figure and rides along with it. A range symbol (a noise or data-quality band)
+ * beside a `0` is the value a range column publishes, so the zero is a placeholder and the band is
+ * reported in its place; beside a nonzero figure it annotates. A symbol with no published meaning
+ * is treated as withholding — reading its zero as a measurement is the failure this exists to stop.
+ */
+function applyFlag(
+  value: CensusVariableValue,
+  rawFlag: string | null | undefined,
+): CensusVariableValue {
+  const code = rawFlag?.trim();
+  if (!code) return value;
+
+  const known = CENSUS_FLAGS.get(code);
+  const flag = {
+    code,
+    meaning:
+      known?.meaning ??
+      `Flagged "${code}", a symbol the Census documentation for this dataset does not define, so the value beside it is not read as a number`,
+  };
+  const placeholder = value.estimate === 0 || value.estimate === null;
+  if (known?.effect === 'annotates' || (known?.effect === 'ranges' && !placeholder)) {
+    return { ...value, flag };
+  }
+  return {
+    estimate: null,
+    label: value.label,
+    suppressed: true,
+    suppressionReason:
+      known?.effect === 'ranges'
+        ? `Published as a range rather than a number: ${flag.meaning}`
+        : flag.meaning,
+    flag,
   };
 }
 
@@ -122,11 +380,13 @@ export class CensusApiService {
 
   /**
    * Query a Census dataset for variables at a specific geography.
-   * Returns parsed rows with suppression codes resolved.
+   * Returns parsed rows with sentinels and flags resolved.
+   *
+   * The caller is responsible for fitting the columns under `GET_COLUMN_LIMIT` first —
+   * `planQueryColumns` says which optional columns fit.
    */
   async queryData(
-    params: {
-      variables: string[];
+    params: QueryColumns & {
       geographyLevel: string;
       geographyFips: string;
       /** State FIPS code — required for sub-state geography levels. */
@@ -139,21 +399,6 @@ export class CensusApiService {
        * upstream — the API returns the aggregate across that dimension instead.
        */
       predicates?: Record<string, string>;
-      /**
-       * Attribute column to request per filter dimension the query left unset, keyed by
-       * predicate code (e.g. `{ POPGROUP: 'POPGROUP_LABEL' }`). The attribute carries the
-       * label of the default the API applied; requesting the bare predicate code instead
-       * would flip the API from applying one default to enumerating every category.
-       */
-      defaultLabelColumns?: Record<string, string>;
-      /**
-       * Columns that separate several records for one geography, keyed by column code
-       * (e.g. `{ MONTH: 'MONTH_DESC' }`). Both the code and its label column are requested,
-       * so each row carries the value that identifies it and the code to pin it with. Unlike
-       * a required filter dimension, naming one of these in `get=` does not change which rows
-       * come back — the API was already returning them all.
-       */
-      recordColumns?: Record<string, string>;
       dataset: string;
       year: number;
     },
@@ -161,14 +406,15 @@ export class CensusApiService {
   ): Promise<CensusDataRow[]> {
     const { censusApiKey } = getServerConfig();
 
-    const defaultLabelColumns = params.defaultLabelColumns ?? {};
-    const recordColumns = params.recordColumns ?? {};
-    const varList = [
-      'NAME',
-      ...params.variables,
-      ...Object.values(defaultLabelColumns),
-      ...Object.entries(recordColumns).flat(),
-    ].join(',');
+    /**
+     * Beyond the caller's codes, `get=` carries: the label attribute of each filter dimension the
+     * query left unset (`POPGROUP_LABEL` — requesting the bare code instead would flip the API
+     * from applying one default to enumerating every category); both columns of each record
+     * dimension (`MONTH`, `MONTH_DESC`), which name the record a row is without changing which
+     * rows come back; the label column of each wildcarded dimension, whose code the API already
+     * echoes; and each measure's flag column.
+     */
+    const varList = getColumnsFor(params).join(',');
     const forClause = `${params.geographyLevel}:${params.geographyFips}`;
 
     // Build compound in= clause: county FIPS requires state FIPS as the outer scope.
@@ -208,6 +454,7 @@ export class CensusApiService {
             dataset: params.dataset,
             year: params.year,
             availableYears: DATASET_AVAILABLE_YEARS[params.dataset],
+            requestedCodes: params.variables,
           });
         }
         const text = await response.text();
@@ -254,16 +501,7 @@ export class CensusApiService {
       },
     );
 
-    return this.parseResponse(
-      raw,
-      params.variables,
-      params.geographyLevel,
-      params.dataset,
-      predicateKeys,
-      defaultLabelColumns,
-      recordColumns,
-      ctx,
-    );
+    return this.parseResponse(raw, params, ctx);
   }
 
   /**
@@ -332,7 +570,7 @@ export class CensusApiService {
       return { status: 'parent_not_accepted', unacceptedParents, acceptedParents: required };
     }
 
-    return { status: 'ok' };
+    return { status: 'ok', acceptedParents: required };
   }
 
   /**
@@ -545,46 +783,64 @@ export class CensusApiService {
 
   private parseResponse(
     raw: CensusRawResponse,
-    requestedVariables: string[],
-    geographyLevel: string,
-    dataset: string,
-    predicateKeys: string[],
-    defaultLabelColumns: Record<string, string>,
-    recordColumns: Record<string, string>,
+    params: Parameters<CensusApiService['queryData']>[0],
     ctx: Context,
   ): CensusDataRow[] {
     if (raw.length < 1) return [];
 
     const headers = raw[0] as string[];
+    const acs = isAcsDataset(params.dataset);
+    const defaultLabelColumns = params.defaultLabelColumns ?? {};
+    const recordColumns = params.recordColumns ?? {};
+    const flagColumns = params.flagColumns ?? {};
     const nameIdx = headers.indexOf('NAME');
     // The Census API echoes the level name in its own casing, so match it the way
     // checkGeography does rather than requiring the caller's exact spelling.
-    const geoTarget = geographyLevel.trim().toLowerCase();
+    const geoTarget = params.geographyLevel.trim().toLowerCase();
     const geoIdx = headers.findIndex((h) => h.toLowerCase() === geoTarget);
 
     // The Census API appends one column per geography level in the resolved hierarchy —
     // a county query returns state + county, a tract query state + county + tract. It also
-    // echoes back every predicate that was filtered on. Once NAME, the requested variables,
-    // and those echoed predicates are excluded, what remains is the geography hierarchy, and
+    // echoes back every predicate that was filtered on. Once every requested column and those
+    // echoed predicates are excluded, what remains is the geography hierarchy, and
     // concatenating it in order composes the full GEOID.
     const nonGeoColumns = new Set([
-      ...requestedVariables,
-      ...predicateKeys,
-      ...Object.values(defaultLabelColumns),
-      ...Object.entries(recordColumns).flat(),
+      ...getColumnsFor(params),
+      ...Object.keys(params.predicates ?? {}),
     ]);
     const geoColumnIdxs = headers.flatMap((header, idx) =>
-      header !== 'NAME' && !nonGeoColumns.has(header) ? [idx] : [],
+      nonGeoColumns.has(header) ? [] : [idx],
     );
-    const variableIdxs = requestedVariables
-      .map((code) => [code, headers.indexOf(code)] as const)
+    const variableIdxs = params.variables
+      .map((code) => {
+        const flagColumn = flagColumns[code];
+        return [
+          code,
+          headers.indexOf(code),
+          flagColumn ? headers.indexOf(flagColumn) : -1,
+        ] as const;
+      })
       .filter(([, idx]) => idx >= 0);
     const appliedFilterIdxs = Object.entries(defaultLabelColumns)
       .map(([code, column]) => [code, headers.indexOf(column)] as const)
       .filter(([, idx]) => idx >= 0);
-    const recordIdxs = Object.entries(recordColumns)
-      .map(([code, column]) => [code, headers.indexOf(code), headers.indexOf(column)] as const)
-      .filter(([, codeIdx]) => codeIdx >= 0);
+    // A wildcarded dimension labels its rows the way a record dimension does: its code arrives as
+    // the predicate echo, its label from the dimension's own label column when that was requested.
+    const recordIdxs = [
+      ...Object.entries(recordColumns).map(
+        ([code, column]) => [code, headers.indexOf(code), headers.indexOf(column)] as const,
+      ),
+      ...(params.wildcardColumns ?? [])
+        .filter((w) => !Object.hasOwn(recordColumns, w.code))
+        .map(
+          (w) =>
+            [
+              w.code,
+              headers.indexOf(w.code),
+              w.labelColumn ? headers.indexOf(w.labelColumn) : -1,
+            ] as const,
+        ),
+    ].filter(([, codeIdx]) => codeIdx >= 0);
 
     const rows: CensusDataRow[] = [];
 
@@ -595,23 +851,29 @@ export class CensusApiService {
       const geographyGeoid = geoColumnIdxs.map((idx) => row[idx] ?? '').join('') || geographyFips;
 
       const variables: Record<string, CensusVariableValue> = {};
+      const rawValues = new Map<string, string | null>();
 
-      for (const [varCode, idx] of variableIdxs) {
-        variables[varCode] = readValue(row[idx] ?? null, varCode);
+      for (const [varCode, idx, flagIdx] of variableIdxs) {
+        const rawValue = row[idx] ?? null;
+        rawValues.set(varCode, rawValue);
+        const value = readValue(rawValue, varCode, acs);
+        variables[varCode] = flagIdx >= 0 ? applyFlag(value, row[flagIdx]) : value;
       }
 
       // Pair each requested estimate with its margin of error. Only ACS uses the E/M suffix
       // for that relationship — elsewhere an E-final code is just a code, so pairing two of
       // them would attach a margin of error to a value that has none.
-      if (isAcsDataset(dataset)) {
-        for (const varCode of requestedVariables) {
-          if (varCode.endsWith('E')) {
-            const moeCode = `${varCode.slice(0, -1)}M`;
-            const est = variables[varCode];
-            const moe = variables[moeCode];
-            if (est && moe) {
-              est.moe = moe.estimate;
-            }
+      if (acs) {
+        for (const varCode of params.variables) {
+          if (!varCode.endsWith('E')) continue;
+          const moeCode = `${varCode.slice(0, -1)}M`;
+          const est = variables[varCode];
+          const moe = variables[moeCode];
+          if (!est || !moe) continue;
+          est.moe = moe.estimate;
+          // The open-ended MOE sentinel is the only signal that the estimate is a boundary.
+          if (est.estimate !== null && Number(rawValues.get(moeCode)) === ACS_OPEN_ENDED_MOE) {
+            est.openEnded = true;
           }
         }
       }

@@ -16,7 +16,9 @@ import { censusHttpError } from '@/services/census-api/errors.js';
 import {
   DATASET_AVAILABLE_YEARS,
   DATASET_LATEST_YEARS,
+  describeAmbiguousRows,
   describeEmptyPredicatedResult,
+  describeRecordRows,
   describeUnsetPredicates,
   getVariableCacheService,
   initVariableCacheService,
@@ -932,5 +934,190 @@ describe('VariableCacheService accessor', () => {
   it('returns the initialized singleton', () => {
     initVariableCacheService();
     expect(getVariableCacheService()).toBeInstanceOf(VariableCacheService);
+  });
+});
+
+/**
+ * A trimmed ecnbasic 2022 variables.json. Each measure names its `_F` flag column in
+ * `attributes`; `GEO_ID_F` is a flag too ("Geo Footnote"), but on a text column that holds no
+ * measure, and `NAICS2022_F` flags a dimension rather than a value.
+ */
+const ecnbasicFlagsVariablesJson = {
+  variables: {
+    ESTAB: { label: 'Number of establishments', predicateType: 'int', attributes: 'ESTAB_F' },
+    RCPTOT: {
+      label: 'Sales, value of shipments, or revenue ($1,000)',
+      predicateType: 'int',
+      attributes: 'RCPTOT_F',
+    },
+    EMP: { label: 'Number of employees', predicateType: 'int', attributes: 'EMP_F' },
+    GEO_ID: {
+      label: 'Geographic identifier code',
+      predicateType: 'string',
+      attributes: 'GEO_ID_F,NAME',
+    },
+    NAICS2022: {
+      label: '2022 NAICS code',
+      required: 'default displayed',
+      predicateType: 'string',
+      attributes: 'NAICS2022_F,NAICS2022_LABEL,NAICS2022_F',
+    },
+  },
+};
+
+describe('VariableCacheService.lookupVariables', () => {
+  it('names the flag column of each measure that publishes one', async () => {
+    queue(ecnbasicFlagsVariablesJson);
+
+    const found = await service.lookupVariables(
+      ['RCPTOT', 'EMP', 'GEO_ID', 'NAICS2022'],
+      'ecnbasic',
+      2022,
+      createMockContext(),
+    );
+
+    expect(found.get('RCPTOT')?.flagAttribute).toBe('RCPTOT_F');
+    expect(found.get('EMP')?.flagAttribute).toBe('EMP_F');
+    // A footnote on a text column and a flag on a dimension carry no withheld value.
+    expect(found.get('GEO_ID')?.flagAttribute).toBeUndefined();
+    expect(found.get('NAICS2022')?.flagAttribute).toBeUndefined();
+    expect(found.get('NAICS2022')?.labelAttribute).toBe('NAICS2022_LABEL');
+  });
+
+  /** `nonemp` 1997–2007 publish the flag as a variable of its own rather than an attribute. */
+  it('finds a flag published as a standalone variable', async () => {
+    queue({
+      variables: {
+        NESTAB: { label: 'Total number of Establishments', predicateType: 'int' },
+        NESTAB_F: { label: 'Flag for Number of establishments', predicateType: 'string' },
+        NRCPTOT: { label: 'Total Receipts (in thousands of dollars)', predicateType: 'int' },
+      },
+    });
+
+    const found = await service.lookupVariables(
+      ['NESTAB', 'NRCPTOT'],
+      'nonemp',
+      2005,
+      createMockContext(),
+    );
+
+    expect(found.get('NESTAB')?.flagAttribute).toBe('NESTAB_F');
+    expect(found.get('NRCPTOT')?.flagAttribute).toBeUndefined();
+  });
+
+  /**
+   * `variables.json` lists annotation columns only inside `attributes`, so `B19013_001EA` has no
+   * entry of its own. A lookup that failed as a whole on it cost `B19013_001E` its label too.
+   */
+  it('resolves each code on its own and leaves out only the ones with no entry', async () => {
+    queue(acsVariablesJson);
+
+    const found = await service.lookupVariables(
+      ['B19013_001E', 'B19013_001EA', 'B19013_001M'],
+      'acs/acs5',
+      2024,
+      createMockContext(),
+    );
+
+    expect(found.get('B19013_001E')?.label).toBe(
+      'Estimate!!Median household income in the past 12 months',
+    );
+    expect(found.get('B19013_001M')?.label).toContain('Margin of Error');
+    expect(found.has('B19013_001EA')).toBe(false);
+  });
+});
+
+/**
+ * A `*` predicate splits one geography into a row per category — 1,552 on `cbp` `NAICS2017` for
+ * one county. The notices name the values a caller pins with, and a list of all of them would be
+ * longer than the data.
+ */
+describe('record-row notices over a wildcarded dimension', () => {
+  const naics = Array.from({ length: 1552 }, (_, i) => ({
+    code: String(1000 + i),
+    label: `Industry ${i}`,
+  }));
+
+  it('describeRecordRows names the dimension and a bounded sample of its values', () => {
+    const text = describeRecordRows('cbp', 2023, 1552, { NAICS2017: naics });
+
+    expect(text).toContain('NAICS2017');
+    expect(text).toContain('"1000" (Industry 0)');
+    expect(text).toContain('1,542 more');
+    expect(text).not.toContain('"2551"');
+    expect(text.length).toBeLessThan(1500);
+  });
+
+  it('describeAmbiguousRows names the dimension to pin the same way', () => {
+    const text = describeAmbiguousRows('cbp', 2023, 1552, { NAICS2017: naics });
+
+    expect(text).toContain('NAICS2017');
+    expect(text).toContain('1,542 more');
+    expect(text.length).toBeLessThan(1500);
+  });
+
+  it('lists every value when there are only a few', () => {
+    const text = describeRecordRows('pep/charv', 2023, 2, {
+      MONTH: [
+        { code: '4', label: 'April' },
+        { code: '7', label: 'July' },
+      ],
+    });
+
+    expect(text).toContain('"4" (April) and "7" (July)');
+    expect(text).not.toContain('more');
+    expect(text).toContain('pick the record you want rather than the first row');
+  });
+
+  /**
+   * A `"*"` predicate is a breakdown the caller asked for, not a split the dataset imposed, so
+   * the notice says the rows are its categories rather than telling the caller to pick one.
+   */
+  it('describeRecordRows words a wildcarded dimension as the breakdown predicates asked for', () => {
+    const text = describeRecordRows('cbp', 2023, 1552, { NAICS2017: naics }, ['NAICS2017']);
+
+    expect(text).toContain('one row per category of NAICS2017');
+    expect(text).toContain('predicates set it to "*"');
+    expect(text).toContain('"1000" (Industry 0)');
+    expect(text).toContain('1,542 more');
+    expect(text).not.toContain('pick the record you want rather than the first row');
+  });
+
+  /** Every other count in the notices is grouped ("1,542 more"), so the row count is too. */
+  it('groups the thousands of a per-geography row count', () => {
+    const split = { NAICS2017: naics };
+    for (const text of [
+      describeRecordRows('cbp', 2023, 1552, split, ['NAICS2017']),
+      describeRecordRows('cbp', 2023, 1552, split),
+      describeRecordRows('cbp', 2023, 1552, {}),
+      describeAmbiguousRows('cbp', 2023, 1552, split),
+      describeAmbiguousRows('cbp', 2023, 1552, {}),
+    ]) {
+      expect(text).toContain('1,552 rows');
+      expect(text).not.toContain('1552');
+    }
+  });
+
+  it('describeRecordRows words a wildcard and a record split each their own way', () => {
+    const text = describeRecordRows(
+      'pep/charv',
+      2023,
+      4,
+      {
+        MONTH: [
+          { code: '4', label: 'April' },
+          { code: '7', label: 'July' },
+        ],
+        SEX: [
+          { code: '1', label: 'Male' },
+          { code: '2', label: 'Female' },
+        ],
+      },
+      ['SEX'],
+    );
+
+    expect(text).toContain('one row per category of SEX');
+    expect(text).toContain('MONTH separates them');
+    expect(text).toContain('{"MONTH": "7"}');
   });
 });

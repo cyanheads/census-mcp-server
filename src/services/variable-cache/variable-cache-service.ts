@@ -8,6 +8,7 @@ import type { Context } from '@cyanheads/mcp-ts-core';
 import { notFound, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import { fetchWithTimeout, type RequestContext, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getDiscoveryConfig } from '@/config/server-config.js';
+import type { WildcardColumn } from '@/services/census-api/census-api-service.js';
 import { censusHttpError, yearNotAvailable } from '@/services/census-api/errors.js';
 import type {
   CensusVariable,
@@ -118,6 +119,55 @@ export function recordLabelColumnsFor(dimensions: RecordDimension[]): Record<str
 }
 
 /**
+ * Map each requested measure that publishes a flag column to that column. A withheld business
+ * value holds `0`, so the flag is what the response needs to read the number at all.
+ */
+export function flagColumnsFor(
+  codes: readonly string[],
+  metadata: ReadonlyMap<string, CensusVariable>,
+): Record<string, string> {
+  return Object.fromEntries(
+    codes.flatMap((code) => {
+      const flag = metadata.get(code)?.flagAttribute;
+      return flag ? [[code, flag]] : [];
+    }),
+  );
+}
+
+/**
+ * The wildcarded dimensions to label, each with its own `_LABEL`/`_DESC` column when the dataset
+ * publishes one. A dimension that is already a record column is labelled that way and skipped.
+ */
+export function wildcardColumnsFor(
+  wildcards: readonly string[],
+  recordColumns: Record<string, string>,
+  metadata: ReadonlyMap<string, CensusVariable>,
+): WildcardColumn[] {
+  return wildcards
+    .filter((code) => !Object.hasOwn(recordColumns, code))
+    .map((code) => {
+      const labelColumn = metadata.get(code)?.labelAttribute;
+      return labelColumn ? { code, labelColumn } : { code };
+    });
+}
+
+/**
+ * Most values a notice quotes for one record column. A wildcarded dimension can split one
+ * geography into over a thousand rows (`cbp` `NAICS2017: "*"` gives 1,552 for one county), and a
+ * list of every code would be longer than the data it describes.
+ */
+const QUOTED_VALUE_LIMIT = 10;
+
+/** Quote a column's values as `"4" (April) and "7" (July)`, the tail past the limit as a count. */
+function quoteValues(values: Array<{ code: string; label: string }>): string {
+  const quoted = values.slice(0, QUOTED_VALUE_LIMIT).map((v) => `"${v.code}" (${v.label})`);
+  const rest = values.length - quoted.length;
+  return rest > 0
+    ? `${quoted.join(', ')}, and ${rest.toLocaleString('en-US')} more`
+    : quoted.join(' and ');
+}
+
+/**
  * The record columns that actually split the response, with the predicate a caller pins one with.
  * A column that took a single value labelled the rows without separating them, so naming it as a
  * cause would send the caller to a predicate that changes nothing. Returns `undefined` when no
@@ -131,7 +181,8 @@ function splittingRecordColumns(
   const entries = Object.entries(observed).filter(([, values]) => values.length > 1);
   const first = entries[0];
   if (!first) return;
-  return { entries, example: `{"${first[0]}": "${first[1].at(-1)?.code ?? ''}"}` };
+  const example = first[1].slice(0, QUOTED_VALUE_LIMIT).at(-1)?.code ?? '';
+  return { entries, example: `{"${first[0]}": "${example}"}` };
 }
 
 /**
@@ -139,24 +190,44 @@ function splittingRecordColumns(
  * dataset publishes, not a repeat of the same number, so reading either one as "the" answer picks
  * a record the query never asked for. The values observed in the response are what a caller pins
  * the record with.
+ *
+ * A dimension the caller set to `"*"` splits the rows too, but that split is the breakdown the
+ * caller asked for, so it is worded as one row per category rather than as a choice to make.
  */
 export function describeRecordRows(
   dataset: string,
   year: number,
   rowsPerGeography: number,
   observed: Record<string, Array<{ code: string; label: string }>>,
+  wildcards: readonly string[] = [],
 ): string {
-  const splitting = splittingRecordColumns(observed);
+  const rows = rowsPerGeography.toLocaleString('en-US');
+  const breakdowns = Object.entries(observed).filter(([code]) => wildcards.includes(code));
+  const splitting = splittingRecordColumns(
+    Object.fromEntries(Object.entries(observed).filter(([code]) => !wildcards.includes(code))),
+  );
+  const breakdown =
+    breakdowns.length > 0
+      ? `Each geography came back on ${rows} rows: ${breakdowns
+          .map(
+            ([code, values]) =>
+              `one row per category of ${code}, because predicates set it to "*" — the record field on each row names its category, taking ${quoteValues(values)}`,
+          )
+          .join('; ')}.`
+      : undefined;
   if (!splitting) {
-    return `${dataset} (${year}) returned ${rowsPerGeography} rows for a single geography and nothing in the response separates them. Set the dataset's filter dimensions explicitly in predicates to pin one — census_list_predicate_values enumerates the codes each one accepts.`;
+    return (
+      breakdown ??
+      `${dataset} (${year}) returned ${rows} rows for a single geography and nothing in the response separates them. Set the dataset's filter dimensions explicitly in predicates to pin one — census_list_predicate_values enumerates the codes each one accepts.`
+    );
   }
   const named = splitting.entries
-    .map(
-      ([code, values]) =>
-        `${code} separates them, taking ${values.map((v) => `"${v.code}" (${v.label})`).join(' and ')}`,
-    )
+    .map(([code, values]) => `${code} separates them, taking ${quoteValues(values)}`)
     .join('; ');
-  return `Each geography came back on ${rowsPerGeography} rows, one per record ${dataset} (${year}) publishes for it, and the record field on each row says which: ${named}. The numbers differ between them, so pick the record you want rather than the first row — add it to predicates, e.g. ${splitting.example}.`;
+  const records = `${dataset} (${year}) also publishes more than one record for each, and the record field on each row says which: ${named}. The numbers differ between them, so pick the record you want rather than the first row — add it to predicates, e.g. ${splitting.example}.`;
+  return breakdown
+    ? `${breakdown} ${records}`
+    : `Each geography came back on ${rows} rows, one per record ${dataset} (${year}) publishes for it, and the record field on each row says which: ${named}. The numbers differ between them, so pick the record you want rather than the first row — add it to predicates, e.g. ${splitting.example}.`;
 }
 
 /**
@@ -171,17 +242,15 @@ export function describeAmbiguousRows(
   rowsPerGeography: number,
   observed: Record<string, Array<{ code: string; label: string }>>,
 ): string {
+  const rows = rowsPerGeography.toLocaleString('en-US');
   const splitting = splittingRecordColumns(observed);
   if (!splitting) {
-    return `${dataset} (${year}) returned ${rowsPerGeography} rows for a single geography, so a rank cannot identify which one it refers to. Set the dataset's filter dimensions explicitly in predicates — census_list_predicate_values enumerates the codes each one accepts — or query one geography at a time with census_query_data.`;
+    return `${dataset} (${year}) returned ${rows} rows for a single geography, so a rank cannot identify which one it refers to. Set the dataset's filter dimensions explicitly in predicates — census_list_predicate_values enumerates the codes each one accepts — or query one geography at a time with census_query_data.`;
   }
   const named = splitting.entries
-    .map(
-      ([code, values]) =>
-        `${code} took ${values.map((v) => `"${v.code}" (${v.label})`).join(' and ')}`,
-    )
+    .map(([code, values]) => `${code} took ${quoteValues(values)}`)
     .join('; ');
-  return `${dataset} (${year}) publishes several records per geography and this comparison pinned none of them, so every geography came back on ${rowsPerGeography} rows with different values: ${named}. Add the one you want to predicates, e.g. ${splitting.example}. census_query_data returns every record for a single geography, each labelled, if you want to see them side by side first.`;
+  return `${dataset} (${year}) publishes several records per geography and this comparison pinned none of them, so every geography came back on ${rows} rows with different values: ${named}. Add the one you want to predicates, e.g. ${splitting.example}. census_query_data returns every record for a single geography, each labelled, if you want to see them side by side first.`;
 }
 
 /**
@@ -364,6 +433,27 @@ export class VariableCacheService {
     unset.sort((a, b) => a.code.localeCompare(b.code));
 
     return { unset, unknown: params.supplied.filter((code) => !variables.has(code)) };
+  }
+
+  /**
+   * Look up each code on its own, leaving out the ones the dataset's `variables.json` has no entry
+   * for rather than failing the rest. The data API accepts columns that file lists only inside an
+   * entry's `attributes` (`B19013_001EA`, `EMP_F`), so a miss here says nothing about whether a
+   * query will succeed — it only means there is no label to show.
+   */
+  async lookupVariables(
+    codes: readonly string[],
+    dataset: string,
+    year: number,
+    ctx: Context,
+  ): Promise<Map<string, CensusVariable>> {
+    const variables = await this.getVariables(dataset, year, ctx);
+    const found = new Map<string, CensusVariable>();
+    for (const code of codes) {
+      const variable = variables.get(code);
+      if (variable) found.set(code, variable);
+    }
+    return found;
   }
 
   /** Look up one variable, returning undefined rather than throwing when it is not defined. */
@@ -553,12 +643,24 @@ export class VariableCacheService {
       if (entry.group) variable.group = entry.group;
 
       // `attributes` is a comma-separated list mixing flag columns with the label column
-      // (e.g. "NAICS2017_F,NAICS2017_LABEL,NAICS2017_F") — only the label one is useful here.
-      const labelAttribute = entry.attributes
-        ?.split(',')
-        .map((name) => name.trim())
-        .find((name) => name === `${code}_LABEL` || name === `${code}_DESC`);
+      // (e.g. "NAICS2017_F,NAICS2017_LABEL,NAICS2017_F").
+      const attributes = entry.attributes?.split(',').map((name) => name.trim()) ?? [];
+      const labelAttribute = attributes.find(
+        (name) => name === `${code}_LABEL` || name === `${code}_DESC`,
+      );
       if (labelAttribute) variable.labelAttribute = labelAttribute;
+
+      // A measure's flag column is named in `attributes` on current vintages and published as a
+      // variable of its own on the older `nonemp` ones (`NESTAB_F`). Numeric measures only: the
+      // same suffix flags a dimension (`NAICS2017_F`) and footnotes a text column (`GEO_ID_F`),
+      // neither of which withholds a value.
+      const flagAttribute = `${code}_F`;
+      if (
+        (entry.predicateType === 'int' || entry.predicateType === 'float') &&
+        (attributes.includes(flagAttribute) || Object.hasOwn(rawVars, flagAttribute))
+      ) {
+        variable.flagAttribute = flagAttribute;
+      }
 
       // Infer E↔M sibling codes by suffix pattern. ACS variables.json omits M-suffix
       // (MOE) variables, but within ACS the pattern is reliable: B*E estimates always have a

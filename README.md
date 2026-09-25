@@ -40,7 +40,7 @@ U.S. Census Bureau data — datasets, variables, and geography — via the Censu
 | `census_search_variables` | Keyword search across variable labels and concept groups. On ACS, returns estimate and margin-of-error codes together. |
 | `census_get_variable` | Fetch full metadata for one or more variable codes — label, concept, predicate type, universe, MOE sibling. |
 | `census_list_predicate_values` | List the codes a filter dimension accepts (`EMPSZES`, `LFO`, `POPGROUP`, `NAICS2017`…), from the dataset dictionary or a live wildcard enumeration. |
-| `census_resolve_geography` | Convert place names (e.g., "King County, WA") or street addresses to Census FIPS identifiers via TIGERweb and Census Geocoder. |
+| `census_resolve_geography` | Convert place names (e.g., "King County, WA"), ZIP codes, or street addresses to Census FIPS identifiers via TIGERweb and Census Geocoder. |
 | `census_query_data` | Query a Census dataset for variables at a specific geography. Returns estimates with MOE, Census sentinel values and withheld business values resolved to their published meanings, and predicate filtering for the business datasets. |
 | `census_compare_geographies` | Rank and compare variables across multiple geographies — all counties in a state, all states nationally, or a named set. Sorted table output, with the same predicate filtering. |
 
@@ -100,12 +100,17 @@ U.S. Census Bureau data — datasets, variables, and geography — via the Censu
 
 ### `census_resolve_geography` <sub>tool</sub>
 
-- Named places (e.g., "King County, WA") resolve via TIGERweb; street addresses resolve to tract level via Census Geocoder
-- Auto-detects `geography_type` for state, county, place, and tract; metropolitan/micropolitan statistical areas, combined statistical areas, and consolidated cities are never auto-detected and need an explicit `geography_type`, since their names overlap city names
+- Named places (e.g., "King County, WA") resolve via TIGERweb; street addresses resolve to tract level via Census Geocoder, with the address's `block_group_fips` and incorporated `place_fips` alongside
+- The place level covers incorporated places and census-designated places together ("Bethesda, MD" → Bethesda CDP, flagged `census_designated_place`). A CDP answers a name only when no incorporated place or county has it exactly, so "Paradise, CA" is Paradise town and "Arlington, VA" Arlington County; a CDP's full name ("Arlington CDP, VA") or `geography_type: "place"` reaches it
+- A 5-digit ZIP (or ZIP+4) resolves to its ZIP Code Tabulation Area (`zip code tabulation area`) — the ACS's ZIP-shaped area, not `cbp`'s `zip code` level, which takes the ZIP itself with no resolution
+- The state after a comma can be an abbreviation in either case, a full name ("Chatham County, Georgia"), or a hyphenated list ("NE-IA", scoped by its first state)
+- Auto-detects `geography_type` for state, county, place, tract, and ZIP; metropolitan/micropolitan statistical areas, combined statistical areas, consolidated cities, and economic places are never auto-detected and need an explicit `geography_type`, since their names overlap city names
+- `economic place` returns the 8-digit code `ecnbasic` 2022 publishes a place under — its county, or `000` when it spans counties, then its place code (Seattle `03363000`, Auburn, WA `00003180`)
 - Optional `county_fips` scopes resolution to the county and tract levels only — required when a tract name matches more than one county; `county_scope_unsupported` when paired with any other level or a street address
-- Prefers an exactly-named match over a partial one (e.g., "Kansas City, MO" does not resolve to North Kansas City)
+- Matching ignores case. A name no level matches is retried with Saint/St. respelled ("Saint Louis, MO") and with accents ignored ("Dona Ana County, NM"); a statistical area is also retried by its leading city, so a name from an earlier delineation ("Denver-Aurora-Lakewood, CO") still resolves
+- Prefers an exactly-named match over a partial one (e.g., "Kansas City, MO" does not resolve to North Kansas City), across levels too ("King, WA" is King County, not Kingston CDP)
 - A name matching more than one geography returns `ambiguous_name`, with every candidate's FIPS code and the state that separates them
-- Returns `state_fips` (→ `parent_fips`) and `fips_summary` (→ `geography_fips`) ready to pass to other tools; a statistical area omits `state_fips` since it can span several states
+- Returns `state_fips` (→ `parent_fips`) and `fips_summary` (→ `geography_fips`) ready to pass to other tools; a statistical area omits `state_fips` since it can span several states, and a ZCTA omits it because its source layer carries no state
 
 ---
 
@@ -115,6 +120,7 @@ U.S. Census Bureau data — datasets, variables, and geography — via the Censu
 - A wildcard returns up to `limit` rows (default 50, max 500) in GEOID order, and `offset` pages through the rest; `totalCount` and `truncated` say how many rows matched, and the notice names the range returned and the next `offset`. Every row counts, including each `pep/charv` record and each category of a `"*"` predicate
 - Up to 49 variable codes per call, fewer on datasets where label or record columns are added: the Census API accepts 50 columns per request and every query also sends `NAME`. `too_many_variables` states the exact maximum before any request goes out. Codes are case-insensitive, and an unknown one is `variable_not_found`
 - Level and parent are checked against the dataset's own geography metadata before querying — `parent_required` and `parent_not_accepted` name what's missing or unaccepted rather than surfacing a raw Census 400
+- Optional `tract_fips` (exactly 6 digits, with a concrete `county_fips`) scopes a block-group or decennial block query to one tract, so the block group around an address is one call: `block group` `2` in `53`/`033`/`007101`
 - Optional `predicates` map filters the business/`pep`/`dec` datasets (e.g., `{"NAICS2017": "5112"}`); a dimension left unset applies a Census-chosen default — an all-categories total on some datasets, a single category on others — echoed per row in `applied_filters`. Keys are case-insensitive and a blank value counts as omitted; `"*"` returns one row per category, each labelled in `record`
 - A dataset that publishes more than one record per geography (`pep/charv`) returns multiple rows, each carrying a `record` field; pin one with `predicates` (e.g., `{"MONTH": "7"}`)
 - ACS sentinel values resolve to the Census's published meanings, a controlled estimate's margin of error reads as `0`, and a median in an open-ended interval is flagged `open_ended`. On `cbp`, `ecnbasic`, and `nonemp`, a value the Census withheld (stored as `0` beside a flag such as `D`) is reported as suppressed with the flag's meaning. A null `estimate` means the value is either suppressed, a text cell (returned under `value`), or genuinely empty

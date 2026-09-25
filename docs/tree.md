@@ -1,6 +1,6 @@
 # census-mcp-server - Directory Structure
 
-Generated on: 2026-09-25 12:42:04
+Generated on: 2026-09-25 14:38:03
 
 ```text
 census-mcp-server/
@@ -29,6 +29,7 @@ census-mcp-server/
 │   ├── 0.3.x/
 │   ├── 0.4.x/
 │   ├── 0.5.x/
+│   ├── 0.6.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -166,7 +167,8 @@ census-mcp-server/
 │   │   │   └── types.ts
 │   │   └── variable-cache/
 │   │       ├── types.ts
-│   │       └── variable-cache-service.ts
+│   │       ├── variable-cache-service.ts
+│   │       └── variable-search.ts
 │   └── index.ts
 ├── tests/
 │   ├── prompts/
@@ -188,6 +190,7 @@ census-mcp-server/
 │       ├── census-query-data.tool.test.ts
 │       ├── census-resolve-geography.tool.test.ts
 │       ├── census-search-variables.tool.test.ts
+│       ├── census-variable-tools.contract.test.ts
 │       └── tool-input-contract.test.ts
 ├── .dockerignore
 ├── .env.example

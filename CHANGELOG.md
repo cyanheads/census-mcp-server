@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.0](changelog/0.6.x/0.6.0.md) — 2026-09-25 · ⚠️ Breaking
+
+census_search_variables matches every query word as a whole word and ranks by one documented rule, census_get_variable resolves annotation and flag columns with table universes and the published margin labels, every tool accepts dataset codes in any case or by two-part shorthand, and eight new datasets join the catalog.
+
 ## [0.5.0](changelog/0.5.x/0.5.0.md) — 2026-09-25 · ⚠️ Breaking
 
 census_resolve_geography reaches census-designated places, ZIP codes as ZCTAs, and ecnbasic 2022 economic places, matches names case-insensitively with every state-suffix form and respelling retries, and returns an address's block group for census_query_data's new tract_fips scope.

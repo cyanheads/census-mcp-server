@@ -58,7 +58,7 @@ export const censusSearchVariables = tool('census_search_variables', {
     query: z.string().describe('Keyword to search (e.g., "median household income")'),
     dataset: z.string().optional().describe('Dataset to search (default: "acs/acs5")'),
     year: z.number().optional().describe('Vintage year (default: latest for dataset)'),
-    limit: z.number().optional().describe('Max results (default: 20, max: 100)'),
+    limit: z.number().int().min(1).max(100).optional().describe('Max results (default: 20, max: 100)'),
   }),
   output: z.object({
     variables: z.array(z.object({
@@ -84,7 +84,7 @@ export const censusSearchVariables = tool('census_search_variables', {
     const dataset = input.dataset?.trim() || 'acs/acs5';
     const { defaultYear } = getServerConfig();
     const year = input.year ?? DATASET_LATEST_YEARS[dataset] ?? defaultYear;
-    const limit = Math.min(input.limit ?? 20, 100);
+    const limit = input.limit ?? 20;
 
     const service = getVariableCacheService();
     const { variables, totalMatches } = await service.searchVariables(

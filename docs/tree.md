@@ -1,6 +1,6 @@
 # census-mcp-server - Directory Structure
 
-Generated on: 2026-09-19 20:34:23
+Generated on: 2026-09-25 09:55:40
 
 ```text
 census-mcp-server/
@@ -27,6 +27,7 @@ census-mcp-server/
 │   ├── 0.1.x/
 │   ├── 0.2.x/
 │   ├── 0.3.x/
+│   ├── 0.4.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -143,16 +144,17 @@ census-mcp-server/
 │   │   ├── resources/
 │   │   │   └── definitions/
 │   │   └── tools/
-│   │       └── definitions/
-│   │           ├── census-compare-geographies.tool.ts
-│   │           ├── census-get-variable.tool.ts
-│   │           ├── census-list-datasets.tool.ts
-│   │           ├── census-list-geographies.tool.ts
-│   │           ├── census-list-predicate-values.tool.ts
-│   │           ├── census-query-data.tool.ts
-│   │           ├── census-resolve-geography.tool.ts
-│   │           ├── census-search-variables.tool.ts
-│   │           └── index.ts
+│   │       ├── definitions/
+│   │       │   ├── census-compare-geographies.tool.ts
+│   │       │   ├── census-get-variable.tool.ts
+│   │       │   ├── census-list-datasets.tool.ts
+│   │       │   ├── census-list-geographies.tool.ts
+│   │       │   ├── census-list-predicate-values.tool.ts
+│   │       │   ├── census-query-data.tool.ts
+│   │       │   ├── census-resolve-geography.tool.ts
+│   │       │   ├── census-search-variables.tool.ts
+│   │       │   └── index.ts
+│   │       └── variable-entry.ts
 │   ├── services/
 │   │   ├── census-api/
 │   │   │   ├── census-api-service.ts
@@ -177,6 +179,7 @@ census-mcp-server/
 │   │       └── variable-cache-service.test.ts
 │   └── tools/
 │       ├── census-compare-geographies.tool.test.ts
+│       ├── census-data-tools.contract.test.ts
 │       ├── census-get-variable.tool.test.ts
 │       ├── census-list-datasets.tool.test.ts
 │       ├── census-list-geographies.tool.test.ts

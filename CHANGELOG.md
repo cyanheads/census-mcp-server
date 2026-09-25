@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.0](changelog/0.4.x/0.4.0.md) — 2026-09-25 · ⚠️ Breaking
+
+census_query_data returns wildcard results 50 rows at a time with limit/offset paging; ACS sentinels and withheld business values decode to their published meanings; limit, sort_by, empty variables, and the variable count are validated before any Census request.
+
 ## [0.3.4](changelog/0.3.x/0.3.4.md) — 2026-09-19
 
 Framework bump to mcp-ts-core 0.13.6 declares stateless HTTP session mode in src/index.ts, moves argument rejections to an InvalidParams envelope with a Recovery line and reason suffix, and moves the skill tree to framework-skills/; a public Streamable HTTP endpoint is now declared in server.json.

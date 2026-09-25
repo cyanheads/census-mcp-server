@@ -7,8 +7,9 @@ import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { censusSearchVariables } from '@/mcp-server/tools/definitions/census-search-variables.tool.js';
 
-// Mock the variable cache service and server config
-vi.mock('@/services/variable-cache/variable-cache-service.js', () => ({
+// Mock the variable cache service and server config; dataset resolution stays real.
+vi.mock('@/services/variable-cache/variable-cache-service.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/services/variable-cache/variable-cache-service.js')>()),
   DATASET_LATEST_YEARS: { 'acs/acs5': 2024 },
   getVariableCacheService: vi.fn(),
 }));
@@ -138,16 +139,15 @@ describe('censusSearchVariables', () => {
     expect(text).toContain('B19013_001M');
   });
 
-  it('throws dataset_not_found when service rejects unknown dataset', async () => {
-    const { McpError, JsonRpcErrorCode: codes } = await import('@cyanheads/mcp-ts-core/errors');
-    mockSearchVariables.mockRejectedValue(
-      new McpError(codes.NotFound, 'Dataset not found: bogus/ds', { reason: 'dataset_not_found' }),
-    );
+  it('throws dataset_not_found for an unknown dataset, before the service is called', async () => {
+    const { JsonRpcErrorCode: codes } = await import('@cyanheads/mcp-ts-core/errors');
     const ctx = createMockContext({ errors: censusSearchVariables.errors });
     const input = censusSearchVariables.input.parse({ query: 'income', dataset: 'bogus/ds' });
     await expect(censusSearchVariables.handler(input, ctx)).rejects.toMatchObject({
       code: codes.NotFound,
+      data: { reason: 'dataset_not_found', dataset: 'bogus/ds' },
     });
+    expect(mockSearchVariables).not.toHaveBeenCalled();
   });
 
   it('throws variables_unavailable when service is down', async () => {

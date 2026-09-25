@@ -8,7 +8,8 @@ import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { censusGetVariable } from '@/mcp-server/tools/definitions/census-get-variable.tool.js';
 
-vi.mock('@/services/variable-cache/variable-cache-service.js', () => ({
+vi.mock('@/services/variable-cache/variable-cache-service.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/services/variable-cache/variable-cache-service.js')>()),
   DATASET_LATEST_YEARS: { 'acs/acs5': 2024 },
   getVariableCacheService: vi.fn(),
 }));

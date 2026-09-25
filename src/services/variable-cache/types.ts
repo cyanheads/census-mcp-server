@@ -5,10 +5,24 @@
 
 /** A single variable entry from Census variables.json. */
 export interface CensusVariable {
+  /**
+   * Column this attribute column annotates or flags, as the per-variable endpoint publishes it
+   * (e.g. "B19013_001E" for `B19013_001EA`). Present on attribute columns and ACS margins of
+   * error only.
+   */
+  attributeOf?: string;
+  /** Kind of attribute column, as published (e.g. "ANNOTATION", "FLAG", "LABEL"). */
+  attributeType?: string;
   /** Variable code (e.g., "B19013_001E"). */
   code: string;
-  /** Concept group the variable belongs to (e.g., "MEDIAN HOUSEHOLD INCOME IN THE PAST 12 MONTHS"). */
-  concept: string;
+  /**
+   * Concept of the table the variable belongs to (e.g., "Median Household Income in the Past 12
+   * Months"). Absent on a column shared across tables (`GEO_ID`, the `ecnbasic` measures): its
+   * `group` lists every table and its concept joins every one of theirs — 99,266 bytes for
+   * `GEO_ID` on `acs/acs5` 2024 — so it names none of them and matches almost any query. Also
+   * absent when the dataset publishes no concept for the column (the ACS `STATE` column).
+   */
+  concept?: string;
   /** Corresponding estimate variable code when this is a MOE variable. */
   estimateCode?: string;
   /**
@@ -41,7 +55,11 @@ export interface CensusVariable {
    * API applies its own default to when a query omits it, rather than rejecting the query.
    */
   required?: boolean;
-  /** Universe the variable applies to (e.g., "Households"). */
+  /**
+   * Universe of the variable's table (e.g., "Households"). The Census publishes it per table in
+   * groups.json rather than per variable, so it is set only by `getVariablesByCode`, and only
+   * when the variable's table publishes one.
+   */
   universe?: string;
   /**
    * Codes this filter dimension accepts, mapped to their labels. Only `NAICS*` and `POPGROUP`
@@ -104,7 +122,30 @@ export interface RawVariableEntry {
   predicateType?: string;
   /** Present (as "default displayed") when the API defaults this dimension instead of erroring. */
   required?: string;
-  universe?: string;
   /** Published code→label map, on the few dimensions that carry one. */
   values?: { item?: Record<string, string> };
+}
+
+/**
+ * One column's entry from the per-variable endpoint (`…/variables/<CODE>.json`). Attribute
+ * columns have no variables.json entry of their own, so this is the only place their label and
+ * the column they belong to are published. A column that is no attribute (`STATE`) carries
+ * `null` in the attribute and type fields.
+ */
+export interface RawVariableRecord {
+  'attribute of'?: string | null;
+  'attribute type'?: string | null;
+  concept?: string;
+  group?: string;
+  label?: string;
+  name?: string;
+  predicateType?: string | null;
+}
+
+/**
+ * groups.json, one entry per table. The universe key is spelled with a trailing space
+ * (`"universe "`), and tables that publish no universe omit it.
+ */
+export interface RawGroupsJson {
+  groups?: Array<{ name?: string; 'universe '?: string; universe?: string }>;
 }

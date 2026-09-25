@@ -1,11 +1,13 @@
 /**
  * @fileoverview Census variable cache service. Fetches and caches variables.json per dataset+year
- * with a configurable TTL, then performs client-side keyword search across label and concept fields.
+ * with a configurable TTL, then performs client-side keyword search across label and concept
+ * fields. Attribute columns and table universes, which variables.json does not carry, are fetched
+ * on first lookup and cached with it.
  * @module services/variable-cache/variable-cache-service
  */
 
 import type { Context } from '@cyanheads/mcp-ts-core';
-import { notFound, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
+import { McpError, notFound, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import { fetchWithTimeout, type RequestContext, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getDiscoveryConfig } from '@/config/server-config.js';
 import type { WildcardColumn } from '@/services/census-api/census-api-service.js';
@@ -13,10 +15,13 @@ import { censusHttpError, yearNotAvailable } from '@/services/census-api/errors.
 import type {
   CensusVariable,
   PredicateCheck,
+  RawGroupsJson,
+  RawVariableRecord,
   RawVariablesJson,
   RecordDimension,
   UnsetPredicate,
 } from './types.js';
+import { rankVariables, type VariableSearchResult } from './variable-search.js';
 
 const CENSUS_API_BASE = 'https://api.census.gov/data';
 
@@ -26,12 +31,13 @@ const CENSUS_API_BASE = 'https://api.census.gov/data';
  * advertises all derive from it, so a caller cannot be pointed at a year the query path refuses.
  *
  * The list is what a query here can answer with, which is narrower than what the Census API
- * hosts, for two separate reasons. A vintage can be absent upstream: `pep/charv` publishes the
+ * hosts, for three separate reasons. A vintage can be absent upstream: `pep/charv` publishes the
  * 2023 vintage alone, and its 2020 through 2022 numbers are values of that vintage's own `YEAR`
- * dimension, so `variables.json` 404s for those paths. Or it can exist upstream and reject the
+ * dimension, so `variables.json` 404s for those paths. It can exist upstream and reject the
  * `NAME` column every query here requests, which is `cbp` before 2012 and `nonemp` 2008 through
- * 2011. `yearNotAvailable` therefore says a year cannot be queried rather than that the dataset
- * does not publish it, which would be false for the second kind.
+ * 2011. Or upstream can fail on it: `acs/acs1/spp` answers HTTP 500 to `POPGROUP_LABEL` on 2008
+ * and to every `us` query on 2010. `yearNotAvailable` therefore says a year cannot be queried
+ * rather than that the dataset does not publish it, which would be false for the last two kinds.
  *
  * A vintage the Census publishes that is missing here is refused before the network, so the
  * lists are checked against `api.census.gov/data/<year>.json` — the per-vintage catalog — rather
@@ -56,8 +62,22 @@ export const DATASET_AVAILABLE_YEARS: Record<string, number[]> = {
     2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2021,
     2022, 2023, 2024,
   ],
+  'acs/acs1/subject': [
+    2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024,
+  ],
+  'acs/acs5/cprofile': [2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024],
+  'acs/acs1/cprofile': [
+    2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024,
+  ],
+  'acs/acsse': [2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024],
+  'acs/acs1/spp': [
+    2009, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024,
+  ],
   'pep/charv': [2023],
   'dec/pl': [2000, 2010, 2020],
+  'dec/dhc': [2020],
+  'dec/dp': [2020],
+  'dec/sdhc': [2020],
   'dec/ddhca': [2020],
   cbp: [2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023],
   ecnbasic: [2012, 2017, 2022],
@@ -69,6 +89,57 @@ export const DATASET_AVAILABLE_YEARS: Record<string, number[]> = {
 
 /** Known dataset codes for validation. */
 export const KNOWN_DATASETS = new Set(Object.keys(DATASET_AVAILABLE_YEARS));
+
+/** The recovery every `dataset_not_found` carries. */
+const DATASET_RECOVERY = {
+  hint: 'Call census_list_datasets to discover valid dataset codes like acs/acs5.',
+};
+
+/**
+ * Resolve a caller's dataset code to the registered one, or throw `dataset_not_found`.
+ *
+ * The input is trimmed and lowercased — every registered code is lowercase, so each code accepted
+ * as spelled still resolves to itself. A blank input is `fallback` when the tool's dataset is
+ * optional and an error when it is required. A single segment resolves when it is the second
+ * segment of exactly one two-segment code (`acs5` is `acs/acs5`, `pl` is `dec/pl`). A third segment
+ * (`profile`, `subject`) never resolves, because it is or can become shared — acs/acs5/subject
+ * stopped being the only `subject` when acs/acs1/subject was added — so its error names the codes
+ * that end in it instead.
+ */
+export function resolveDataset(input: string | undefined, fallback?: string): string {
+  const trimmed = input?.trim() ?? '';
+  if (!trimmed) {
+    if (fallback) return fallback;
+    throw notFound(
+      'No dataset code was given. Pass a dataset code such as "acs/acs5"; census_list_datasets lists them all.',
+      { reason: 'dataset_not_found', dataset: trimmed, recovery: DATASET_RECOVERY },
+    );
+  }
+
+  const code = trimmed.toLowerCase();
+  if (KNOWN_DATASETS.has(code)) return code;
+
+  if (!code.includes('/')) {
+    const segments = [...KNOWN_DATASETS].map((known) => known.split('/'));
+    const [only, ...others] = segments.filter((s) => s.length === 2 && s[1] === code);
+    if (only && others.length === 0) return only.join('/');
+
+    const endingIn = segments
+      .filter((s) => s.length === 3 && s[2] === code)
+      .map((s) => s.join('/'));
+    if (endingIn.length > 0) {
+      throw notFound(
+        `Unknown dataset: "${trimmed}" is the last segment of ${listCodes(endingIn)}, not a dataset code of its own. Pass the full code.`,
+        { reason: 'dataset_not_found', dataset: trimmed, recovery: DATASET_RECOVERY },
+      );
+    }
+  }
+
+  throw notFound(
+    `Unknown dataset: "${trimmed}". Use census_list_datasets to see valid dataset codes.`,
+    { reason: 'dataset_not_found', dataset: trimmed, recovery: DATASET_RECOVERY },
+  );
+}
 
 /** Map of dataset to latest available year. */
 export const DATASET_LATEST_YEARS: Record<string, number> = Object.fromEntries(
@@ -83,6 +154,16 @@ export const DATASET_LATEST_YEARS: Record<string, number> = Object.fromEntries(
  */
 export function isAcsDataset(dataset: string): boolean {
   return dataset.startsWith('acs/');
+}
+
+/**
+ * True for the ACS datasets that publish a margin of error beside each estimate. The comparison
+ * profiles (`acs/acs5/cprofile`, `acs/acs1/cprofile`) publish none — the data API answers
+ * `CP03_2024_062M` with HTTP 400 — so inferring M codes there advertises columns that cannot be
+ * queried. They still write ACS sentinels, which `isAcsDataset` keeps decoding.
+ */
+function publishesMarginsOfError(dataset: string): boolean {
+  return isAcsDataset(dataset) && !dataset.endsWith('/cprofile');
 }
 
 /**
@@ -320,8 +401,57 @@ export function describeEmptyPredicatedResult(
   return parts.join(' ');
 }
 
+/**
+ * True for a `group` naming more than one table (`"B17015,B18104,…"`). Such a column's concept
+ * joins every one of those tables' concepts, so it describes none of them.
+ */
+function isSharedAcrossTables(group: string | undefined): boolean {
+  return group?.includes(',') ?? false;
+}
+
+/** The one table a variable belongs to, or undefined for shared and table-less columns. */
+function tableOf(variable: CensusVariable): string | undefined {
+  const { group } = variable;
+  return group && group !== 'N/A' && !isSharedAcrossTables(group) ? group : undefined;
+}
+
+/**
+ * The label the Census publishes for an estimate's margin-of-error column: the estimate label with
+ * its `Estimate` segment replaced by `Margin of Error`, wherever it sits (`Estimate!!Total` on
+ * current vintages, `Number!!Estimate!!…` and `Total!!Estimate!!…` on older ones). A current
+ * profile percent column has no such segment and opens with `Percent!!`, which becomes
+ * `Percent Margin of Error!!`. A label with neither is prefixed whole.
+ */
+function marginOfErrorLabel(estimateLabel: string): string {
+  const segments = estimateLabel.split('!!');
+  const estimate = segments.indexOf('Estimate');
+  if (estimate !== -1) return segments.with(estimate, 'Margin of Error').join('!!');
+  if (segments[0] === 'Percent')
+    return ['Percent Margin of Error', ...segments.slice(1)].join('!!');
+  return `Margin of Error!!${estimateLabel}`;
+}
+
+/** Per-variable requests in flight at once when one lookup names several attribute columns. */
+const ATTRIBUTE_FETCH_CONCURRENCY = 4;
+
 interface CacheEntry {
+  /**
+   * Every column named in some entry's `attributes` list — `B19013_001EA`, `EMP_F`,
+   * `NAICS2017_LABEL`. variables.json gives these no entry of their own, so this index is what
+   * separates a column the dataset has from a code it does not.
+   */
+  attributeNames: Set<string>;
+  /** Attribute columns already resolved from the per-variable endpoint. */
+  attributes: Map<string, CensusVariable>;
   fetchedAt: number;
+  /**
+   * The dataset's spelling of each column name that is not all uppercase, keyed by its uppercase
+   * form. Only the comparison profiles have any (`CP03_2024to2019_062SS`), and upstream rejects
+   * the uppercased spelling.
+   */
+  spellings: Map<string, string>;
+  /** Universe per table from groups.json, loaded on the first lookup that needs one. */
+  universes?: Map<string, string>;
   variables: Map<string, CensusVariable>;
 }
 
@@ -329,65 +459,37 @@ export class VariableCacheService {
   private readonly cache = new Map<string, CacheEntry>();
 
   /**
-   * Search variables by keyword across label and concept fields.
-   * Returns variables sorted by relevance (exact concept match > label match > partial).
+   * Search variables by keyword across label and concept fields. `rankVariables` holds the
+   * matching and ordering rule.
    */
   async searchVariables(
     params: { query: string; dataset: string; year: number; limit: number },
     ctx: Context,
-  ): Promise<{ variables: CensusVariable[]; totalMatches: number }> {
-    const variables = await this.getVariables(params.dataset, params.year, ctx);
-    const queryLower = params.query.toLowerCase();
-    const queryTerms = queryLower.split(/\s+/).filter(Boolean);
-
-    const scored: Array<{ variable: CensusVariable; score: number }> = [];
-
-    for (const variable of variables.values()) {
-      const labelLower = variable.label.toLowerCase();
-      const conceptLower = variable.concept.toLowerCase();
-
-      let score = 0;
-      if (conceptLower === queryLower) score += 100;
-      else if (conceptLower.includes(queryLower)) score += 50;
-      if (labelLower === queryLower) score += 80;
-      else if (labelLower.includes(queryLower)) score += 40;
-      for (const term of queryTerms) {
-        if (conceptLower.includes(term)) score += 10;
-        if (labelLower.includes(term)) score += 5;
-      }
-
-      if (score > 0) scored.push({ variable, score });
-    }
-
-    scored.sort((a, b) => b.score - a.score);
-
-    return {
-      variables: scored.slice(0, params.limit).map((s) => s.variable),
-      totalMatches: scored.length,
-    };
+  ): Promise<VariableSearchResult> {
+    const { variables } = await this.getEntry(params.dataset, params.year, ctx);
+    return rankVariables(variables, params.query, params.limit);
   }
 
   /**
-   * Get metadata for specific variable codes. Throws if any code is not found.
+   * Get metadata for specific variable codes, in the order given, with each one's table universe.
+   * Throws `variable_not_found` naming every code the dataset has no column for, before any
+   * further request goes out.
+   *
+   * A code variables.json lists only inside an entry's `attributes` is resolved from the
+   * per-variable endpoint, which publishes its label and the column it belongs to. An uppercased
+   * code resolves to the dataset's own spelling where that differs.
    */
   async getVariablesByCode(
-    codes: string[],
+    requested: string[],
     dataset: string,
     year: number,
     ctx: Context,
   ): Promise<CensusVariable[]> {
-    const variables = await this.getVariables(dataset, year, ctx);
-    const results: CensusVariable[] = [];
-    const missing: string[] = [];
-
-    for (const code of codes) {
-      const variable = variables.get(code);
-      if (variable) {
-        results.push(variable);
-      } else {
-        missing.push(code);
-      }
-    }
+    const entry = await this.getEntry(dataset, year, ctx);
+    const codes = requested.map((code) => entry.spellings.get(code) ?? code);
+    const missing = codes.filter(
+      (code) => !entry.variables.has(code) && !entry.attributeNames.has(code),
+    );
 
     if (missing.length > 0) {
       throw notFound(`Variable codes not found in ${dataset} (${year}): ${missing.join(', ')}`, {
@@ -401,7 +503,31 @@ export class VariableCacheService {
       });
     }
 
-    return results;
+    const unresolved = [
+      ...new Set(codes.filter((code) => !entry.variables.has(code) && !entry.attributes.has(code))),
+    ];
+    for (let i = 0; i < unresolved.length; i += ATTRIBUTE_FETCH_CONCURRENCY) {
+      await Promise.all(
+        unresolved.slice(i, i + ATTRIBUTE_FETCH_CONCURRENCY).map(async (code) => {
+          entry.attributes.set(code, await this.fetchAttribute(code, dataset, year, ctx));
+        }),
+      );
+    }
+
+    const resolved = codes.flatMap((code) => {
+      const variable = entry.variables.get(code) ?? entry.attributes.get(code);
+      return variable ? [variable] : [];
+    });
+
+    const universes = resolved.some((v) => tableOf(v))
+      ? await this.getUniverses(entry, dataset, year, ctx)
+      : undefined;
+
+    return resolved.map((variable) => {
+      const table = tableOf(variable);
+      const universe = table ? universes?.get(table) : undefined;
+      return universe ? { ...variable, universe } : variable;
+    });
   }
 
   /**
@@ -542,23 +668,166 @@ export class VariableCacheService {
     if (!KNOWN_DATASETS.has(dataset)) {
       throw notFound(
         `Unknown dataset: "${dataset}". Use census_list_datasets to see valid dataset codes.`,
-        {
-          reason: 'dataset_not_found',
-          dataset,
-          recovery: {
-            hint: 'Call census_list_datasets to discover valid dataset codes like acs/acs5.',
-          },
-        },
+        { reason: 'dataset_not_found', dataset, recovery: DATASET_RECOVERY },
       );
     }
   }
 
-  /** Get or fetch the variable map for a dataset+year. Cached in-memory with TTL. */
+  /** The variable map for a dataset+year. */
   private async getVariables(
     dataset: string,
     year: number,
     ctx: Context,
   ): Promise<Map<string, CensusVariable>> {
+    return (await this.getEntry(dataset, year, ctx)).variables;
+  }
+
+  /**
+   * GET one Census metadata document and parse it, retrying transient failures. `mapError`
+   * translates a failed fetch (unchanged by default); an HTML page or unparseable body is
+   * `variables_unavailable`.
+   */
+  private fetchMetadata(
+    url: string,
+    what: string,
+    scope: { dataset: string; year: number },
+    ctx: Context,
+    mapError: (error: unknown) => unknown = (error) => error,
+  ): Promise<unknown> {
+    return withRetry(
+      async () => {
+        let response: Response;
+        try {
+          response = await fetchWithTimeout(url, 30_000, ctx as unknown as RequestContext, {
+            signal: ctx.signal,
+            // A 404 is an answer here, not a fault — a dropped vintage, or a dataset that
+            // publishes no groups.json — so it is logged at debug and handled by the caller.
+            expectedStatuses: [404],
+          });
+        } catch (error) {
+          throw mapError(error);
+        }
+        const text = await response.text();
+
+        if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
+          throw serviceUnavailable(
+            `Census ${what} returned HTML for ${scope.dataset} (${scope.year}).`,
+            { reason: 'variables_unavailable', ...ctx.recoveryFor('variables_unavailable') },
+          );
+        }
+
+        try {
+          return JSON.parse(text) as unknown;
+        } catch {
+          throw serviceUnavailable(
+            `Census ${what} could not be parsed for ${scope.dataset} (${scope.year}).`,
+            { reason: 'variables_unavailable', ...ctx.recoveryFor('variables_unavailable') },
+          );
+        }
+      },
+      {
+        operation: 'VariableCacheService.getVariables',
+        context: ctx as unknown as RequestContext,
+        baseDelayMs: 2000,
+        signal: ctx.signal,
+      },
+    );
+  }
+
+  /** The metadata a failed per-variable or groups.json fetch leaves the lookup without. */
+  private metadataUnavailable(
+    what: string,
+    scope: { dataset: string; year: number },
+    ctx: Context,
+    cause: unknown,
+  ): McpError {
+    const status =
+      cause instanceof McpError ? (cause.data?.status as number | undefined) : undefined;
+    return serviceUnavailable(
+      `Census ${what} could not be fetched for ${scope.dataset} (${scope.year})${status ? `: HTTP ${status}` : ''}.`,
+      {
+        reason: 'variables_unavailable',
+        dataset: scope.dataset,
+        year: scope.year,
+        ...(status !== undefined && { status }),
+        ...ctx.recoveryFor('variables_unavailable'),
+      },
+      { cause },
+    );
+  }
+
+  /**
+   * Resolve one attribute column from the per-variable endpoint. Any failure is
+   * `variables_unavailable`: the code was found in the dataset's own attributes index, so a miss
+   * here is the endpoint failing rather than the code not existing.
+   */
+  private async fetchAttribute(
+    code: string,
+    dataset: string,
+    year: number,
+    ctx: Context,
+  ): Promise<CensusVariable> {
+    const url = `${CENSUS_API_BASE}/${year}/${dataset}/variables/${encodeURIComponent(code)}.json`;
+    const what = `variable metadata for ${code}`;
+    let raw: RawVariableRecord;
+    try {
+      raw = (await this.fetchMetadata(url, what, { dataset, year }, ctx)) as RawVariableRecord;
+    } catch (error) {
+      throw this.metadataUnavailable(what, { dataset, year }, ctx, error);
+    }
+
+    const variable: CensusVariable = {
+      code,
+      label: raw.label ?? '',
+      predicateType: raw.predicateType ?? 'string',
+    };
+    if (raw.concept && !isSharedAcrossTables(raw.group)) variable.concept = raw.concept;
+    if (raw.group) variable.group = raw.group;
+    if (raw['attribute of']) variable.attributeOf = raw['attribute of'];
+    if (raw['attribute type']) variable.attributeType = raw['attribute type'];
+    return variable;
+  }
+
+  /**
+   * Universe per table, from groups.json, cached on the entry so it expires with variables.json.
+   * A dataset that publishes no groups.json (a 404) has no universes; any other failure is
+   * `variables_unavailable`, since leaving the field out would claim the table publishes none.
+   */
+  private async getUniverses(
+    entry: CacheEntry,
+    dataset: string,
+    year: number,
+    ctx: Context,
+  ): Promise<Map<string, string>> {
+    if (entry.universes) return entry.universes;
+
+    const universes = new Map<string, string>();
+    let raw: RawGroupsJson | undefined;
+    try {
+      raw = (await this.fetchMetadata(
+        `${CENSUS_API_BASE}/${year}/${dataset}/groups.json`,
+        'groups.json',
+        { dataset, year },
+        ctx,
+      )) as RawGroupsJson;
+    } catch (error) {
+      const notPublished = error instanceof McpError && error.data?.status === 404;
+      if (!notPublished)
+        throw this.metadataUnavailable('groups.json', { dataset, year }, ctx, error);
+    }
+
+    for (const group of raw?.groups ?? []) {
+      // The Census spells the key with a trailing space; the unpadded spelling is read too.
+      const universe = (group['universe '] ?? group.universe)?.trim();
+      if (group.name && universe) universes.set(group.name, universe);
+    }
+
+    entry.universes = universes;
+    return universes;
+  }
+
+  /** Get or fetch the cache entry for a dataset+year. Cached in-memory with TTL. */
+  private async getEntry(dataset: string, year: number, ctx: Context): Promise<CacheEntry> {
     this.validateDataset(dataset);
     this.validateYear(dataset, year);
 
@@ -569,63 +838,25 @@ export class VariableCacheService {
 
     if (existing && Date.now() - existing.fetchedAt < ttlMs) {
       ctx.log.debug('Variable cache hit', { dataset, year });
-      return existing.variables;
+      return existing;
     }
 
     ctx.log.info('Fetching variables.json', { dataset, year });
-    const url = `${CENSUS_API_BASE}/${year}/${dataset}/variables.json`;
-
-    const raw = await withRetry(
-      async () => {
-        let response: Response;
-        try {
-          response = await fetchWithTimeout(url, 30_000, ctx as unknown as RequestContext, {
-            signal: ctx.signal,
-            // A vintage this catalog lists that the API has since dropped is an expected
-            // outcome, not a fault — log it at debug and answer with year_not_available.
-            expectedStatuses: [404],
-          });
-        } catch (error) {
-          throw censusHttpError(error, {
-            dataset,
-            year,
-            availableYears: DATASET_AVAILABLE_YEARS[dataset],
-          });
-        }
-        const text = await response.text();
-
-        if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
-          throw serviceUnavailable(
-            `Census variables.json returned HTML for ${dataset} (${year}).`,
-            { reason: 'variables_unavailable' },
-          );
-        }
-
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(text);
-        } catch {
-          throw serviceUnavailable(
-            `Census variables.json could not be parsed for ${dataset} (${year}).`,
-            { reason: 'variables_unavailable' },
-          );
-        }
-
-        return parsed as RawVariablesJson;
-      },
-      {
-        operation: 'VariableCacheService.getVariables',
-        context: ctx as unknown as RequestContext,
-        baseDelayMs: 2000,
-        signal: ctx.signal,
-      },
-    );
+    const raw = (await this.fetchMetadata(
+      `${CENSUS_API_BASE}/${year}/${dataset}/variables.json`,
+      'variables.json',
+      { dataset, year },
+      ctx,
+      (error) =>
+        censusHttpError(error, { dataset, year, availableYears: DATASET_AVAILABLE_YEARS[dataset] }),
+    )) as RawVariablesJson;
 
     const variables = new Map<string, CensusVariable>();
+    const attributeNames = new Set<string>();
     const rawVars = raw.variables ?? {};
     // The E/M suffix convention is an ACS table convention, not a Census-wide one — inferring
-    // it elsewhere invents codes the dataset does not have.
-    const acsFamily = isAcsDataset(dataset);
+    // it elsewhere, or on the ACS comparison profiles, invents codes the dataset does not have.
+    const inferMargins = publishesMarginsOfError(dataset);
 
     for (const [code, entry] of Object.entries(rawVars)) {
       if (code === 'for' || code === 'in' || code === 'ucgid') continue;
@@ -633,20 +864,30 @@ export class VariableCacheService {
       const variable: CensusVariable = {
         code,
         label: entry.label ?? '',
-        concept: entry.concept ?? '',
         predicateType: entry.predicateType ?? 'string',
       };
 
-      if (entry.universe) variable.universe = entry.universe;
+      if (entry.concept && !isSharedAcrossTables(entry.group)) variable.concept = entry.concept;
       if (entry.required != null) variable.required = true;
       if (entry.values?.item) variable.values = entry.values.item;
       if (entry.group) variable.group = entry.group;
 
       // `attributes` is a comma-separated list mixing flag columns with the label column
       // (e.g. "NAICS2017_F,NAICS2017_LABEL,NAICS2017_F").
-      const attributes = entry.attributes?.split(',').map((name) => name.trim()) ?? [];
+      const attributes =
+        entry.attributes
+          ?.split(',')
+          .map((name) => name.trim())
+          .filter(Boolean) ?? [];
+      for (const name of attributes) attributeNames.add(name);
+      // `_TTL` labels a filter dimension on some vintages (`acs/acs1/spp` 2012–2017 `POPGROUP_TTL`).
+      // It is read only on a required dimension, since a labelled column that is not required is
+      // taken as a record dimension, and requesting one changes which rows a query returns.
       const labelAttribute = attributes.find(
-        (name) => name === `${code}_LABEL` || name === `${code}_DESC`,
+        (name) =>
+          name === `${code}_LABEL` ||
+          name === `${code}_DESC` ||
+          (variable.required === true && name === `${code}_TTL`),
       );
       if (labelAttribute) variable.labelAttribute = labelAttribute;
 
@@ -666,10 +907,16 @@ export class VariableCacheService {
       // (MOE) variables, but within ACS the pattern is reliable: B*E estimates always have a
       // B*M counterpart accessible via the data API. Check rawVars first (some datasets do
       // include M codes), then fall back to pattern-based inference for E-suffix codes.
-      if (acsFamily) {
+      // A geography column (`STATE`, `PLACE`, `LSAD_NAME`) sits beside the estimates with
+      // `group: "N/A"`; it can end in E, but it is no estimate and has no margin.
+      if (inferMargins && entry.group !== 'N/A') {
         if (code.endsWith('M')) {
           const estimateCode = `${code.slice(0, -1)}E`;
-          if (rawVars[estimateCode]) variable.estimateCode = estimateCode;
+          if (rawVars[estimateCode]) {
+            variable.estimateCode = estimateCode;
+            variable.attributeOf = estimateCode;
+            variable.attributeType = 'MARGIN_OF_ERROR';
+          }
         } else if (code.endsWith('E')) {
           const moeCode = `${code.slice(0, -1)}M`;
           // Set moeCode regardless of whether the M code appears in variables.json —
@@ -681,23 +928,41 @@ export class VariableCacheService {
       variables.set(code, variable);
     }
 
-    // Synthesize M-suffix entries for E-suffix variables so direct lookup of B*M codes works.
-    // These synthetic entries let census_get_variable resolve M codes without a variables_not_found error.
+    // Synthesize the M entries variables.json leaves out, as the Census publishes each one in its
+    // own per-variable record, so a lookup or search of an M code needs no further request.
     for (const [code, variable] of variables) {
       if (variable.moeCode && !variables.has(variable.moeCode)) {
         variables.set(variable.moeCode, {
           code: variable.moeCode,
-          label: `Margin of Error — ${variable.label}`,
-          concept: variable.concept,
-          predicateType: 'int',
+          label: marginOfErrorLabel(variable.label),
+          ...(variable.concept !== undefined && { concept: variable.concept }),
+          ...(variable.group && { group: variable.group }),
+          // A margin is an integer unless its estimate is fractional: the year medians are typed
+          // `string`, but their published margins are `int`.
+          predicateType: variable.predicateType === 'float' ? 'float' : 'int',
           estimateCode: code,
+          attributeOf: code,
+          attributeType: 'MARGIN_OF_ERROR',
         });
       }
     }
 
-    this.cache.set(cacheKey, { variables, fetchedAt: Date.now() });
+    const spellings = new Map<string, string>();
+    for (const name of [...variables.keys(), ...attributeNames]) {
+      const upper = name.toUpperCase();
+      if (upper !== name) spellings.set(upper, name);
+    }
+
+    const fresh: CacheEntry = {
+      variables,
+      attributeNames,
+      attributes: new Map(),
+      fetchedAt: Date.now(),
+      spellings,
+    };
+    this.cache.set(cacheKey, fresh);
     ctx.log.info('Variable cache populated', { dataset, year, variableCount: variables.size });
-    return variables;
+    return fresh;
   }
 }
 

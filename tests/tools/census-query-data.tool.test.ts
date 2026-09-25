@@ -41,7 +41,7 @@ vi.mock('@/config/server-config.js', () => ({
 
 const mockQueryData = vi.fn();
 const mockCheckGeography = vi.fn();
-const mockGetVariablesByCode = vi.fn();
+const mockLookupVariables = vi.fn();
 const mockCheckPredicates = vi.fn();
 const mockGetRecordDimensions = vi.fn();
 const mockValidateYear = vi.fn();
@@ -62,7 +62,7 @@ beforeEach(async () => {
     '@/services/variable-cache/variable-cache-service.js'
   );
   vi.mocked(getVariableCacheService).mockReturnValue({
-    getVariablesByCode: mockGetVariablesByCode,
+    lookupVariables: mockLookupVariables,
     checkPredicates: mockCheckPredicates,
     getRecordDimensions: mockGetRecordDimensions,
     validateYear: mockValidateYear,
@@ -83,8 +83,8 @@ beforeEach(async () => {
   // Default: the dataset publishes one row per geography, so nothing separates records.
   mockGetRecordDimensions.mockResolvedValue([]);
 
-  // Default: label enrichment returns the code as label (best-effort)
-  mockGetVariablesByCode.mockResolvedValue([]);
+  // Default: the variable cache has no entry for any requested code, so labels fall back.
+  mockLookupVariables.mockResolvedValue(new Map());
 });
 
 describe('censusQueryData', () => {
@@ -180,17 +180,23 @@ describe('censusQueryData', () => {
     });
   });
 
-  it('throws too_many_variables when more than 50 requested', async () => {
+  /**
+   * The Census API caps `get=` at 50 columns and every query sends NAME, so 50 codes is 51
+   * columns — rejected upstream as an untyped 400 before the cap counted NAME.
+   */
+  it('throws too_many_variables for 50 codes, naming 49 as the maximum', async () => {
     const ctx = createMockContext({ errors: censusQueryData.errors });
-    const manyVars = Array.from({ length: 51 }, (_, i) => `B19013_${String(i).padStart(3, '0')}E`);
+    const manyVars = Array.from({ length: 50 }, (_, i) => `B19013_${String(i).padStart(3, '0')}E`);
     const input = censusQueryData.input.parse({
       variables: manyVars,
       geography_level: 'state',
       geography_fips: '06',
     });
     await expect(censusQueryData.handler(input, ctx)).rejects.toMatchObject({
-      data: { reason: 'too_many_variables' },
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'too_many_variables', requested: 50, maxVariables: 49 },
     });
+    expect(mockQueryData).not.toHaveBeenCalled();
   });
 
   it('passes countyFips to apiService for tract-level queries', async () => {
@@ -492,7 +498,7 @@ describe('censusQueryData', () => {
             estimate: null,
             label: 'B19013_001E',
             suppressed: true,
-            suppressionReason: 'Not available — geography too small or data not collected',
+            suppressionReason: 'Estimate not computable: too few sample observations',
           },
         },
       },
@@ -511,7 +517,7 @@ describe('censusQueryData', () => {
       { suppressed: boolean; suppression_reason?: string }
     >;
     expect(vars.B19013_001E?.suppressed).toBe(true);
-    expect(vars.B19013_001E?.suppression_reason).toContain('geography too small');
+    expect(vars.B19013_001E?.suppression_reason).toContain('too few sample observations');
   });
 
   it('forwards predicates to the api service', async () => {
@@ -993,7 +999,7 @@ describe('censusQueryData', () => {
               estimate: null,
               label: 'Median household income',
               suppressed: true,
-              suppression_reason: 'Not available — geography too small',
+              suppression_reason: 'Cannot be displayed: too few sample cases in this geography',
             },
           },
         },
@@ -1001,8 +1007,9 @@ describe('censusQueryData', () => {
     };
     const blocks = censusQueryData.format!(output);
     const text = (blocks[0] as { type: string; text: string }).text;
-    expect(text).toContain('Suppressed');
-    expect(text).toContain('geography too small');
+    expect(text).toContain(
+      '**B19013_001E:** Suppressed (Cannot be displayed: too few sample cases in this geography)',
+    );
   });
 
   /**
@@ -1181,18 +1188,7 @@ describe('censusQueryData', () => {
     );
   });
 
-  it('label enrichment from variable cache falls through to api label on cache failure', async () => {
-    // variable cache throws — handler catches and continues
-    const { getVariableCacheService } = await import(
-      '@/services/variable-cache/variable-cache-service.js'
-    );
-    vi.mocked(getVariableCacheService).mockReturnValue({
-      getVariablesByCode: vi.fn().mockRejectedValue(new Error('cache cold')),
-      checkPredicates: mockCheckPredicates,
-      getRecordDimensions: mockGetRecordDimensions,
-      validateYear: mockValidateYear,
-    } as never);
-
+  it('falls back to the service label for a code the variable cache has no entry for', async () => {
     mockQueryData.mockResolvedValue([
       {
         geographyName: 'Oregon',
@@ -1303,14 +1299,14 @@ describe('censusQueryData', () => {
     });
   });
 
-  it('throws with exactly 50 variables — boundary accepted', async () => {
+  it('accepts 49 variables, the most NAME leaves room for — boundary accepted', async () => {
     mockQueryData.mockResolvedValue([
       {
         geographyName: 'State X',
         geographyFips: '01',
         geographyGeoid: '01',
         variables: Object.fromEntries(
-          Array.from({ length: 50 }, (_, i) => [
+          Array.from({ length: 49 }, (_, i) => [
             `B${String(i).padStart(7, '0')}E`,
             { estimate: i, label: `Var ${i}`, suppressed: false },
           ]),
@@ -1319,9 +1315,9 @@ describe('censusQueryData', () => {
     ]);
 
     const ctx = createMockContext({ errors: censusQueryData.errors });
-    const vars50 = Array.from({ length: 50 }, (_, i) => `B${String(i).padStart(7, '0')}E`);
+    const vars49 = Array.from({ length: 49 }, (_, i) => `B${String(i).padStart(7, '0')}E`);
     const input = censusQueryData.input.parse({
-      variables: vars50,
+      variables: vars49,
       geography_level: 'state',
       geography_fips: '01',
     });

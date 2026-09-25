@@ -27,8 +27,12 @@
 
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { describe, expect, it } from 'vitest';
+import { censusCompareGeographies } from '@/mcp-server/tools/definitions/census-compare-geographies.tool.js';
 import { censusListDatasets } from '@/mcp-server/tools/definitions/census-list-datasets.tool.js';
 import { censusListGeographies } from '@/mcp-server/tools/definitions/census-list-geographies.tool.js';
+import { censusListPredicateValues } from '@/mcp-server/tools/definitions/census-list-predicate-values.tool.js';
+import { censusQueryData } from '@/mcp-server/tools/definitions/census-query-data.tool.js';
+import { censusSearchVariables } from '@/mcp-server/tools/definitions/census-search-variables.tool.js';
 import { allToolDefinitions } from '@/mcp-server/tools/definitions/index.js';
 
 /** JSON-RPC code for an argument rejection, as a client reads it off the wire. */
@@ -123,4 +127,107 @@ describe('tool input contract', () => {
     expect(text).toContain('Call census_list_datasets to discover valid dataset codes');
     expect(text).toContain('(reason dataset_not_found');
   });
+});
+
+/**
+ * Every count input is bounded in the schema, so the bound reaches the published JSON Schema a
+ * client renders and an out-of-range value never reaches a handler. A bound that lives only in
+ * the describe prose lets a negative limit slice from the end of a list, 0 return an empty page,
+ * and a fraction pass through.
+ */
+describe('bounded count inputs', () => {
+  /** Each bounded input, the smallest valid call around it, and its published bounds. */
+  const bounded = [
+    {
+      definition: censusSearchVariables,
+      field: 'limit',
+      base: { query: 'median household income' },
+      minimum: 1,
+      maximum: 100,
+    },
+    {
+      definition: censusCompareGeographies,
+      field: 'limit',
+      base: { variables: ['B19013_001E'], geography_level: 'state' },
+      minimum: 1,
+      maximum: 500,
+    },
+    {
+      definition: censusListPredicateValues,
+      field: 'limit',
+      base: { predicate: 'NAICS2017', dataset: 'cbp' },
+      minimum: 1,
+      maximum: 500,
+    },
+    {
+      definition: censusQueryData,
+      field: 'limit',
+      base: { variables: ['B19013_001E'], geography_level: 'county', geography_fips: '*' },
+      minimum: 1,
+      maximum: 500,
+    },
+    {
+      definition: censusQueryData,
+      field: 'offset',
+      base: { variables: ['B19013_001E'], geography_level: 'county', geography_fips: '*' },
+      minimum: 0,
+      maximum: undefined,
+    },
+  ] as const;
+
+  const label = (entry: (typeof bounded)[number]) => `${entry.definition.name} ${entry.field}`;
+
+  it.each(bounded.map((entry) => [label(entry), entry] as const))(
+    '%s publishes an integer with its bounds',
+    (_label, { definition, field, minimum, maximum }) => {
+      const schema = definition.input.toJSONSchema() as {
+        properties: Record<string, { type?: string; minimum?: number; maximum?: number }>;
+      };
+      const property = schema.properties[field];
+
+      expect(property?.type).toBe('integer');
+      expect(property?.minimum).toBe(minimum);
+      if (maximum === undefined) {
+        // `.int()` alone would publish Number.MAX_SAFE_INTEGER; an offset has no bound to state.
+        expect(property?.maximum ?? Number.MAX_SAFE_INTEGER).toBe(Number.MAX_SAFE_INTEGER);
+      } else {
+        expect(property?.maximum).toBe(maximum);
+      }
+    },
+  );
+
+  const rejected = bounded.flatMap((entry) =>
+    [entry.minimum - 1, -1, 2.5, ...(entry.maximum === undefined ? [] : [entry.maximum + 1])]
+      .filter((value, index, all) => all.indexOf(value) === index)
+      .map((value) => [label(entry), value, entry] as const),
+  );
+
+  it.each(rejected)(
+    '%s rejects %s as an InvalidParams envelope naming the field',
+    async (_label, value, { definition, field, base }) => {
+      // The handler never runs on a rejected call, so no tool reaches its upstream API here.
+      const { isError, text, code, data } = errorOf(
+        await runToolContract(definition as never, { ...base, [field]: value } as never),
+      );
+
+      expect(isError).toBe(true);
+      expect(code).toBe(INVALID_PARAMS);
+      expect(data.reason).toBe('invalid_arguments');
+      expect(data.issues).toEqual(
+        expect.arrayContaining([expect.objectContaining({ path: [field] })]),
+      );
+      expect(text).toContain(field);
+    },
+  );
+
+  it.each(bounded.map((entry) => [label(entry), entry] as const))(
+    '%s accepts its bounds and an omitted value',
+    (_label, { definition, field, base, minimum, maximum }) => {
+      expect(definition.input.safeParse(base).success).toBe(true);
+      expect(definition.input.safeParse({ ...base, [field]: minimum }).success).toBe(true);
+      if (maximum !== undefined) {
+        expect(definition.input.safeParse({ ...base, [field]: maximum }).success).toBe(true);
+      }
+    },
+  );
 });

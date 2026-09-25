@@ -40,7 +40,7 @@ vi.mock('@/config/server-config.js', () => ({
 
 const mockQueryData = vi.fn();
 const mockCheckGeography = vi.fn();
-const mockGetVariablesByCode = vi.fn();
+const mockLookupVariables = vi.fn();
 const mockCheckPredicates = vi.fn();
 const mockGetRecordDimensions = vi.fn();
 const mockValidateYear = vi.fn();
@@ -61,7 +61,7 @@ beforeEach(async () => {
     '@/services/variable-cache/variable-cache-service.js'
   );
   vi.mocked(getVariableCacheService).mockReturnValue({
-    getVariablesByCode: mockGetVariablesByCode,
+    lookupVariables: mockLookupVariables,
     checkPredicates: mockCheckPredicates,
     getRecordDimensions: mockGetRecordDimensions,
     validateYear: mockValidateYear,
@@ -82,8 +82,8 @@ beforeEach(async () => {
   // Default: the dataset publishes one row per geography, so nothing separates records.
   mockGetRecordDimensions.mockResolvedValue([]);
 
-  // Default: label enrichment best-effort (returns nothing — codes used as labels)
-  mockGetVariablesByCode.mockResolvedValue([]);
+  // Default: the variable cache has no entry for any requested code, so labels fall back.
+  mockLookupVariables.mockResolvedValue(new Map());
 });
 
 describe('censusCompareGeographies', () => {
@@ -627,7 +627,13 @@ describe('censusCompareGeographies', () => {
     expect(enrichment.sortVariable).toBe('B01001_001E');
   });
 
-  it('caps limit at 500 even when input is higher', async () => {
+  it('rejects a limit above 500 at the schema rather than clamping it', () => {
+    const base = { variables: ['B19013_001E'], geography_level: 'county' };
+    expect(censusCompareGeographies.input.safeParse({ ...base, limit: 501 }).success).toBe(false);
+    expect(censusCompareGeographies.input.safeParse({ ...base, limit: 500 }).success).toBe(true);
+  });
+
+  it('returns 500 rows at limit 500 and does not advise raising the limit past it', async () => {
     const manyRows = Array.from({ length: 600 }, (_, i) => ({
       geographyName: `County ${i}`,
       geographyFips: String(i).padStart(5, '0'),
@@ -642,14 +648,16 @@ describe('censusCompareGeographies', () => {
     const input = censusCompareGeographies.input.parse({
       variables: ['B19013_001E'],
       geography_level: 'county',
-      limit: 999,
+      limit: 500,
     });
     const result = await censusCompareGeographies.handler(input, ctx);
 
-    expect(result.rows.length).toBeLessThanOrEqual(500);
+    expect(result.rows).toHaveLength(500);
     const enrichment = getEnrichment(ctx);
     expect(enrichment.truncated).toBe(true);
     expect(enrichment.totalCount).toBe(600);
+    expect(enrichment.notice).toContain('100 more geographies not shown');
+    expect(enrichment.notice).not.toMatch(/Increase the limit/);
   });
 
   it('sets truncated=false when results fit within limit', async () => {
@@ -738,17 +746,7 @@ describe('censusCompareGeographies', () => {
     expect(enrichment.year).toBe(2022);
   });
 
-  it('label enrichment cache failure does not block comparison', async () => {
-    const { getVariableCacheService } = await import(
-      '@/services/variable-cache/variable-cache-service.js'
-    );
-    vi.mocked(getVariableCacheService).mockReturnValue({
-      getVariablesByCode: vi.fn().mockRejectedValue(new Error('cache cold')),
-      checkPredicates: mockCheckPredicates,
-      getRecordDimensions: mockGetRecordDimensions,
-      validateYear: mockValidateYear,
-    } as never);
-
+  it('ranks a code the variable cache has no entry for under the service label', async () => {
     mockQueryData.mockResolvedValue([
       {
         geographyName: 'County X',
@@ -767,6 +765,8 @@ describe('censusCompareGeographies', () => {
     });
     const result = await censusCompareGeographies.handler(input, ctx);
     expect(result.rows).toHaveLength(1);
+    const variables = result.rows[0]?.variables as Record<string, { label: string }>;
+    expect(variables.B19013_001E?.label).toBe('Median income');
   });
 
   it('format output never contains API key or secrets', () => {
@@ -1307,6 +1307,23 @@ describe('censusCompareGeographies — datasets that publish several records per
     await expect(censusCompareGeographies.handler(charvInput(), ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.ValidationError,
       data: { reason: 'ambiguous_rows', rowsPerGeography: 2 },
+    });
+  });
+
+  it('groups the thousands of the per-geography row count in the error message', async () => {
+    mockQueryData.mockResolvedValue(
+      Array.from({ length: 1552 }, (_, i) => ({
+        geographyName: 'King County, Washington',
+        geographyFips: '033',
+        geographyGeoid: '53033',
+        variables: { POP: { estimate: i, label: 'POP', suppressed: false } },
+        record: { NAICS2017: { code: String(1000 + i), label: `Industry ${i}` } },
+      })),
+    );
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    await expect(censusCompareGeographies.handler(charvInput(), ctx)).rejects.toMatchObject({
+      message: expect.stringContaining('returned 1,552 rows for each state'),
     });
   });
 

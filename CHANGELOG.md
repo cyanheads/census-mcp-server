@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.1](changelog/0.6.x/0.6.1.md) — 2026-10-08
+
+mcp-ts-core ^0.13.6 → ^0.13.14: tool error results end with a request ID and no longer carry server stack traces or root-cause text, more mistyped tool arguments are repaired before validation, and the Docker image moves to the multi-arch deps-stage layout with a health check.
+
 ## [0.6.0](changelog/0.6.x/0.6.0.md) — 2026-09-25 · ⚠️ Breaking
 
 census_search_variables matches every query word as a whole word and ranks by one documented rule, census_get_variable resolves annotation and flag columns with table universes and the published margin labels, every tool accepts dataset codes in any case or by two-part shorthand, and eight new datasets join the catalog.

@@ -95,8 +95,10 @@ describe('tool input contract', () => {
   );
 
   it('appends the synthesized recovery hint and reason term to the rejection text', async () => {
+    // A boolean, not a number: since mcp-ts-core 0.13.9 an integer sent for a string field is
+    // repaired to its digits before validation, so only a boolean keeps the wrong-type intent.
     const { text, data } = errorOf(
-      await runToolContract(censusListDatasets, { filter: 1 } as never),
+      await runToolContract(censusListDatasets, { filter: true } as never),
     );
 
     expect(text).toContain('filter');
@@ -126,6 +128,25 @@ describe('tool input contract', () => {
     expect(data.reason).toBe('dataset_not_found');
     expect(text).toContain('Call census_list_datasets to discover valid dataset codes');
     expect(text).toContain('(reason dataset_not_found');
+  });
+
+  it('fills the declared recovery hint for a bare ctx.fail throw', async () => {
+    // The handler throws `ctx.fail('sort_by_not_requested', …)` with no recovery of its own; the
+    // framework fills the hint from the errors[] entry. The check runs before any request.
+    const { isError, text, data } = errorOf(
+      await runToolContract(censusCompareGeographies, {
+        variables: ['B19013_001E'],
+        geography_level: 'state',
+        sort_by: 'B01001_001E',
+      } as never),
+    );
+
+    expect(isError).toBe(true);
+    expect(data.reason).toBe('sort_by_not_requested');
+    expect(data.recovery).toEqual(
+      expect.objectContaining({ hint: expect.stringContaining('Set sort_by to one of the codes') }),
+    );
+    expect(text).toContain('Set sort_by to one of the codes');
   });
 });
 

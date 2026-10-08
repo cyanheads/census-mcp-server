@@ -422,7 +422,6 @@ export const censusQueryData = tool('census_query_data', {
           year,
           geographyLevel: input.geography_level,
           availableLevels: check.availableLevels,
-          ...ctx.recoveryFor('geography_not_supported'),
         },
       );
     }
@@ -501,7 +500,6 @@ export const censusQueryData = tool('census_query_data', {
           dataset,
           year,
           unknownPredicates: predicateCheck.unknown,
-          ...ctx.recoveryFor('predicate_not_supported'),
         },
       );
     }

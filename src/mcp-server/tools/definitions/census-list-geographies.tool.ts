@@ -93,7 +93,6 @@ export const censusListGeographies = tool('census_list_geographies', {
       throw ctx.fail('year_not_available', `No geography data found for ${dataset} (${year})`, {
         dataset,
         year,
-        ...ctx.recoveryFor('year_not_available'),
       });
     }
 

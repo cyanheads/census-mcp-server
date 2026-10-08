@@ -315,7 +315,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
       throw ctx.fail(
         'sort_by_not_requested',
         `sort_by "${sortBy}" is not one of the requested variables (${variables.join(', ')}), so there is nothing to rank on.`,
-        { sortBy, variables, ...ctx.recoveryFor('sort_by_not_requested') },
+        { sortBy, variables },
       );
     }
 
@@ -366,7 +366,6 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
           year,
           geographyLevel: input.geography_level,
           availableLevels: check.availableLevels,
-          ...ctx.recoveryFor('geography_not_supported'),
         },
       );
     }
@@ -433,7 +432,6 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
           dataset,
           year,
           unknownPredicates: predicateCheck.unknown,
-          ...ctx.recoveryFor('predicate_not_supported'),
         },
       );
     }

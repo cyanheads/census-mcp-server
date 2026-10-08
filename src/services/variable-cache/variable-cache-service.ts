@@ -712,7 +712,7 @@ export class VariableCacheService {
         if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
           throw serviceUnavailable(
             `Census ${what} returned HTML for ${scope.dataset} (${scope.year}).`,
-            { reason: 'variables_unavailable', ...ctx.recoveryFor('variables_unavailable') },
+            { reason: 'variables_unavailable' },
           );
         }
 
@@ -721,7 +721,7 @@ export class VariableCacheService {
         } catch {
           throw serviceUnavailable(
             `Census ${what} could not be parsed for ${scope.dataset} (${scope.year}).`,
-            { reason: 'variables_unavailable', ...ctx.recoveryFor('variables_unavailable') },
+            { reason: 'variables_unavailable' },
           );
         }
       },
@@ -738,7 +738,6 @@ export class VariableCacheService {
   private metadataUnavailable(
     what: string,
     scope: { dataset: string; year: number },
-    ctx: Context,
     cause: unknown,
   ): McpError {
     const status =
@@ -750,7 +749,6 @@ export class VariableCacheService {
         dataset: scope.dataset,
         year: scope.year,
         ...(status !== undefined && { status }),
-        ...ctx.recoveryFor('variables_unavailable'),
       },
       { cause },
     );
@@ -773,7 +771,7 @@ export class VariableCacheService {
     try {
       raw = (await this.fetchMetadata(url, what, { dataset, year }, ctx)) as RawVariableRecord;
     } catch (error) {
-      throw this.metadataUnavailable(what, { dataset, year }, ctx, error);
+      throw this.metadataUnavailable(what, { dataset, year }, error);
     }
 
     const variable: CensusVariable = {
@@ -812,8 +810,7 @@ export class VariableCacheService {
       )) as RawGroupsJson;
     } catch (error) {
       const notPublished = error instanceof McpError && error.data?.status === 404;
-      if (!notPublished)
-        throw this.metadataUnavailable('groups.json', { dataset, year }, ctx, error);
+      if (!notPublished) throw this.metadataUnavailable('groups.json', { dataset, year }, error);
     }
 
     for (const group of raw?.groups ?? []) {

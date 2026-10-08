@@ -221,7 +221,7 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
       throw ctx.fail(
         'predicate_not_supported',
         `"${predicate}" is not a variable in ${dataset} (${year}).`,
-        { dataset, year, predicate, ...ctx.recoveryFor('predicate_not_supported') },
+        { dataset, year, predicate },
       );
     }
 
@@ -232,7 +232,7 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
       throw ctx.fail(
         'not_a_filter_dimension',
         `"${predicate}" is not one of the dimensions ${dataset} (${year}) filters on.`,
-        { dataset, year, predicate, ...ctx.recoveryFor('not_a_filter_dimension') },
+        { dataset, year, predicate },
       );
     }
 
@@ -296,7 +296,6 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
         dataset,
         year,
         predicate,
-        ...ctx.recoveryFor('no_values'),
       });
     }
 

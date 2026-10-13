@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.2](changelog/0.6.x/0.6.2.md) — 2026-10-13
+
+Adds the dec/ddhcb 2020 dataset, sibling-table and sibling-dataset hints for codes and groups a table does not publish, variable and table code search, and NYC borough resolution; fixes mixed-case comparison-profile columns, Bronx and Queens place matches, and repeated error text.
+
 ## [0.6.1](changelog/0.6.x/0.6.1.md) — 2026-10-08
 
 mcp-ts-core ^0.13.6 → ^0.13.14: tool error results end with a request ID and no longer carry server stack traces or root-cause text, more mistyped tool arguments are repaired before validation, and the Docker image moves to the multi-arch deps-stage layout with a health check.

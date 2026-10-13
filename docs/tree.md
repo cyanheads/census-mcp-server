@@ -1,6 +1,6 @@
 # census-mcp-server - Directory Structure
 
-Generated on: 2026-10-08 11:18:51
+Generated on: 2026-10-13 15:44:21
 
 ```text
 census-mcp-server/
@@ -173,6 +173,8 @@ census-mcp-server/
 │   │       └── variable-search.ts
 │   └── index.ts
 ├── tests/
+│   ├── fixtures/
+│   │   └── dec-ddhcb-2020-popgroup.json
 │   ├── prompts/
 │   ├── resources/
 │   ├── services/

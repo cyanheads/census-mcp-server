@@ -106,7 +106,13 @@ const DATASETS = [
     datasetId: 'dec/ddhca',
     name: 'Detailed Demographic and Housing Characteristics File A (DDHC-A)',
     description:
-      'Detailed demographic and housing characteristics from the Decennial Census, published per detailed race and ethnic group. Every value is scoped by the predicate POPGROUP, and there is no code for all groups combined — the "Total population" code 001 that appears in the dataset dictionary returns nothing at any level. A query that omits POPGROUP is answered with one group the API picks rather than an error, so read the applied_filters label on each row before treating a number as a population total, and use dec/pl P1_001N when the total is what is wanted. census_list_predicate_values on POPGROUP finds a group code by keyword.',
+      'Detailed demographic and housing characteristics from the Decennial Census, published per detailed race and ethnic group. Every value is scoped by the predicate POPGROUP, and there is no code for all groups combined — the "Total population" code 001 that appears in the dataset dictionary returns nothing at any level. A query that omits POPGROUP is answered with one group the API picks rather than an error, so read the applied_filters label on each row before treating a number as a population total, and use dec/pl P1_001N when the total is what is wanted. T01001 publishes every group, but the sex-by-age tables T02001, T02002, and T02003 split the groups between them: at each geography a group is published in at most one of the three, and many groups in none, with only their T01001 total published there. A query on one table returns nothing for a group another holds there or none of them publishes, and the no_data hint or the response notice names the other two. census_list_predicate_values on POPGROUP finds a group code by keyword.',
+  },
+  {
+    datasetId: 'dec/ddhcb',
+    name: 'Detailed Demographic and Housing Characteristics File B (DDHC-B)',
+    description:
+      'Household type and tenure from the 2020 Census, published per detailed race and ethnic group through the predicate POPGROUP. At each geography a group is published in only one household-type table — T03001 (total only), T03002, T03003, or T03004 — and only one tenure table, T04001 (total only) or T04002, so a query on one table returns nothing for a group another holds there, and the no_data hint or the response notice names the other tables. There is no code for all groups combined: the dictionary declares codes below 1002, and none of them is published. A query that omits POPGROUP is answered with 1002 (European alone) rather than an error, so read the applied_filters label before treating a number as a total. T03001_001N (households) and T04001_001N (occupied housing units) are separate estimates and usually differ for the same group. census_list_predicate_values on POPGROUP finds a group code by keyword.',
   },
   {
     datasetId: 'cbp',

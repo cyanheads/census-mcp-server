@@ -257,6 +257,22 @@ const STATE_NAME_ALIASES: Record<string, string> = {
   'virgin islands': 'VI',
 };
 
+/**
+ * New York City's five boroughs, keyed by their folded name, each coextensive with one New York
+ * county — TIGERweb holds exactly one county subdivision, the borough, in each of the five. Three
+ * are published under a different county name, so the county level asks for that name instead.
+ * The relationship has been fixed since 1914, when Bronx County was split from New York County
+ * (Richmond borough became Staten Island in 1975, the county keeping its name), so this table
+ * does not drift with TIGERweb vintages the way a spelling alias would.
+ */
+const NYC_BOROUGHS: Record<string, { borough: string; county: string; countyFips: string }> = {
+  brooklyn: { borough: 'Brooklyn', county: 'Kings', countyFips: '047' },
+  manhattan: { borough: 'Manhattan', county: 'New York', countyFips: '061' },
+  'staten island': { borough: 'Staten Island', county: 'Richmond', countyFips: '085' },
+  bronx: { borough: 'The Bronx', county: 'Bronx', countyFips: '005' },
+  queens: { borough: 'Queens', county: 'Queens', countyFips: '081' },
+};
+
 /** Two-letter postal abbreviation → 2-digit state FIPS, for WHERE clauses on non-state layers. */
 const STATE_ABBR_TO_FIPS: Record<string, string> = Object.fromEntries(
   US_STATES.map((s) => [s.abbr, s.fips]),
@@ -326,6 +342,8 @@ type LayerFeature = TigerwebFeature & { layer: number };
  * one row is the geography, several are `ambiguous_name`.
  */
 interface LevelMatch {
+  /** The New York City borough the county level was queried through, by its county's name. */
+  borough?: string;
   /**
    * Every row is a census-designated place named exactly the term. A CDP is a statistical area
    * rather than a government, so it answers only when no later level has an exact row: "Arlington,
@@ -357,6 +375,20 @@ const stripMarks = (value: string) => value.normalize('NFD').replace(/\p{M}+/gu,
 
 /** Lowercase and strip diacritics — "Doña Ana" and "dona ana" fold to the same string. */
 const fold = (value: string) => stripMarks(value).toLowerCase().trim();
+
+/**
+ * The New York City borough a name gives, when its state suffix is New York — "Brooklyn", "The
+ * Bronx", or the Census's own "Queens borough" form.
+ */
+const nycBorough = ({ placeName, stateAbbr }: SplitName) =>
+  stateAbbr === 'NY'
+    ? NYC_BOROUGHS[
+        fold(placeName)
+          .replace(/\s+/g, ' ')
+          .replace(/^the /, '')
+          .replace(/\s+borough$/, '')
+      ]
+    : undefined;
 
 /**
  * The name respelled with each Saint token in TIGERweb's abbreviated form ("Saint Louis" →
@@ -508,8 +540,13 @@ export class GeographyService {
   /**
    * Query one geography level for the name as given. Resolves to `null` when its layers have
    * no row for it.
+   *
+   * A New York City borough is read at the county level as its county's own name ("Brooklyn, NY"
+   * asks for Kings), as that level's query term rather than a retry, so a place row that only
+   * contains the borough name never outranks the county. The place level keeps the name as given:
+   * "Manhattan" read as "New York" there would answer with New York city, a different geography.
    */
-  private resolvePrimary(
+  private async resolvePrimary(
     trimmed: string,
     geographyType: GeographyType,
     lookup: NameLookup,
@@ -539,6 +576,16 @@ export class GeographyService {
     }
 
     const { placeName } = lookup.split;
+    const borough = geographyType === 'county' ? nycBorough(lookup.split) : undefined;
+    if (borough && fold(borough.county) !== fold(placeName)) {
+      const match = await this.resolveTerm(
+        geographyType,
+        { pattern: borough.county.toUpperCase(), exactTerm: borough.county },
+        lookup,
+      );
+      return match && { ...match, borough: borough.borough };
+    }
+
     return this.resolveTerm(
       geographyType,
       { pattern: placeName.toUpperCase(), exactTerm: placeName },
@@ -583,8 +630,14 @@ export class GeographyService {
    * Query one geography level for one spelling of the name. Matching is case-insensitive —
    * TIGERweb's `LIKE` is not, so both sides are uppercased — and scoped by the state suffix
    * and county the caller gave, wherever the layer can express them.
+   *
+   * A New York City borough is no place, so on the place and economic place levels a row that
+   * only contains its name is a different geography ("Bronx, NY" would settle on Bronxville
+   * village, "Queens, NY" on Queensbury town) and counts as no row; a place named exactly the term
+   * still answers. Every spelling of the name passes through here, so the rule holds for the
+   * respelling retries too.
    */
-  private resolveTerm(
+  private async resolveTerm(
     geographyType: GeographyType,
     term: SearchTerm,
     lookup: NameLookup,
@@ -609,7 +662,7 @@ export class GeographyService {
       whereClause += ` AND COUNTY='${lookup.countyFips}'`;
     }
 
-    return this.findMatches({
+    const match = await this.findMatches({
       ...lookup,
       geographyType,
       term,
@@ -619,6 +672,12 @@ export class GeographyService {
       // with the South Dakota micro area alongside the Washington one.
       ...(stateAbbr && spec.stateInName && { nameStateAbbr: stateAbbr }),
     });
+
+    const placeLevel = geographyType === 'place' || geographyType === ECONOMIC_PLACE;
+    if (match && !match.exact && placeLevel && nycBorough(lookup.split)) {
+      return null;
+    }
+    return match;
   }
 
   /**
@@ -709,6 +768,7 @@ export class GeographyService {
     if (placeFips) result.placeFips = placeFips;
     const cdp = row.layer === spec.cdpLayer;
     if (cdp) result.censusDesignatedPlace = true;
+    if (match.borough) result.borough = match.borough;
 
     if (geographyType === ECONOMIC_PLACE) {
       if (!stateFips) {
@@ -810,7 +870,7 @@ export class GeographyService {
         name,
         attemptedTypes: [ECONOMIC_PLACE],
         recovery: {
-          hint: `Query ecnbasic 2022 at geography_level "economic place" with geography_fips "*", parent_fips "${stateFips}", and an industry predicate, and take the row whose code ends in ${placeFips}.`,
+          hint: `Query ecnbasic 2022 at geography_level "economic place" with geography_fips "*", parent_fips "${stateFips}", and an industry predicate, and take the row whose code ends in the place code.`,
         },
       },
     );
@@ -1008,42 +1068,45 @@ export class GeographyService {
   }
 
   /**
-   * Build the `no_match` error for a name no layer in the chain matched. The hint is built from
-   * the split name, so it names the place and state apart and never appends a second state to
-   * a name that already carries one.
+   * Build the `no_match` error for a name no layer in the chain matched. The message states the
+   * miss from the split name — the place and state apart, never a second state appended to a name
+   * that already carries one — and the hint states only what to try next.
    */
   private noMatch(name: string, split: SplitName, types: GeographyType[], countyFips?: string) {
-    const attempted = types.join(' or ');
-    // county_fips narrows the chain to the levels that sit in a county, so it is part of why
-    // nothing matched — a caller told only to check the spelling would re-run the same miss.
-    const scope = countyFips ? ` in county ${countyFips}` : '';
-
-    return notFound(`No ${attempted} matched "${name}"${scope}.`, {
+    const { message, hint } = this.describeNoMatch(name, split, types, countyFips);
+    return notFound(message, {
       reason: 'no_match',
       name,
       attemptedTypes: types,
       ...(countyFips && { countyFips }),
-      recovery: { hint: this.noMatchHint(name, split, types, countyFips) },
+      recovery: { hint },
     });
   }
 
-  private noMatchHint(
+  private describeNoMatch(
     name: string,
     split: SplitName,
     types: GeographyType[],
     countyFips: string | undefined,
-  ): string {
+  ): { message: string; hint: string } {
     const { placeName, stateLabel } = split;
     const attempted = types.join(' or ');
-    const levels = GEOGRAPHY_TYPES.join(', ');
+    // The levels a caller could switch to — the ones just tried are the miss, not an option.
+    const otherLevels = GEOGRAPHY_TYPES.filter((type) => !types.includes(type)).join(', ');
 
     // A ZCTA is not a ZIP: ZIPs that serve only PO boxes or a single address have none, yet
     // cbp publishes data for them under the ZIP itself, so a miss here says nothing about cbp.
     if (types.includes(ZCTA)) {
       const zip = ZIP_CODE.exec(name.trim())?.[1];
       return zip
-        ? `"${zip}" was checked only as a ZIP Code Tabulation Area (ZCTA), and no ZCTA has that code. cbp publishes ZIP-level data by the ZIP itself: pass "${zip}" as geography_fips with geography_level "zip code" — it needs no resolution.`
-        : `A zip code tabulation area is named by its 5-digit code (e.g., "98109") — pass the ZIP, or set geography_type to search a named level (${levels}).`;
+        ? {
+            message: `No ZIP Code Tabulation Area (ZCTA) has the code "${zip}" — it was checked only as a ZCTA, not as a ZIP.`,
+            hint: 'cbp publishes ZIP-level data by the ZIP itself: pass the ZIP as geography_fips with geography_level "zip code" — it needs no resolution.',
+          }
+        : {
+            message: `No zip code tabulation area matched "${name}": a ZCTA is named by its 5-digit code.`,
+            hint: `Pass the 5-digit ZIP (e.g., "98109"), or set geography_type to search a named level (${otherLevels}).`,
+          };
     }
 
     // A statistical area was asked for by level, so another level or a street address would
@@ -1053,21 +1116,61 @@ export class GeographyService {
       const inState = stateLabel ? ` covers ${stateLabel}` : '';
       const leading =
         leadingCity !== placeName ? `, and none contains its leading city "${leadingCity}"` : '';
-      return `No ${attempted} named "${placeName}"${inState}${leading} — check the spelling, or name the area by a single city it contains, as in "Seattle, WA" for the Seattle-Tacoma-Bellevue metro area.`;
+      return {
+        message: `No ${attempted} named "${placeName}"${inState}${leading}.`,
+        hint: 'Check the spelling, or name the area by a single city it contains, as in "Seattle, WA" for the Seattle-Tacoma-Bellevue metro area.',
+      };
+    }
+
+    // county_fips narrows the chain to the levels that sit in a county, so it is part of why
+    // nothing matched — a caller told only to check the spelling would re-run the same miss.
+    const where = stateLabel && (countyFips ? `county ${countyFips} of ${stateLabel}` : stateLabel);
+    const named = `No ${attempted} named "${placeName}" exists in ${where}.`;
+
+    // A borough reaches its county only at the county level, so a miss here is another level
+    // asked for alone, or a county scope that rules the borough's county out.
+    const borough = nycBorough(split);
+    if (borough) {
+      const coextensive = `It is the New York City borough coextensive with ${borough.county} County (county ${borough.countyFips})`;
+      const otherCounty = countyFips !== undefined && countyFips !== borough.countyFips;
+      if (otherCounty && types.includes('county')) {
+        return {
+          message: named,
+          hint: `${coextensive}, so drop county_fips or change it to ${borough.countyFips}.`,
+        };
+      }
+      const rescope = otherCounty
+        ? ` with county_fips dropped or set to ${borough.countyFips},`
+        : '';
+      // ecnbasic 2022 keys New York city by its economic place code, which the place level lacks.
+      const cityLevel = types.includes(ECONOMIC_PLACE) ? ECONOMIC_PLACE : 'place';
+      return {
+        message: named,
+        hint: `${coextensive}: set geography_type "county", or omit it,${rescope} to resolve the borough as its county; New York City as a whole is "New York, NY" at geography_type "${cityLevel}".`,
+      };
     }
 
     // Only places that clear the Economic Census threshold are economic places, so a real town
     // can miss here — its establishments are tabulated in its county's balance.
     if (types.includes(ECONOMIC_PLACE)) {
-      const inState = stateLabel ? ` in ${stateLabel}` : '';
-      return `No 2022 economic place named "${placeName}"${inState}. Economic places are the incorporated places, census-designated places, and county subdivisions with 2,500 or more residents or jobs, plus each county's remainder ("Balance of Adams County"), which holds the establishments of every smaller place in it. Check the spelling, or resolve "Balance of <county> County" for a smaller place.`;
+      return {
+        message: where
+          ? `No 2022 economic place named "${placeName}" exists in ${where}.`
+          : `No 2022 economic place named "${placeName}".`,
+        hint: `Economic places are the incorporated places, census-designated places, and county subdivisions with 2,500 or more residents or jobs, plus each county's remainder ("Balance of Adams County"), which holds the establishments of every smaller place in it. Check the spelling, or resolve "Balance of <county> County" for a smaller place.`,
+      };
     }
 
-    const scope = countyFips ? ` in county ${countyFips}` : '';
     const dropScope = countyFips ? ' drop county_fips,' : '';
-    return stateLabel
-      ? `No ${attempted} named "${placeName}" exists in ${stateLabel}${scope} — check the spelling,${dropScope} set geography_type to search a different level (${levels}), or pass a full street address.`
-      : `Add the state abbreviation (e.g., "${placeName}, WA"),${dropScope} set geography_type to search a specific level (${levels}), or pass a full street address.`;
+    return where
+      ? {
+          message: named,
+          hint: `Check the spelling,${dropScope} set geography_type to search a different level (${otherLevels}), or pass a full street address.`,
+        }
+      : {
+          message: `No ${attempted} matched "${name}"${countyFips ? ` in county ${countyFips}` : ''}.`,
+          hint: `Add the state abbreviation (e.g., "Springfield, IL"),${dropScope} set geography_type to search a different level (${otherLevels}), or pass a full street address.`,
+        };
   }
 
   /**
@@ -1145,16 +1248,17 @@ export class GeographyService {
     const matches = data.result?.addressMatches ?? [];
 
     if (matches.length === 0) {
-      throw notFound(
-        `Address "${address}" could not be geocoded. Verify the address format and include a ZIP code.`,
-        {
-          reason: 'no_match',
-          address,
-          recovery: {
-            hint: `Include a full address with ZIP code (e.g., "1600 Pennsylvania Ave NW, Washington, DC 20500").`,
-          },
+      // Asking for a ZIP the address already ends in sends the caller back with the same input.
+      const hasZip = /\b\d{5}(?:-\d{4})?\s*$/.test(address);
+      throw notFound(`Address "${address}" could not be geocoded.`, {
+        reason: 'no_match',
+        address,
+        recovery: {
+          hint: hasZip
+            ? 'Check the house number and street name, or resolve the city or county by name instead (e.g., "Seattle, WA").'
+            : 'Add the ZIP code (e.g., "1600 Pennsylvania Ave NW, Washington, DC 20500"), or resolve the city or county by name instead.',
         },
-      );
+      });
     }
 
     // biome-ignore lint/style/noNonNullAssertion: guarded by matches.length === 0 check above

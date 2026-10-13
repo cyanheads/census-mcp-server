@@ -296,6 +296,38 @@ describe('censusListDatasets', () => {
     expect(new Set(result.datasets.map((d) => d.name)).size).toBe(result.datasets.length);
   });
 
+  /**
+   * dec/ddhcb publishes each group in only one household-type table and one tenure table per
+   * geography, has no all-groups code, and defaults an unset POPGROUP to 1002 — the catalog is
+   * where a caller learns all three before the first query.
+   */
+  it('catalogs dec/ddhcb with its table split, on both surfaces (#54)', async () => {
+    const result = await censusListDatasets.handler(
+      censusListDatasets.input.parse({}),
+      createMockContext(),
+    );
+    const entry = result.datasets.find((d) => d.dataset_id === 'dec/ddhcb');
+
+    expect(entry?.name).toBe('Detailed Demographic and Housing Characteristics File B (DDHC-B)');
+    expect(entry?.available_years).toEqual([2020]);
+    for (const fact of ['T03001', 'T03004', 'T04001', 'T04002', '1002', 'European alone']) {
+      expect(entry?.description).toContain(fact);
+    }
+    expect(entry?.description).toMatch(/only one/);
+    expect(entry?.description).toMatch(/no code for all groups/);
+    expect(entry?.description).toMatch(/separate estimates/);
+    const text = (censusListDatasets.format!(result)[0] as { text: string }).text;
+    expect(text).toContain('**ID:** `dec/ddhcb`');
+    expect(text).toContain(entry?.description as string);
+  });
+
+  it('says on dec/ddhca that the sex-by-age tables split the groups (#68)', async () => {
+    const description = await descriptionOf('dec/ddhca');
+
+    expect(description).toContain('T02001');
+    expect(description).toContain('T01001');
+  });
+
   it('says the comparison profiles carry no margins of error (#52)', async () => {
     for (const id of ['acs/acs5/cprofile', 'acs/acs1/cprofile']) {
       expect(await descriptionOf(id)).toMatch(/no margins? of error/i);

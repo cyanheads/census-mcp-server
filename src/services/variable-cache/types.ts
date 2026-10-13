@@ -11,7 +11,11 @@ export interface CensusVariable {
    * error only.
    */
   attributeOf?: string;
-  /** Kind of attribute column, as published (e.g. "ANNOTATION", "FLAG", "LABEL"). */
+  /**
+   * Kind of attribute column in upper-snake case (e.g. "ANNOTATION", "FLAG", "MARGIN_OF_ERROR"),
+   * whatever the vintage publishes: the 5-year ACS through 2010, the 1-year ACS through 2011, and
+   * 2010 `dec/pl` write `Annotation`, `Margin of Error`, `Errata`, and so on.
+   */
   attributeType?: string;
   /** Variable code (e.g., "B19013_001E"). */
   code: string;
@@ -35,7 +39,7 @@ export interface CensusVariable {
    * Table the variable belongs to, as variables.json names it (e.g. "T01001" on `dec/ddhca`,
    * "CB2300CBP" on `cbp`), or `"N/A"` for the geography and metadata columns that belong to no
    * table. Which table a query reads decides how many of a dimension's codes come back, so this
-   * is what picks the probe variable in `findPublicationProbe`.
+   * is what picks the probe variables in `findPublicationProbes`.
    */
   group?: string;
   /** Human-readable label (e.g., "Estimate!!Median household income in the past 12 months"). */
@@ -61,6 +65,12 @@ export interface CensusVariable {
    * when the variable's table publishes one.
    */
   universe?: string;
+  /**
+   * True when the variable belongs to a single table but `universe` could not be read, because
+   * groups.json failed with something other than a 404. Its table may publish one; the failure is
+   * not cached, so a later lookup tries again. Set only by `getVariablesByCode`.
+   */
+  universeUnavailable?: true;
   /**
    * Codes this filter dimension accepts, mapped to their labels. Only `NAICS*` and `POPGROUP`
    * publish one; every other dimension has to be enumerated against the data endpoint.

@@ -21,7 +21,14 @@ import type {
   RecordDimension,
   UnsetPredicate,
 } from './types.js';
-import { rankVariables, type VariableSearchResult } from './variable-search.js';
+import {
+  codeToken,
+  isSharedAcrossTables,
+  looksLikeCode,
+  rankVariables,
+  tableOf,
+  type VariableSearchResult,
+} from './variable-search.js';
 
 const CENSUS_API_BASE = 'https://api.census.gov/data';
 
@@ -79,6 +86,7 @@ export const DATASET_AVAILABLE_YEARS: Record<string, number[]> = {
   'dec/dp': [2020],
   'dec/sdhc': [2020],
   'dec/ddhca': [2020],
+  'dec/ddhcb': [2020],
   cbp: [2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023],
   ecnbasic: [2012, 2017, 2022],
   nonemp: [
@@ -103,17 +111,18 @@ const DATASET_RECOVERY = {
  * optional and an error when it is required. A single segment resolves when it is the second
  * segment of exactly one two-segment code (`acs5` is `acs/acs5`, `pl` is `dec/pl`). A third segment
  * (`profile`, `subject`) never resolves, because it is or can become shared — acs/acs5/subject
- * stopped being the only `subject` when acs/acs1/subject was added — so its error names the codes
- * that end in it instead.
+ * stopped being the only `subject` when acs/acs1/subject was added — so its recovery names the
+ * codes that end in it instead.
  */
 export function resolveDataset(input: string | undefined, fallback?: string): string {
   const trimmed = input?.trim() ?? '';
   if (!trimmed) {
     if (fallback) return fallback;
-    throw notFound(
-      'No dataset code was given. Pass a dataset code such as "acs/acs5"; census_list_datasets lists them all.',
-      { reason: 'dataset_not_found', dataset: trimmed, recovery: DATASET_RECOVERY },
-    );
+    throw notFound('No dataset code was given.', {
+      reason: 'dataset_not_found',
+      dataset: trimmed,
+      recovery: DATASET_RECOVERY,
+    });
   }
 
   const code = trimmed.toLowerCase();
@@ -129,16 +138,21 @@ export function resolveDataset(input: string | undefined, fallback?: string): st
       .map((s) => s.join('/'));
     if (endingIn.length > 0) {
       throw notFound(
-        `Unknown dataset: "${trimmed}" is the last segment of ${listCodes(endingIn)}, not a dataset code of its own. Pass the full code.`,
-        { reason: 'dataset_not_found', dataset: trimmed, recovery: DATASET_RECOVERY },
+        `Unknown dataset: "${trimmed}" is the last segment of a dataset code, not a dataset code of its own.`,
+        {
+          reason: 'dataset_not_found',
+          dataset: trimmed,
+          recovery: { hint: `Pass the full code — ${listCodes(endingIn, 'or')}.` },
+        },
       );
     }
   }
 
-  throw notFound(
-    `Unknown dataset: "${trimmed}". Use census_list_datasets to see valid dataset codes.`,
-    { reason: 'dataset_not_found', dataset: trimmed, recovery: DATASET_RECOVERY },
-  );
+  throw notFound(`Unknown dataset: "${trimmed}".`, {
+    reason: 'dataset_not_found',
+    dataset: trimmed,
+    recovery: DATASET_RECOVERY,
+  });
 }
 
 /** Map of dataset to latest available year. */
@@ -173,11 +187,157 @@ function publishesMarginsOfError(dataset: string): boolean {
  */
 export const NON_FILTERING_PREDICATES = new Set(['GEOCOMP']);
 
-/** Join codes into readable prose: `A`, `A and B`, `A, B, and C`. */
-function listCodes(codes: string[]): string {
+/** Join codes into readable prose: `A`, `A and B`, `A, B, and C` (or `A or B` for alternatives). */
+function listCodes(codes: readonly string[], conjunction: 'and' | 'or' = 'and'): string {
   if (codes.length <= 1) return codes[0] ?? '';
-  if (codes.length === 2) return `${codes[0]} and ${codes[1]}`;
-  return `${codes.slice(0, -1).join(', ')}, and ${codes.at(-1)}`;
+  if (codes.length === 2) return `${codes[0]} ${conjunction} ${codes[1]}`;
+  return `${codes.slice(0, -1).join(', ')}, ${conjunction} ${codes.at(-1)}`;
+}
+
+/**
+ * Tables that split a dataset's `POPGROUP` groups between them. At each geography a group is
+ * published in only one table of a family, so a table answers for some groups there and not for
+ * others, and which one holds a group changes from geography to geography (api.census.gov,
+ * 2026-10-13). On `dec/ddhca` the sex-by-age tables `T02001`–`T02003` publish 295, 573, and 551
+ * groups nationally with none in two of them, while `T01001` publishes all 2,996 and splits nothing.
+ * On `dec/ddhcb` household type (`T03001`–`T03004`) and tenure (`T04001`–`T04002`) each split the
+ * same 2,996 groups, and no table publishes them all.
+ *
+ * Read off the published rows rather than variables.json, which describes the tables without
+ * saying which groups each one serves — so the list is written down here, per dataset.
+ */
+const POPGROUP_TABLE_FAMILIES: Readonly<Record<string, ReadonlyArray<readonly string[]>>> = {
+  'dec/ddhca': [['T02001', 'T02002', 'T02003']],
+  'dec/ddhcb': [
+    ['T03001', 'T03002', 'T03003', 'T03004'],
+    ['T04001', 'T04002'],
+  ],
+};
+
+/**
+ * Word why a result on tables that split `POPGROUP` groups can lack a group, a geography, or a
+ * value, naming the other tables of each family a requested code belongs to. Costs no request: the
+ * exact table a group sits in at a geography takes up to three requests per geography to find, so
+ * the guidance names where to look instead.
+ *
+ * Returns `''` when no requested code is in such a table, or when `singleCell` says the request
+ * named one geography and one group and its codes come from one table — a value came back and
+ * nothing beside it can be missing. Codes from several tables always get the guidance: the Census
+ * answers only where the first-listed table publishes the group, so a later table that does not
+ * publish it there reads null, and the reverse order returns nothing. Only a measure code — a table
+ * prefix with a digit, then `_` — names a table: `GEO_ID` and `NAME` are columns of every table and
+ * play no part in which rows come back.
+ */
+export function describeTableSplit(
+  codes: readonly string[],
+  dataset: string,
+  singleCell: boolean,
+): string {
+  const tables = [...new Set(codes.filter((code) => /^[A-Z]+\d\w*_/.test(code)).map(tableOfCode))];
+  const families = (POPGROUP_TABLE_FAMILIES[dataset] ?? []).flatMap((family) => {
+    const requested = tables.filter((table) => family.includes(table));
+    return requested.length > 0 ? [{ family, requested }] : [];
+  });
+  if (families.length === 0 || (singleCell && tables.length === 1)) return '';
+
+  const only = families.map(({ family }) => `only one of ${listCodes(family)}`).join(', and in ');
+  const elsewhere = families
+    .map(({ family, requested }, i) => {
+      const others = family.filter((table) => !requested.includes(table));
+      const candidates = others.length > 0 ? listCodes(others, 'or') : 'another of them';
+      return i === 0
+        ? `a group or geography missing from ${listCodes(requested, 'or')} may be published in ${candidates} at that geography instead`
+        : `one missing from ${listCodes(requested, 'or')} in ${candidates}`;
+    })
+    .join(', ');
+  const parts = [
+    `Each geography publishes a POPGROUP group in ${only}, so ${elsewhere}, or not at all.`,
+  ];
+  if (tables.length > 1) {
+    parts.push(
+      `With codes from more than one table, rows follow the first-listed one, ${tables[0]}: a group or geography it does not publish has no row, and a later table that does not publish the group there reads null. Query each table on its own to see every group it publishes.`,
+    );
+  }
+  return parts.join(' ');
+}
+
+/**
+ * The datasets that can publish a code, by its table prefix. ACS splits its table families across
+ * datasets, so a code asked of the wrong one is unknown there and present in a sibling: `S1701`
+ * lives in the subject tables, `S0201` alone in `acs/acs1/spp`, `DP1` in `dec/dp`. A prefix counts
+ * only when a digit follows it, so `SEX`, `STATE`, and `CPOP` match no row and `CP03` is never read
+ * as a `C` table. Decennial `P`/`H` tables sit in several `dec/*` datasets at once and the
+ * business and estimate datasets carry no table prefix, so neither has a row.
+ */
+const SIBLING_CANDIDATES: ReadonlyArray<readonly [prefix: string, datasets: readonly string[]]> = [
+  ['CP', ['acs/acs5/cprofile', 'acs/acs1/cprofile']],
+  ['DP', ['acs/acs5/profile', 'acs/acs1/profile', 'dec/dp']],
+  ['B', ['acs/acs5', 'acs/acs1']],
+  ['C', ['acs/acs5', 'acs/acs1']],
+  ['S', ['acs/acs5/subject', 'acs/acs1/subject', 'acs/acs1/spp']],
+  ['K', ['acs/acsse']],
+];
+
+/** Most tables one failed lookup probes siblings for. */
+const SIBLING_LOOKUP_TABLE_LIMIT = 5;
+
+/**
+ * The one deadline every sibling probe for an error shares. A per-variable lookup measured
+ * 0.30–0.77 s, so 2.5 s covers the longest chain — three candidates — at the slowest of them; tables
+ * are probed in parallel, so more tables do not lengthen it.
+ */
+export const SIBLING_LOOKUP_DEADLINE_MS = 2_500;
+
+/** `acs/acs5/subject` and `acs/acs5` are one survey; `acs/acs1/spp` is another. */
+function surveyOf(dataset: string): string {
+  return dataset.split('/').slice(0, 2).join('/');
+}
+
+/** The table a variable code belongs to: `S1701` for `S1701_C03_001E`. */
+function tableOfCode(code: string): string {
+  return code.split('_')[0] ?? code;
+}
+
+/**
+ * A code as the per-variable endpoint spells it. That endpoint matches case, and every column is
+ * uppercase except the comparison profiles' significance columns (`CP03_2024to2019_062SS`), so the
+ * uppercased form a missing code arrives in would 404 in the very dataset that publishes it.
+ */
+function publishedSpelling(code: string): string {
+  return code.replace(/^(CP\d{2}(?:PR)?_\d{4})TO(\d{4}_\d+SS)$/, '$1to$2');
+}
+
+/**
+ * The datasets to probe for a code missing from `dataset`, in order: the requested dataset left
+ * out, only those listed for `year`, and the requested survey's own datasets first.
+ */
+function siblingCandidates(code: string, dataset: string, year: number): string[] {
+  const row = SIBLING_CANDIDATES.find(
+    ([prefix]) => code.startsWith(prefix) && /\d/.test(code.charAt(prefix.length)),
+  );
+  const listed = (row?.[1] ?? []).filter(
+    (candidate) => candidate !== dataset && DATASET_AVAILABLE_YEARS[candidate]?.includes(year),
+  );
+  const survey = surveyOf(dataset);
+  return [
+    ...listed.filter((candidate) => surveyOf(candidate) === survey),
+    ...listed.filter((candidate) => surveyOf(candidate) !== survey),
+  ];
+}
+
+/**
+ * The recovery sentence for missing codes a sibling dataset was confirmed to hold:
+ * `S1701_C03_001E is in acs/acs5/subject — query that dataset instead.` The dataset and year that
+ * lack them are the diagnosis the paired message already states, and the sibling was confirmed for
+ * that same year, so neither is named again.
+ */
+export function describeSiblingHolders(holders: ReadonlyMap<string, string>): string {
+  const bySibling = Map.groupBy(holders, ([, sibling]) => sibling);
+  const parts = [...bySibling].map(([sibling, entries]) => {
+    const codes = entries.map(([code]) => code);
+    return `${listCodes(codes)} ${codes.length === 1 ? 'is' : 'are'} in ${sibling}`;
+  });
+  return `${listCodes(parts)} — query ${bySibling.size === 1 ? 'that dataset' : 'those datasets'} instead.`;
 }
 
 /**
@@ -312,26 +472,23 @@ export function describeRecordRows(
 }
 
 /**
- * Word the failure that a comparison came back with several rows per geography. A rank is a
+ * Word the recovery for a comparison that came back with several rows per geography. A rank is a
  * statement about one geography, so a ranking that lists the same one twice with two different
  * numbers is wrong however the rows are labelled — the fix is to pin the record, and the values
- * observed in the response are what the caller pins it to.
+ * observed in the response are what the caller pins it to. The row count is the diagnosis, which
+ * the paired message states, so the hint carries only the pin and the values to pick from.
  */
 export function describeAmbiguousRows(
-  dataset: string,
-  year: number,
-  rowsPerGeography: number,
   observed: Record<string, Array<{ code: string; label: string }>>,
 ): string {
-  const rows = rowsPerGeography.toLocaleString('en-US');
   const splitting = splittingRecordColumns(observed);
   if (!splitting) {
-    return `${dataset} (${year}) returned ${rows} rows for a single geography, so a rank cannot identify which one it refers to. Set the dataset's filter dimensions explicitly in predicates — census_list_predicate_values enumerates the codes each one accepts — or query one geography at a time with census_query_data.`;
+    return "Set the dataset's filter dimensions explicitly in predicates — census_list_predicate_values enumerates the codes each one accepts — or query one geography at a time with census_query_data.";
   }
   const named = splitting.entries
     .map(([code, values]) => `${code} took ${quoteValues(values)}`)
     .join('; ');
-  return `${dataset} (${year}) publishes several records per geography and this comparison pinned none of them, so every geography came back on ${rows} rows with different values: ${named}. Add the one you want to predicates, e.g. ${splitting.example}. census_query_data returns every record for a single geography, each labelled, if you want to see them side by side first.`;
+  return `Add the record you want to predicates, e.g. ${splitting.example} — ${named} in this response. census_query_data returns every record for a single geography, each labelled, if you want to see them side by side first.`;
 }
 
 /**
@@ -371,19 +528,23 @@ export function describeUnsetPredicates(
 }
 
 /**
- * Word why a predicated query came back empty, for the `no_data` recovery hint. Covers both
- * causes: a dimension left unset (`ecnbasic` publishes nothing below the national level until an
- * industry is named) and a supplied value that does not exist (an unknown `NAICS2017` value is a
- * `204`, not a `400`). Returns `''` when neither applies, so the caller falls back to its own
- * dataset-aware hint.
+ * Word why a predicated query came back empty, for the `no_data` recovery hint. Covers three
+ * causes: a requested table that does not publish the group at that geography while a sibling
+ * table does (`dec/ddhca` `T02003` lacks `1360`, which `T02002` publishes), a dimension left unset
+ * (`ecnbasic` publishes nothing below the national level until an industry is named), and a
+ * supplied value that does not exist (an unknown `NAICS2017` value is a `204`, not a `400`). The
+ * sibling tables lead, since the value is usually valid there. Returns `''` when none applies, so
+ * the caller falls back to its own dataset-aware hint.
  */
 export function describeEmptyPredicatedResult(
   unset: UnsetPredicate[],
   supplied: string[],
   dataset: string,
   year: number,
+  variables: readonly string[],
 ): string {
-  const parts: string[] = [];
+  const split = describeTableSplit(variables, dataset, false);
+  const parts: string[] = split ? [split] : [];
 
   if (unset.length > 0) {
     const codes = unset.map((p) => p.code);
@@ -399,20 +560,6 @@ export function describeEmptyPredicatedResult(
   }
 
   return parts.join(' ');
-}
-
-/**
- * True for a `group` naming more than one table (`"B17015,B18104,…"`). Such a column's concept
- * joins every one of those tables' concepts, so it describes none of them.
- */
-function isSharedAcrossTables(group: string | undefined): boolean {
-  return group?.includes(',') ?? false;
-}
-
-/** The one table a variable belongs to, or undefined for shared and table-less columns. */
-function tableOf(variable: CensusVariable): string | undefined {
-  const { group } = variable;
-  return group && group !== 'N/A' && !isSharedAcrossTables(group) ? group : undefined;
 }
 
 /**
@@ -434,6 +581,14 @@ function marginOfErrorLabel(estimateLabel: string): string {
 /** Per-variable requests in flight at once when one lookup names several attribute columns. */
 const ATTRIBUTE_FETCH_CONCURRENCY = 4;
 
+/**
+ * Time groups.json gets, every attempt and backoff included. It only adds `universe`, so a stalled
+ * one must not hold the call past the 60-second request timeout MCP SDK clients default to — four
+ * 30-second attempt timeouts plus backoff came to 139 s. Four fast failures and their 2/4/8 s
+ * backoff (at most 17.5 s with jitter) still fit; a fetch measured under 2 s.
+ */
+const UNIVERSE_DEADLINE_MS = 20_000;
+
 interface CacheEntry {
   /**
    * Every column named in some entry's `attributes` list — `B19013_001EA`, `EMP_F`,
@@ -450,34 +605,157 @@ interface CacheEntry {
    * the uppercased spelling.
    */
   spellings: Map<string, string>;
-  /** Universe per table from groups.json, loaded on the first lookup that needs one. */
+  /**
+   * Universe per table from groups.json, loaded on the first lookup that needs one. Unset after a
+   * failed read, so the next lookup tries again.
+   */
   universes?: Map<string, string>;
   variables: Map<string, CensusVariable>;
 }
+
+/** The entry's spelling of a code given in any case, or the code uppercased when it lists none. */
+function spellingIn(entry: CacheEntry, code: string): string {
+  const upper = code.toUpperCase();
+  return entry.spellings.get(upper) ?? upper;
+}
+
+/**
+ * Why a query shaped like a code matched nothing, in the dataset's spelling of the code: a column
+ * the dataset lists only as an attribute, a code a sibling dataset was confirmed to hold, or
+ * neither.
+ */
+export type CodeMiss =
+  | { kind: 'attribute'; code: string }
+  | { kind: 'sibling'; code: string; sibling: string }
+  | { kind: 'absent'; code: string };
 
 export class VariableCacheService {
   private readonly cache = new Map<string, CacheEntry>();
 
   /**
-   * Search variables by keyword across label and concept fields. `rankVariables` holds the
-   * matching and ordering rule.
+   * Search variables by a code or by keywords across label and concept fields. `rankVariables`
+   * holds the matching and ordering rule; a single-token query also reaches it as a code, in the
+   * dataset's own spelling.
+   *
+   * A single token shaped like a code (`looksLikeCode`) that matched no code and no variable
+   * whole — nothing at all, or only some of its words (`CP03_2024_062E` shares "2024" with every
+   * income label) — gets a `codeMiss`: an attribute column the dataset lists (no request), or else
+   * the sibling dataset that holds it (`findSiblingDatasets`, a variable code by
+   * `variables/<code>.json` and a table ID by `groups/<id>.json`). Either one replaces the
+   * most-words keyword results, which hold only fragments of the code. A code neither one
+   * explains keeps those results, or is `absent` when there were none. Only this path sends a
+   * request past variables.json, and a lookup that fails counts as no sibling rather than failing
+   * the search.
    */
   async searchVariables(
     params: { query: string; dataset: string; year: number; limit: number },
     ctx: Context,
-  ): Promise<VariableSearchResult> {
-    const { variables } = await this.getEntry(params.dataset, params.year, ctx);
-    return rankVariables(variables, params.query, params.limit);
+  ): Promise<VariableSearchResult & { codeMiss?: CodeMiss }> {
+    const { dataset, year } = params;
+    const entry = await this.getEntry(dataset, year, ctx);
+    const token = codeToken(params.query);
+    const code = token === undefined ? undefined : spellingIn(entry, token);
+    const result = rankVariables(entry.variables, params.query, params.limit, code);
+    const unmatched = result.totalMatches === 0 || result.matchedTermCount < result.termCount;
+    if (!unmatched || code === undefined || !looksLikeCode(code)) return result;
+
+    const empty = { ...result, variables: [], totalMatches: 0, matchedTermCount: 0 };
+    if (entry.attributeNames.has(code)) return { ...empty, codeMiss: { kind: 'attribute', code } };
+    const kind = code.includes('_') ? 'variables' : 'groups';
+    const sibling = (await this.findSiblingDatasets([code], dataset, year, ctx, kind)).get(code);
+    if (sibling) return { ...empty, codeMiss: { kind: 'sibling', code, sibling } };
+    return result.totalMatches > 0 ? result : { ...result, codeMiss: { kind: 'absent', code } };
+  }
+
+  /**
+   * The dataset's own spelling of each code, matched regardless of case. Every column is uppercase
+   * except the comparison profiles' significance columns (`CP03_2024to2019_062SS`), whose
+   * uppercased form the Census API rejects. A code the dataset does not list comes back
+   * uppercased, so a rejection names it the way it names the caller's other codes. Reads the
+   * cached variables.json, so it spends a request only when nothing has loaded it yet.
+   */
+  async resolveSpellings(
+    codes: readonly string[],
+    dataset: string,
+    year: number,
+    ctx: Context,
+  ): Promise<string[]> {
+    const entry = await this.getEntry(dataset, year, ctx);
+    return codes.map((code) => spellingIn(entry, code));
+  }
+
+  /**
+   * Find the sibling dataset that publishes each code `dataset` lacks, for a recovery hint.
+   * Returns each confirmed code mapped to the sibling that holds it; a code with no confirmed
+   * sibling is left out.
+   *
+   * The code's table prefix picks the candidates (`SIBLING_CANDIDATES`), and each candidate is
+   * asked for the code on its own: `variables/<code>.json` for a variable, `groups/<id>.json` for a
+   * table ID, where a 200 holds it and a 404 does not. One chain runs per table — the first code of
+   * each — for at most the first five tables, all under one deadline. The probes are a hint, never
+   * the answer: one that fails or runs out of time ends its chain and leaves that code out, and they
+   * go outside `withRetry`, so a probe expected to 404 spends no retry budget. A caller's
+   * cancellation is rethrown, never answered with a partial result.
+   */
+  async findSiblingDatasets(
+    codes: readonly string[],
+    dataset: string,
+    year: number,
+    ctx: Context,
+    kind: 'variables' | 'groups' = 'variables',
+  ): Promise<Map<string, string>> {
+    const chains = new Map<string, { code: string; candidates: string[] }>();
+    for (const code of codes) {
+      const table = kind === 'groups' ? code : tableOfCode(code);
+      if (chains.has(table)) continue;
+      const candidates = siblingCandidates(code, dataset, year);
+      if (candidates.length > 0) chains.set(table, { code, candidates });
+      if (chains.size === SIBLING_LOOKUP_TABLE_LIMIT) break;
+    }
+    if (chains.size === 0) return new Map();
+
+    const deadline = new AbortController();
+    const timer = setTimeout(
+      () => deadline.abort(new Error('Sibling dataset lookup ran out of time.')),
+      SIBLING_LOOKUP_DEADLINE_MS,
+    );
+    const signal = ctx.signal ? AbortSignal.any([ctx.signal, deadline.signal]) : deadline.signal;
+    try {
+      const found = await Promise.all(
+        [...chains.values()].map(async ({ code, candidates }) => {
+          for (const candidate of candidates) {
+            const outcome = await this.probeSibling(
+              candidate,
+              year,
+              kind,
+              publishedSpelling(code),
+              signal,
+              ctx,
+            );
+            if (outcome === 'holds') return [[code, candidate] as const];
+            if (outcome === 'failed') return [];
+          }
+          return [];
+        }),
+      );
+      return new Map(found.flat());
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**
    * Get metadata for specific variable codes, in the order given, with each one's table universe.
    * Throws `variable_not_found` naming every code the dataset has no column for, before any
-   * further request goes out.
+   * further request to it goes out; its recovery names the sibling dataset that publishes a
+   * missing code where one is confirmed (`findSiblingDatasets`).
    *
    * A code variables.json lists only inside an entry's `attributes` is resolved from the
-   * per-variable endpoint, which publishes its label and the column it belongs to. An uppercased
-   * code resolves to the dataset's own spelling where that differs.
+   * per-variable endpoint, which publishes its label and the column it belongs to. A code in any
+   * case resolves to the dataset's own spelling.
+   *
+   * When groups.json fails (`getUniverses`), each variable that belongs to a single table comes
+   * back without `universe` and marked `universeUnavailable`, rather than failing the lookup.
    */
   async getVariablesByCode(
     requested: string[],
@@ -486,20 +764,41 @@ export class VariableCacheService {
     ctx: Context,
   ): Promise<CensusVariable[]> {
     const entry = await this.getEntry(dataset, year, ctx);
-    const codes = requested.map((code) => entry.spellings.get(code) ?? code);
+    const codes = requested.map((code) => spellingIn(entry, code));
     const missing = codes.filter(
       (code) => !entry.variables.has(code) && !entry.attributeNames.has(code),
     );
 
     if (missing.length > 0) {
+      const holders = await this.findSiblingDatasets(missing, dataset, year, ctx);
+      const search = 'census_search_variables to find valid codes for this dataset and year.';
+      // One probe runs per table, so a code whose table a probe placed in a sibling is pointed
+      // there too — never back at the dataset that cannot hold it.
+      const tableHolders = new Map(
+        [...holders].map(([code, sibling]) => [tableOfCode(code), sibling]),
+      );
+      const rest = missing.filter((code) => !holders.has(code));
+      const sameTable = Map.groupBy(
+        rest.filter((code) => tableHolders.has(tableOfCode(code))),
+        (code) => tableHolders.get(tableOfCode(code)) as string,
+      );
+      const unplaced = rest.filter((code) => !tableHolders.has(tableOfCode(code)));
+      const hints = [
+        ...(holders.size > 0 ? [describeSiblingHolders(holders)] : []),
+        ...[...sameTable].map(
+          ([sibling, sameCodes]) =>
+            `${listCodes(sameCodes)} ${sameCodes.length === 1 ? 'is' : 'are'} from a table found in ${sibling}; look ${sameCodes.length === 1 ? 'it' : 'them'} up there.`,
+        ),
+        ...(unplaced.length === 0
+          ? []
+          : [holders.size === 0 ? `Use ${search}` : `For ${listCodes(unplaced)}, use ${search}`]),
+      ];
       throw notFound(`Variable codes not found in ${dataset} (${year}): ${missing.join(', ')}`, {
         reason: 'variable_not_found',
         missingCodes: missing,
         dataset,
         year,
-        recovery: {
-          hint: `Use census_search_variables to find valid codes for ${dataset} ${year}.`,
-        },
+        recovery: { hint: hints.join(' ') },
       });
     }
 
@@ -521,11 +820,13 @@ export class VariableCacheService {
 
     const universes = resolved.some((v) => tableOf(v))
       ? await this.getUniverses(entry, dataset, year, ctx)
-      : undefined;
+      : new Map<string, string>();
 
     return resolved.map((variable) => {
       const table = tableOf(variable);
-      const universe = table ? universes?.get(table) : undefined;
+      if (!table) return variable;
+      if (!universes) return { ...variable, universeUnavailable: true };
+      const universe = universes.get(table);
       return universe ? { ...variable, universe } : variable;
     });
   }
@@ -623,21 +924,24 @@ export class VariableCacheService {
   }
 
   /**
-   * Pick the measure variable to probe with when checking which of a dimension's codes the
-   * dataset actually publishes rows for.
+   * Pick the measure variables to probe with when checking which of a dimension's codes the
+   * dataset actually publishes rows for; the published set is the union of what each one returns.
    *
    * A wildcard group-by answers from the dataset's published value map when every requested
    * column can be served from metadata, and only reads the data file when a measure is among
-   * them — so which measure is requested decides the answer. Coverage is per table and nests:
-   * on `dec/ddhca` the total-population table publishes 2,996 population groups where the
-   * 23-category sex-by-age table publishes 551 of the same ones. The coarsest table therefore
-   * gives the widest set, and cell count is what says which table is coarsest.
+   * them — so which measure is requested decides the answer. Coverage is per table. On
+   * `dec/ddhca` the total-population table publishes 2,996 population groups and every
+   * sex-by-age table a subset of them, so one measure from the coarsest table, which cell count
+   * identifies, gives the widest set.
+   *
+   * The sex-by-age tables do not nest among themselves, though — each publishes groups the others
+   * do not (see `POPGROUP_TABLE_FAMILIES`) — and on `dec/ddhcb` every table belongs to such a
+   * family, so no single table holds every group. When the coarsest table is one of them, the
+   * check probes one measure per table of the dataset's smallest family instead: each family
+   * splits the same groups, so the one with the fewest tables is the cheapest complete union, at
+   * one request per table per cache refresh.
    */
-  async findPublicationProbe(
-    dataset: string,
-    year: number,
-    ctx: Context,
-  ): Promise<string | undefined> {
+  async findPublicationProbes(dataset: string, year: number, ctx: Context): Promise<string[]> {
     const variables = await this.getVariables(dataset, year, ctx);
     const tables = new Map<string, string[]>();
     for (const v of variables.values()) {
@@ -647,10 +951,16 @@ export class VariableCacheService {
       members.push(v.code);
       tables.set(v.group, members);
     }
-    const coarsest = [...tables.entries()].sort(
-      ([aName, aVars], [bName, bVars]) => aVars.length - bVars.length || aName.localeCompare(bName),
-    )[0];
-    return coarsest?.[1].sort()[0];
+    const firstMeasureOf = (table: string) => tables.get(table)?.sort().slice(0, 1) ?? [];
+    const [coarsest] = [...tables.keys()].sort(
+      (a, b) => (tables.get(a)?.length ?? 0) - (tables.get(b)?.length ?? 0) || a.localeCompare(b),
+    );
+    if (coarsest === undefined) return [];
+
+    const families = POPGROUP_TABLE_FAMILIES[dataset] ?? [];
+    if (!families.some((family) => family.includes(coarsest))) return firstMeasureOf(coarsest);
+    const [smallest] = [...families].sort((a, b) => a.length - b.length);
+    return (smallest ?? []).flatMap(firstMeasureOf);
   }
 
   /**
@@ -666,10 +976,11 @@ export class VariableCacheService {
   /** Validate that a dataset code is known. */
   validateDataset(dataset: string): void {
     if (!KNOWN_DATASETS.has(dataset)) {
-      throw notFound(
-        `Unknown dataset: "${dataset}". Use census_list_datasets to see valid dataset codes.`,
-        { reason: 'dataset_not_found', dataset, recovery: DATASET_RECOVERY },
-      );
+      throw notFound(`Unknown dataset: "${dataset}".`, {
+        reason: 'dataset_not_found',
+        dataset,
+        recovery: DATASET_RECOVERY,
+      });
     }
   }
 
@@ -685,21 +996,26 @@ export class VariableCacheService {
   /**
    * GET one Census metadata document and parse it, retrying transient failures. `mapError`
    * translates a failed fetch (unchanged by default); an HTML page or unparseable body is
-   * `variables_unavailable`.
+   * `variables_unavailable`. `deadlineMs` bounds every attempt and backoff together, for a
+   * document the lookup can answer without.
    */
   private fetchMetadata(
     url: string,
     what: string,
     scope: { dataset: string; year: number },
     ctx: Context,
-    mapError: (error: unknown) => unknown = (error) => error,
+    {
+      mapError = (error) => error,
+      deadlineMs,
+    }: { mapError?: (error: unknown) => unknown; deadlineMs?: number } = {},
   ): Promise<unknown> {
     return withRetry(
-      async () => {
+      async ({ signal, remainingMs }) => {
         let response: Response;
         try {
-          response = await fetchWithTimeout(url, 30_000, ctx as unknown as RequestContext, {
-            signal: ctx.signal,
+          const timeoutMs = Math.min(30_000, remainingMs);
+          response = await fetchWithTimeout(url, timeoutMs, ctx as unknown as RequestContext, {
+            signal,
             // A 404 is an answer here, not a fault — a dropped vintage, or a dataset that
             // publishes no groups.json — so it is logged at debug and handled by the caller.
             expectedStatuses: [404],
@@ -730,11 +1046,12 @@ export class VariableCacheService {
         context: ctx as unknown as RequestContext,
         baseDelayMs: 2000,
         signal: ctx.signal,
+        ...(deadlineMs !== undefined && { deadlineMs }),
       },
     );
   }
 
-  /** The metadata a failed per-variable or groups.json fetch leaves the lookup without. */
+  /** The attribute record a failed per-variable fetch leaves the lookup without. */
   private metadataUnavailable(
     what: string,
     scope: { dataset: string; year: number },
@@ -755,9 +1072,43 @@ export class VariableCacheService {
   }
 
   /**
+   * Ask one sibling dataset whether it publishes `code`, in a single request. A 404 is the
+   * expected "no", logged at debug; anything else that fails is `failed`, unless the caller has
+   * gone, which is rethrown.
+   */
+  private async probeSibling(
+    sibling: string,
+    year: number,
+    kind: 'variables' | 'groups',
+    code: string,
+    signal: AbortSignal,
+    ctx: Context,
+  ): Promise<'holds' | 'absent' | 'failed'> {
+    const url = `${CENSUS_API_BASE}/${year}/${sibling}/${kind}/${encodeURIComponent(code)}.json`;
+    try {
+      // Past the shared deadline, so that deadline — not a per-probe timeout — ends a slow probe.
+      const response = await fetchWithTimeout(
+        url,
+        SIBLING_LOOKUP_DEADLINE_MS * 2,
+        ctx as unknown as RequestContext,
+        { signal, expectedStatuses: [404] },
+      );
+      await response.body?.cancel();
+      return 'holds';
+    } catch (error) {
+      if (ctx.signal?.aborted) throw error;
+      return error instanceof McpError && error.data?.status === 404 ? 'absent' : 'failed';
+    }
+  }
+
+  /**
    * Resolve one attribute column from the per-variable endpoint. Any failure is
    * `variables_unavailable`: the code was found in the dataset's own attributes index, so a miss
-   * here is the endpoint failing rather than the code not existing.
+   * here is the endpoint failing rather than the code not existing. A caller's cancellation is
+   * rethrown as it arrived.
+   *
+   * `attribute type` is the one published value normalized here, to upper-snake case: vintages
+   * spell the same kind `Annotation` and `ANNOTATION`, `Margin of Error` and `MARGIN_OF_ERROR`.
    */
   private async fetchAttribute(
     code: string,
@@ -771,6 +1122,7 @@ export class VariableCacheService {
     try {
       raw = (await this.fetchMetadata(url, what, { dataset, year }, ctx)) as RawVariableRecord;
     } catch (error) {
+      if (ctx.signal?.aborted) throw error;
       throw this.metadataUnavailable(what, { dataset, year }, error);
     }
 
@@ -782,21 +1134,25 @@ export class VariableCacheService {
     if (raw.concept && !isSharedAcrossTables(raw.group)) variable.concept = raw.concept;
     if (raw.group) variable.group = raw.group;
     if (raw['attribute of']) variable.attributeOf = raw['attribute of'];
-    if (raw['attribute type']) variable.attributeType = raw['attribute type'];
+    const attributeType = raw['attribute type']?.trim().toUpperCase().replace(/\s+/g, '_');
+    if (attributeType) variable.attributeType = attributeType;
     return variable;
   }
 
   /**
    * Universe per table, from groups.json, cached on the entry so it expires with variables.json.
-   * A dataset that publishes no groups.json (a 404) has no universes; any other failure is
-   * `variables_unavailable`, since leaving the field out would claim the table publishes none.
+   * A dataset that publishes no groups.json (a 404) has no universes. Any other failure — once
+   * retries are spent or `UNIVERSE_DEADLINE_MS` has passed, or a body with no `groups` list —
+   * returns `undefined` and caches nothing, so the next lookup asks again; the variables are still
+   * answered from variables.json. A caller's cancellation is rethrown, never turned into a lookup
+   * without universes.
    */
   private async getUniverses(
     entry: CacheEntry,
     dataset: string,
     year: number,
     ctx: Context,
-  ): Promise<Map<string, string>> {
+  ): Promise<Map<string, string> | undefined> {
     if (entry.universes) return entry.universes;
 
     const universes = new Map<string, string>();
@@ -807,10 +1163,26 @@ export class VariableCacheService {
         'groups.json',
         { dataset, year },
         ctx,
+        { deadlineMs: UNIVERSE_DEADLINE_MS },
       )) as RawGroupsJson;
+      // Every dataset answers with a `groups` array, empty where it publishes no tables.
+      if (!Array.isArray(raw?.groups)) {
+        throw serviceUnavailable(
+          `Census groups.json for ${dataset} (${year}) carried no groups list.`,
+          { reason: 'variables_unavailable' },
+        );
+      }
     } catch (error) {
-      const notPublished = error instanceof McpError && error.data?.status === 404;
-      if (!notPublished) throw this.metadataUnavailable('groups.json', { dataset, year }, error);
+      // Checked on the signal: an abort during the retry backoff rethrows its raw reason.
+      if (ctx.signal?.aborted) throw error;
+      if (!(error instanceof McpError && error.data?.status === 404)) {
+        ctx.log.warning('groups.json could not be fetched; returning variables without universe', {
+          dataset,
+          year,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return;
+      }
     }
 
     for (const group of raw?.groups ?? []) {
@@ -844,8 +1216,14 @@ export class VariableCacheService {
       'variables.json',
       { dataset, year },
       ctx,
-      (error) =>
-        censusHttpError(error, { dataset, year, availableYears: DATASET_AVAILABLE_YEARS[dataset] }),
+      {
+        mapError: (error) =>
+          censusHttpError(error, {
+            dataset,
+            year,
+            availableYears: DATASET_AVAILABLE_YEARS[dataset],
+          }),
+      },
     )) as RawVariablesJson;
 
     const variables = new Map<string, CensusVariable>();

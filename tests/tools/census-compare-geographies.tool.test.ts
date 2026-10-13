@@ -44,6 +44,7 @@ const mockLookupVariables = vi.fn();
 const mockCheckPredicates = vi.fn();
 const mockGetRecordDimensions = vi.fn();
 const mockValidateYear = vi.fn();
+const mockResolveSpellings = vi.fn();
 
 beforeEach(async () => {
   vi.clearAllMocks();
@@ -65,7 +66,13 @@ beforeEach(async () => {
     checkPredicates: mockCheckPredicates,
     getRecordDimensions: mockGetRecordDimensions,
     validateYear: mockValidateYear,
+    resolveSpellings: mockResolveSpellings,
   } as never);
+
+  // Default: the dataset spells every code in uppercase, as every non-comparison-profile one does.
+  mockResolveSpellings.mockImplementation(async (codes: string[]) =>
+    codes.map((code) => code.toUpperCase()),
+  );
 
   /**
    * The real check, not a stub: a test that asserts the year is refused before the first
@@ -545,8 +552,10 @@ describe('censusCompareGeographies', () => {
     const error = await Promise.resolve(censusCompareGeographies.handler(input, ctx)).catch(
       (e: unknown) => e,
     );
-    expect((error as Error).message).toContain('13 geography levels');
-    expect((error as Error).message).not.toContain('level 0');
+    // #62: census_list_geographies is the contract recovery's step, so the message leaves it out.
+    expect((error as Error).message).toBe(
+      'Geography level "tract" does not exist in acs/acs1 (2024). It publishes 13 geography levels.',
+    );
     expect(error).toMatchObject({ data: { availableLevels } });
   });
 
@@ -1358,6 +1367,23 @@ describe('censusCompareGeographies — datasets that publish several records per
     expect(hint).toContain('MONTH');
     expect(hint).toContain('"4" (April)');
     expect(hint).toContain('{"MONTH": "7"}');
+  });
+
+  /** #62: the row count is the diagnosis, so the hint keeps only the values and the pin. */
+  it('states the row count in the message alone, and the pin in the hint alone', async () => {
+    mockQueryData.mockResolvedValue(duplicated);
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const error = (await Promise.resolve(censusCompareGeographies.handler(charvInput(), ctx)).catch(
+      (err: unknown) => err,
+    )) as { message: string; data: { recovery: { hint: string } } };
+
+    expect(error.message).toBe(
+      'pep/charv (2023) returned 2 rows for each state, so a ranking would list every one of them more than once with different values.',
+    );
+    expect(error.data.recovery.hint).toBe(
+      'Add the record you want to predicates, e.g. {"MONTH": "7"} — MONTH took "4" (April) and "7" (July) in this response. census_query_data returns every record for a single geography, each labelled, if you want to see them side by side first.',
+    );
   });
 
   it('ranks each geography once when the record is pinned', async () => {

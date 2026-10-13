@@ -33,7 +33,7 @@ vi.mock('@/config/server-config.js', () => ({
 const mockFetchPredicateValues = vi.fn();
 const mockFindVariable = vi.fn();
 const mockGetFilterDimensions = vi.fn();
-const mockFindPublicationProbe = vi.fn();
+const mockFindPublicationProbes = vi.fn();
 
 beforeEach(async () => {
   vi.clearAllMocks();
@@ -49,12 +49,12 @@ beforeEach(async () => {
   vi.mocked(getVariableCacheService).mockReturnValue({
     findVariable: mockFindVariable,
     getFilterDimensions: mockGetFilterDimensions,
-    findPublicationProbe: mockFindPublicationProbe,
+    findPublicationProbes: mockFindPublicationProbes,
   } as never);
 
   mockGetFilterDimensions.mockResolvedValue([]);
   // Default: the dataset offers no measure column, so a value map is returned unchecked.
-  mockFindPublicationProbe.mockResolvedValue(undefined);
+  mockFindPublicationProbes.mockResolvedValue([]);
 });
 
 /** EMPSZES is the shape of every dimension the Census publishes no value list for. */
@@ -245,7 +245,7 @@ describe('censusListPredicateValues — dimensions with a published value list',
    */
   it('drops the codes the dataset publishes no rows for', async () => {
     mockFindVariable.mockResolvedValue(popgroup);
-    mockFindPublicationProbe.mockResolvedValue('T01001_001N');
+    mockFindPublicationProbes.mockResolvedValue(['T01001_001N']);
     mockFetchPredicateValues.mockResolvedValue(publishedPopgroups);
 
     const ctx = createMockContext({ errors: censusListPredicateValues.errors });
@@ -271,7 +271,7 @@ describe('censusListPredicateValues — dimensions with a published value list',
       ...popgroup,
       values: Object.fromEntries(codes.map((code) => [code, `Group ${code}`])),
     });
-    mockFindPublicationProbe.mockResolvedValue('T01001_001N');
+    mockFindPublicationProbes.mockResolvedValue(['T01001_001N']);
     mockFetchPredicateValues.mockResolvedValue(codes.slice(0, 1200).map((code) => ({ code })));
 
     const ctx = createMockContext({ errors: censusListPredicateValues.errors });
@@ -292,7 +292,7 @@ describe('censusListPredicateValues — dimensions with a published value list',
    */
   it('names the withheld code when a keyword matched only unpublished ones', async () => {
     mockFindVariable.mockResolvedValue(popgroup);
-    mockFindPublicationProbe.mockResolvedValue('T01001_001N');
+    mockFindPublicationProbes.mockResolvedValue(['T01001_001N']);
     mockFetchPredicateValues.mockResolvedValue(publishedPopgroups);
 
     const ctx = createMockContext({ errors: censusListPredicateValues.errors });
@@ -325,7 +325,7 @@ describe('censusListPredicateValues — dimensions with a published value list',
       { code: 'NAICS2017', label: '2017 NAICS code', concept: '', predicateType: 'string' },
       { code: 'TAXSTAT', label: 'Tax status code', concept: '', predicateType: 'string' },
     ]);
-    mockFindPublicationProbe.mockResolvedValue('ASRET');
+    mockFindPublicationProbes.mockResolvedValue(['ASRET']);
 
     const ctx = createMockContext({ errors: censusListPredicateValues.errors });
     const result = await censusListPredicateValues.handler(
@@ -347,7 +347,7 @@ describe('censusListPredicateValues — dimensions with a published value list',
    */
   it('falls back to the unchecked value map when the check fails', async () => {
     mockFindVariable.mockResolvedValue(popgroup);
-    mockFindPublicationProbe.mockResolvedValue('T01001_001N');
+    mockFindPublicationProbes.mockResolvedValue(['T01001_001N']);
     mockFetchPredicateValues.mockRejectedValue(new Error('Census API unreachable'));
 
     const ctx = createMockContext({ errors: censusListPredicateValues.errors });
@@ -368,7 +368,7 @@ describe('censusListPredicateValues — dimensions with a published value list',
    */
   it('keeps the value map when the check comes back empty', async () => {
     mockFindVariable.mockResolvedValue(popgroup);
-    mockFindPublicationProbe.mockResolvedValue('T01001_001N');
+    mockFindPublicationProbes.mockResolvedValue(['T01001_001N']);
     mockFetchPredicateValues.mockResolvedValue([]);
 
     const ctx = createMockContext({ errors: censusListPredicateValues.errors });

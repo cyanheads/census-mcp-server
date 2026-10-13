@@ -173,6 +173,94 @@ describe('censusSearchVariables', () => {
     expect(getEnrichment(ctx).notice).toContain('zzznomatch');
   });
 
+  it('keeps the keyword advice for a query that is not shaped like a code (characterization)', async () => {
+    mockSearchVariables.mockResolvedValue({
+      variables: [],
+      totalMatches: 0,
+      matchedTermCount: 0,
+      termCount: 1,
+    });
+    const ctx = createMockContext({ errors: censusSearchVariables.errors });
+    await censusSearchVariables.handler(censusSearchVariables.input.parse({ query: 'xyzzy' }), ctx);
+    expect(getEnrichment(ctx).notice).toBe(
+      'No variables matched "xyzzy". Try broader keywords or a different dataset.',
+    );
+  });
+
+  describe('an empty result for a code (#63)', () => {
+    const noticeFor = async (
+      query: string,
+      codeMiss: unknown,
+      scope: { dataset?: string; year?: number } = {},
+    ) => {
+      mockSearchVariables.mockResolvedValue({
+        variables: [],
+        totalMatches: 0,
+        matchedTermCount: 0,
+        termCount: 2,
+        codeMiss,
+      });
+      const ctx = createMockContext({ errors: censusSearchVariables.errors });
+      await censusSearchVariables.handler(
+        censusSearchVariables.input.parse({ query, ...scope }),
+        ctx,
+      );
+      return getEnrichment(ctx).notice as string;
+    };
+
+    it('names the sibling dataset that holds the code', async () => {
+      const notice = await noticeFor('s1701_c03_001e', {
+        kind: 'sibling',
+        code: 'S1701_C03_001E',
+        sibling: 'acs/acs5/subject',
+      });
+      expect(notice).toBe(
+        'No variables matched "s1701_c03_001e" in acs/acs5 (2024). S1701_C03_001E is in acs/acs5/subject — query that dataset instead.',
+      );
+    });
+
+    /** The code is named as the dataset spells it, never as the query typed it. */
+    it('points a significance column at census_get_variable, in its published spelling', async () => {
+      const notice = await noticeFor(
+        'cp03_2024to2019_062ss',
+        { kind: 'attribute', code: 'CP03_2024to2019_062SS' },
+        { dataset: 'acs/acs5/cprofile', year: 2024 },
+      );
+      expect(notice).toBe(
+        'CP03_2024to2019_062SS is an attribute column of acs/acs5/cprofile (2024) — an annotation, flag, label, or significance column published beside a variable, which search does not list. Call census_get_variable with CP03_2024to2019_062SS for its label and the variable it belongs to.',
+      );
+    });
+
+    it('says the code is not in the dataset, without the keyword advice', async () => {
+      const notice = await noticeFor('nope_1', { kind: 'absent', code: 'NOPE_1' });
+      expect(notice).toBe(
+        'No variable or table in acs/acs5 (2024) has the code "NOPE_1", and no label or concept contains it. Codes differ by dataset and vintage: check the code and year, or search with words from the variable\'s label.',
+      );
+    });
+  });
+
+  it('adds no partial-match notice when the query matched as a code (#63)', async () => {
+    mockSearchVariables.mockResolvedValue({
+      variables: [
+        {
+          code: 'B19013_001E',
+          label: 'Estimate!!Median household income',
+          predicateType: 'int',
+          moeCode: 'B19013_001M',
+        },
+      ],
+      totalMatches: 1,
+      matchedTermCount: 2,
+      termCount: 2,
+    });
+    const ctx = createMockContext({ errors: censusSearchVariables.errors });
+    await censusSearchVariables.handler(
+      censusSearchVariables.input.parse({ query: 'b19013_001e' }),
+      ctx,
+    );
+    expect(getEnrichment(ctx).notice).toBeUndefined();
+  });
+
   it('discloses truncation enrichment when total_matches exceeds the limit', async () => {
     mockSearchVariables.mockResolvedValue({
       variables: [
@@ -193,6 +281,63 @@ describe('censusSearchVariables', () => {
     expect(enrichment.shown).toBe(1);
     expect(enrichment.cap).toBe(1);
     expect(enrichment.notice).toContain('42');
+  });
+
+  it('says where a table cut at the limit continues, not to narrow the query (#63)', async () => {
+    const shown = ['S1701_C01_001E', 'S1701_C01_001M', 'S1701_C02_001E', 'S1701_C02_001M'];
+    mockSearchVariables.mockResolvedValue({
+      variables: shown.map((code) => ({ code, label: 'Estimate!!Total', predicateType: 'int' })),
+      totalMatches: 372,
+      codeMatches: 372,
+      matchedTermCount: 1,
+      termCount: 1,
+    });
+    const ctx = createMockContext({ errors: censusSearchVariables.errors });
+    await censusSearchVariables.handler(
+      censusSearchVariables.input.parse({ query: 'S1701', limit: 4 }),
+      ctx,
+    );
+    expect(getEnrichment(ctx).notice).toBe(
+      '372 variables matched — 368 not shown; the table continues in code order after S1701_C02_001M. Raise limit (max 100), or search a later variable code on its own — a word added to a table code ends the code match.',
+    );
+
+    const atMax = createMockContext({ errors: censusSearchVariables.errors });
+    mockSearchVariables.mockResolvedValue({
+      variables: Array.from({ length: 100 }, (_, i) => ({
+        code: `S1701_C01_${String(i + 1).padStart(3, '0')}E`,
+        label: 'Estimate!!Total',
+        predicateType: 'int',
+      })),
+      totalMatches: 372,
+      codeMatches: 372,
+      matchedTermCount: 1,
+      termCount: 1,
+    });
+    await censusSearchVariables.handler(
+      censusSearchVariables.input.parse({ query: 'S1701', limit: 100 }),
+      atMax,
+    );
+    const notice = getEnrichment(atMax).notice as string;
+    expect(notice).toContain('after S1701_C01_100E. Search a later variable code on its own');
+    expect(notice).not.toMatch(/narrow|raise limit/i);
+  });
+
+  it('keeps the narrowing advice when the cut falls among keyword matches (#63)', async () => {
+    mockSearchVariables.mockResolvedValue({
+      variables: [{ code: 'GEO_ID', label: 'Geography', predicateType: 'string' }],
+      totalMatches: 2,
+      codeMatches: 1,
+      matchedTermCount: 2,
+      termCount: 2,
+    });
+    const ctx = createMockContext({ errors: censusSearchVariables.errors });
+    await censusSearchVariables.handler(
+      censusSearchVariables.input.parse({ query: 'GEO_ID', limit: 1 }),
+      ctx,
+    );
+    expect(getEnrichment(ctx).notice).toBe(
+      '2 variables matched — 1 not shown. Narrow the query or raise limit (max 100).',
+    );
   });
 
   it('passes custom year to variable cache service', async () => {

@@ -30,6 +30,12 @@ export interface ResolvedGeography {
   /** 1-digit block group within the tract — from a street address only. */
   blockGroupFips?: string;
   /**
+   * The New York City borough the name gave, when the county level was queried through it
+   * ("Brooklyn" for Kings County, "Queens borough" for Queens County). Absent whenever the name
+   * was already the county's own ("Queens", "Bronx").
+   */
+  borough?: string;
+  /**
    * The place is a census-designated place — an unincorporated community the Census delineates
    * for statistics — rather than an incorporated one. Absent for every other geography.
    */

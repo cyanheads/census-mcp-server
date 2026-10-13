@@ -22,13 +22,16 @@ export function formatYears(years: number[]): string {
   return runs.map(([start, end]) => (start === end ? `${start}` : `${start}-${end}`)).join(', ');
 }
 
-/** Most levels a `geography_not_supported` message spells out; `acs/acs5` publishes 65. */
+/**
+ * Most levels a `geography_not_supported` message spells out; `acs/acs5` 2024 publishes 43 (in 65
+ * geography.json entries, one per parent hierarchy — `census_list_geographies` counts the same 43).
+ */
 const LEVELS_NAMED_LIMIT = 12;
 
 /**
  * Message for a geography level a dataset and vintage do not publish. A short level list is
  * spelled out, so a caller that sees only the text answer can retry without another call; a
- * long one is counted and left to `census_list_geographies`.
+ * long one is counted, and the contract's recovery points at `census_list_geographies` for it.
  */
 export function levelNotSupportedMessage(
   level: string,
@@ -39,7 +42,7 @@ export function levelNotSupportedMessage(
   const head = `Geography level "${level}" does not exist in ${dataset} (${year}).`;
   return availableLevels.length <= LEVELS_NAMED_LIMIT
     ? `${head} Available levels: ${availableLevels.join(', ')}.`
-    : `${head} It publishes ${availableLevels.length} geography levels; census_list_geographies lists them.`;
+    : `${head} It publishes ${availableLevels.length} geography levels.`;
 }
 
 /**
@@ -50,7 +53,8 @@ export function levelNotSupportedMessage(
  * or it publishes one that rejects the `NAME` column every query here sends (`cbp` before 2012,
  * `nonemp` 2008 through 2011). The wording says the year cannot be queried rather than that the
  * dataset does not publish it, because the second kind is published — it just cannot be read in
- * the shape every query here takes.
+ * the shape every query here takes. The years are what the caller retries with, so they sit in
+ * the hint alone.
  */
 export function yearNotAvailable(
   dataset: string,
@@ -58,22 +62,17 @@ export function yearNotAvailable(
   availableYears: number[] | undefined,
 ): McpError {
   const years = availableYears?.length ? formatYears(availableYears) : undefined;
-  return validationError(
-    years
-      ? `${dataset} cannot be queried for ${year}. Years available: ${years}.`
-      : `${dataset} cannot be queried for ${year}.`,
-    {
-      reason: 'year_not_available',
-      dataset,
-      year,
-      ...(availableYears?.length && { availableYears }),
-      recovery: {
-        hint: years
-          ? `Retry with a year ${dataset} serves: ${years}. census_list_datasets returns the same list as available_years for every dataset.`
-          : `Call census_list_datasets and retry with a year listed under available_years for ${dataset}.`,
-      },
+  return validationError(`${dataset} cannot be queried for ${year}.`, {
+    reason: 'year_not_available',
+    dataset,
+    year,
+    ...(availableYears?.length && { availableYears }),
+    recovery: {
+      hint: years
+        ? `Retry with a year this dataset serves: ${years}.`
+        : 'Call census_list_datasets and retry with a year listed under available_years for this dataset.',
     },
-  );
+  });
 }
 
 /** Longest upstream message worth putting in front of a caller. */
@@ -94,6 +93,10 @@ function upstreamMessage(body: unknown): string | undefined {
   if (text === '' || text.length > UPSTREAM_MESSAGE_LIMIT || /[<>]/.test(text)) return;
   return text;
 }
+
+/** How every data-request `variable_not_found` recovery ends: upstream stops at the first miss. */
+export const FIRST_UNKNOWN_ONLY =
+  'The Census API names only the first unknown code in a request, so check the others before retrying.';
 
 /** Statuses `withRetry` treats as transient, so the hint can tell a retry from a rejection. */
 const RETRYABLE_STATUSES = new Set([408, 425, 429, 502, 503, 504]);
@@ -126,6 +129,8 @@ const UNKNOWN_VARIABLE = /^error: unknown variable '([^']+)'$/;
  * other column of that kind. A code the caller did not send — `NAME`, or a label, record, or flag
  * column the server added — stays `upstream_error`, since naming it as the caller's mistake would
  * send them looking for a code they never passed. The API names only the first unknown column.
+ * Its recovery points at variable search here; `queryData` swaps in the sibling dataset that
+ * publishes the code when a lookup confirms one, once its retries are over.
  *
  * Every other status keeps the status-mapped code it already had, which is what decides whether
  * `withRetry` tries again. Anything that is not an HTTP failure (timeout, abort, network error)
@@ -174,7 +179,7 @@ export function censusHttpError(
         status,
         upstreamMessage: upstream,
         recovery: {
-          hint: `Call census_search_variables to find valid codes for ${scope.dataset} (${scope.year}), or census_get_variable to confirm one. The Census API names only the first unknown code in a request, so check the others before retrying.`,
+          hint: `Call census_search_variables to find valid codes for this dataset and year, or census_get_variable to confirm one. ${FIRST_UNKNOWN_ONLY}`,
         },
       },
     );
@@ -194,10 +199,11 @@ export function censusHttpError(
       year: scope.year,
       ...(status !== undefined && { status }),
       ...(upstream && { upstreamMessage: upstream }),
+      // The upstream line is the diagnosis, carried by the message; the hint is the next step.
       recovery: {
         hint: retryable
-          ? `Retry the request; if it persists, the Census API is temporarily unavailable for ${scope.dataset} (${scope.year}).`
-          : `The Census API rejected this request rather than failing transiently${upstream ? `: ${upstream}` : ''}. Change the query — retrying it unchanged returns the same status.`,
+          ? 'Retry the request; if it persists, the Census API is temporarily unavailable for this dataset and year.'
+          : 'Change the query — the Census API rejected it rather than failing transiently, so retrying it unchanged returns the same status.',
       },
     },
   );

@@ -4,6 +4,7 @@
  * @module tests/services/census-api/census-api-service.test
  */
 
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -19,6 +20,7 @@ import {
   padFips,
   planQueryColumns,
 } from '@/services/census-api/census-api-service.js';
+import { initVariableCacheService } from '@/services/variable-cache/variable-cache-service.js';
 
 vi.mock('@/config/server-config.js', () => ({
   getDiscoveryConfig: vi.fn(() => ({ defaultYear: 2024, variableCacheTtlHours: 24 })),
@@ -1377,6 +1379,9 @@ describe('CensusApiService.queryData — unknown variable rejection', () => {
   const rejectWith = (body: string, status = 400) =>
     new Response(body, { status, headers: { 'content-type': 'text/plain' } });
 
+  // A variable_not_found asks the variable cache which sibling dataset publishes the code.
+  beforeEach(() => initVariableCacheService());
+
   it('reports an unknown variable the caller sent as variable_not_found, without retrying', async () => {
     queue(rejectWith("error: unknown variable 'B19013_001X'"));
 
@@ -1401,7 +1406,101 @@ describe('CensusApiService.queryData — unknown variable rejection', () => {
       recovery: { hint: expect.stringContaining('census_search_variables') },
     });
     expect(error?.data.retryable).not.toBe(true);
-    expect(requestedUrls).toHaveLength(1);
+    // One data request; the acs/acs1 sibling probe after it is unstaged, so it fails quietly.
+    expect(requestedUrls.filter((url) => !url.includes('/variables/'))).toHaveLength(1);
+  });
+
+  /** The live 2024 acs/acs5/subject record for S1701_C03_001E. */
+  const S1701_RECORD = {
+    name: 'S1701_C03_001E',
+    label:
+      'Estimate!!Percent below poverty level!!Population for whom poverty status is determined',
+    concept: 'Poverty Status in the Past 12 Months',
+    predicateType: 'float',
+    group: 'S1701',
+    limit: 0,
+    attributes: 'S1701_C03_001EA,S1701_C03_001M,S1701_C03_001MA',
+  };
+
+  const unknownS1701 = () =>
+    query('state', { variables: ['S1701_C03_001E'], geographyFips: '53', year: 2024 }).then(
+      () => undefined,
+      (err: { code: number; data: Record<string, unknown>; message: string }) => err,
+    );
+
+  it('names the sibling dataset that publishes the code, probed once after the data request', async () => {
+    queue(rejectWith("error: unknown variable 'S1701_C03_001E'"), S1701_RECORD);
+
+    const error = await unknownS1701();
+
+    expect(error?.code).toBe(-32001);
+    expect(error?.message).toBe('Variable code not found in acs/acs5 (2024): S1701_C03_001E.');
+    expect(error?.data).toMatchObject({
+      reason: 'variable_not_found',
+      missingCodes: ['S1701_C03_001E'],
+      status: 400,
+      upstreamMessage: "error: unknown variable 'S1701_C03_001E'",
+      recovery: {
+        hint: 'S1701_C03_001E is in acs/acs5/subject — query that dataset instead. The Census API names only the first unknown code in a request, so check the others before retrying.',
+      },
+    });
+    expect(requestedUrls.map((url) => new URL(url).pathname)).toEqual([
+      '/data/2024/acs/acs5',
+      '/data/2024/acs/acs5/subject/variables/S1701_C03_001E.json',
+    ]);
+  });
+
+  it('keeps the search hint when the probe fails, spending one request on it', async () => {
+    queue(rejectWith("error: unknown variable 'S1701_C03_001E'"), rejectWith('unavailable', 503));
+
+    const error = await unknownS1701();
+
+    expect(error?.data).toMatchObject({
+      reason: 'variable_not_found',
+      recovery: {
+        hint: 'Call census_search_variables to find valid codes for this dataset and year, or census_get_variable to confirm one. The Census API names only the first unknown code in a request, so check the others before retrying.',
+      },
+    });
+    // The probe runs outside the retry loop: a 503 is one request, not a retried one.
+    expect(requestedUrls).toHaveLength(2);
+  });
+
+  it('cancels the call when the caller leaves during the probe, rather than answering without it', async () => {
+    const controller = new AbortController();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url: string | URL, init?: RequestInit) => {
+        requestedUrls.push(String(url));
+        if (requestedUrls.length === 1) {
+          return Promise.resolve(rejectWith("error: unknown variable 'S1701_C03_001E'"));
+        }
+        return new Promise((_resolve, reject) =>
+          init?.signal?.addEventListener('abort', () => reject(init.signal?.reason)),
+        );
+      }),
+    );
+
+    const pending = service
+      .queryData(
+        {
+          variables: ['S1701_C03_001E'],
+          geographyLevel: 'state',
+          geographyFips: '53',
+          dataset: 'acs/acs5',
+          year: 2024,
+        },
+        createMockContext({ signal: controller.signal }),
+      )
+      .then(
+        () => undefined,
+        (err: { code: number; data?: Record<string, unknown> }) => err,
+      );
+    await vi.waitFor(() => expect(requestedUrls).toHaveLength(2));
+    controller.abort();
+
+    const error = await pending;
+    expect(error?.code).toBe(JsonRpcErrorCode.RequestCancelled);
+    expect(error?.data?.reason).not.toBe('variable_not_found');
   });
 
   it.each([

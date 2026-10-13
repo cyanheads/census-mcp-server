@@ -2,9 +2,9 @@
 
 **Server:** census-mcp-server
 **Version:** 0.6.1
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.14`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.15`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
-**MCP SDK:** `@modelcontextprotocol/server` ^2.2.0
+**MCP SDK:** `@modelcontextprotocol/server` ^2.3.1
 **Zod:** ^4.6.5
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -246,8 +246,8 @@ src/
       geography-service.ts              # TIGERweb + Census Geocoder geography resolution
       types.ts                          # Geography types
     variable-cache/
-      variable-cache-service.ts         # In-process variables.json cache, attribute columns, universes, dataset resolution
-      variable-search.ts                # Whole-word variable search and ranking rule
+      variable-cache-service.ts         # In-process variables.json cache, attribute columns, universes, dataset resolution, sibling-dataset lookup
+      variable-search.ts                # Code and whole-word variable search, and its ranking rule
       types.ts                          # Variable types
   mcp-server/
     tools/variable-entry.ts             # Per-variable output entry + rendering shared by both data tools

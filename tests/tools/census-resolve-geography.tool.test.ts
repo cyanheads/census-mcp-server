@@ -4,7 +4,7 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { censusResolveGeography } from '@/mcp-server/tools/definitions/census-resolve-geography.tool.js';
 
@@ -312,6 +312,24 @@ describe('censusResolveGeography', () => {
     expect(mockResolveGeography).not.toHaveBeenCalled();
   });
 
+  /** #62: the message said what to provide, and the hint said it again. */
+  it('states a blank name in the message and what to send in the hint, on both surfaces', async () => {
+    const result = await runToolContract(censusResolveGeography, { name: '   ' });
+    const error = (
+      result.structuredContent as {
+        error: { message: string; data: { recovery: { hint: string } } };
+      }
+    ).error;
+
+    expect(error.message).toBe('Place name is required.');
+    expect(error.data.recovery.hint).toBe(
+      'Provide a city, county, state, or street address, such as "King County, WA" or "Washington".',
+    );
+    const text = result.content.map((c) => ('text' in c ? c.text : '')).join('\n');
+    expect(text).toContain('Error: Place name is required.');
+    expect(text).toContain(`Recovery: ${error.data.recovery.hint}`);
+  });
+
   it('includes place_fips when service resolves a place', async () => {
     mockResolveGeography.mockResolvedValue({
       name: 'Seattle, Washington',
@@ -466,6 +484,52 @@ describe('censusResolveGeography', () => {
     expect(result).not.toHaveProperty('census_designated_place');
     const text = (censusResolveGeography.format!(result)[0] as { text: string }).text;
     expect(text).not.toContain('census-designated');
+  });
+
+  it('discloses a New York City borough mapped to its county, on both surfaces', async () => {
+    mockResolveGeography.mockResolvedValue({
+      name: 'Richmond County',
+      geographyType: 'county',
+      stateFips: '36',
+      countyFips: '085',
+      fipsSummary: '085',
+      borough: 'Staten Island',
+    });
+
+    const result = await runToolContract(censusResolveGeography, { name: 'Staten Island, NY' });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      name: 'Richmond County',
+      fips_summary: '085',
+      notice: '"Staten Island" is the New York City borough coextensive with Richmond County.',
+    });
+    expect(result.structuredContent).not.toHaveProperty('borough');
+    const text = result.content.map((c) => ('text' in c ? c.text : '')).join('\n');
+    expect(text).toContain(
+      '"Staten Island" is the New York City borough coextensive with Richmond County.',
+    );
+  });
+
+  it('carries no notice when the service mapped no borough', async () => {
+    mockResolveGeography.mockResolvedValue({
+      name: 'Queens County',
+      geographyType: 'county',
+      stateFips: '36',
+      countyFips: '081',
+      fipsSummary: '081',
+    });
+
+    const result = await runToolContract(censusResolveGeography, { name: 'Queens, NY' });
+
+    expect(result.structuredContent).not.toHaveProperty('notice');
+    const text = result.content.map((c) => ('text' in c ? c.text : '')).join('\n');
+    expect(text).not.toContain('borough');
+  });
+
+  it('declares the notice in the advertised output and names boroughs in the name description', () => {
+    expect(Object.keys(censusResolveGeography.enrichment ?? {})).toEqual(['notice']);
+    expect(censusResolveGeography.input.shape.name.description).toContain('Brooklyn, NY');
   });
 
   it('throws ambiguous_name when service rejects with ambiguity', async () => {

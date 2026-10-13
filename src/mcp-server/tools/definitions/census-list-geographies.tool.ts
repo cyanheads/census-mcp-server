@@ -7,10 +7,20 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getDiscoveryConfig } from '@/config/server-config.js';
 import { getCensusApiService } from '@/services/census-api/census-api-service.js';
+import { yearNotAvailable } from '@/services/census-api/errors.js';
 import {
+  DATASET_AVAILABLE_YEARS,
   DATASET_LATEST_YEARS,
   resolveDataset,
 } from '@/services/variable-cache/variable-cache-service.js';
+
+/**
+ * Distinct `geography_level` values — the count the data tools' `geography_not_supported` message
+ * gives. geography.json lists a level once per parent hierarchy (acs/acs5 2024: 65 entries, 43
+ * levels), so the entry count would tell a caller a different total for the same dataset-year.
+ */
+const countLevels = (levels: ReadonlyArray<{ geography_level: string }>) =>
+  new Set(levels.map((level) => level.geography_level)).size;
 
 export const censusListGeographies = tool('census_list_geographies', {
   title: 'List Census Geography Levels',
@@ -52,7 +62,9 @@ export const censusListGeographies = tool('census_list_geographies', {
           })
           .describe('A single geography level available for this dataset.'),
       )
-      .describe('Geography levels supported by this dataset and year.'),
+      .describe(
+        'Geography levels supported by this dataset and year, one entry per parent hierarchy: a level published under several hierarchies (county under state, and under a metro area) appears once for each.',
+      ),
   }),
 
   enrichment: {
@@ -60,7 +72,9 @@ export const censusListGeographies = tool('census_list_geographies', {
     year: z.number().describe('Vintage year queried.'),
     totalLevels: z
       .number()
-      .describe('Total number of geography levels available for this dataset and year.'),
+      .describe(
+        'Distinct geography levels available for this dataset and year — the count census_query_data and census_compare_geographies give for an unsupported level. Can be lower than the number of geography_levels entries, which repeat a level per parent hierarchy.',
+      ),
   },
 
   errors: [
@@ -74,8 +88,17 @@ export const censusListGeographies = tool('census_list_geographies', {
     {
       reason: 'year_not_available',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Dataset exists but the requested year has no data.',
+      when: "Dataset exists but the Census API publishes no geography list for the requested year. For a year outside the dataset's available_years, the error names the years it serves.",
       recovery: 'Check available_years in census_list_datasets for valid years for this dataset.',
+    },
+    {
+      reason: 'upstream_error',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: "The Census API answered the dataset's geography.json with an HTTP error other than a 404, or with HTML or an unparseable body.",
+      retryable: true,
+      thrownBy: 'service',
+      recovery:
+        'Retry the request if the failure was transient; if the Census API rejected the request outright, retrying it unchanged returns the same status, so change the dataset or year.',
     },
   ],
 
@@ -90,7 +113,11 @@ export const censusListGeographies = tool('census_list_geographies', {
     const levels = await service.fetchGeographyLevels(dataset, year, ctx);
 
     if (levels.length === 0) {
-      throw ctx.fail('year_not_available', `No geography data found for ${dataset} (${year})`, {
+      const availableYears = DATASET_AVAILABLE_YEARS[dataset];
+      // A listed year that 404s means the catalog drifted from the API: naming it as available
+      // beside "cannot be queried" would contradict itself.
+      if (!availableYears?.includes(year)) throw yearNotAvailable(dataset, year, availableYears);
+      throw ctx.fail('year_not_available', `No geography data found for ${dataset} (${year}).`, {
         dataset,
         year,
       });
@@ -121,15 +148,21 @@ export const censusListGeographies = tool('census_list_geographies', {
       };
     });
 
-    ctx.enrich({ dataset, year, totalLevels: result.length });
+    ctx.enrich({ dataset, year, totalLevels: countLevels(result) });
 
     return { geography_levels: result };
   },
 
   format: (result) => {
+    const levels = countLevels(result.geography_levels);
+    const entries = result.geography_levels.length;
     const lines: string[] = [
       `## Geography Levels\n`,
-      `**${result.geography_levels.length} levels available**\n`,
+      `**${levels} levels available**${
+        entries > levels
+          ? ` — ${entries} entries, since a level published under more than one parent hierarchy is listed once for each`
+          : ''
+      }\n`,
     ];
     for (const level of result.geography_levels) {
       lines.push(`### ${level.geography_level}`);

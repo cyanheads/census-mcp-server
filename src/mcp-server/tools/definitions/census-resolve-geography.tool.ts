@@ -17,7 +17,7 @@ export const censusResolveGeography = tool('census_resolve_geography', {
     name: z
       .string()
       .describe(
-        'Place name (e.g., "King County, WA", "Seattle, WA", "California"), 5-digit ZIP code (e.g., "98109", resolved to its ZIP Code Tabulation Area), or street address (e.g., "1600 Pennsylvania Ave NW, Washington, DC 20500"). Include the state after a comma — its abbreviation or full name, as in "Chatham County, Georgia" — to disambiguate places with common names. It narrows a statistical area as well, matching any state the area spans, so "Kansas City, MO" and "Kansas City, KS" both reach the MO-KS metro area. Matching ignores case, reads "Saint" and "St." as the same word, and accepts unaccented spellings ("Dona Ana County, NM"). For a statistical area a leading city is enough ("Denver, CO" for the Denver-Aurora-Centennial metro area), and an older full name resolves through its leading city ("Denver-Aurora-Lakewood, CO").',
+        'Place name (e.g., "King County, WA", "Seattle, WA", "California"), 5-digit ZIP code (e.g., "98109", resolved to its ZIP Code Tabulation Area), or street address (e.g., "1600 Pennsylvania Ave NW, Washington, DC 20500"). Include the state after a comma — its abbreviation or full name, as in "Chatham County, Georgia" — to disambiguate places with common names. It narrows a statistical area as well, matching any state the area spans, so "Kansas City, MO" and "Kansas City, KS" both reach the MO-KS metro area. Matching ignores case, reads "Saint" and "St." as the same word, and accepts unaccented spellings ("Dona Ana County, NM"). For a statistical area a leading city is enough ("Denver, CO" for the Denver-Aurora-Centennial metro area), and an older full name resolves through its leading city ("Denver-Aurora-Lakewood, CO"). A New York City borough with a New York suffix resolves to the county it is coextensive with when geography_type is "county" or omitted — "Brooklyn, NY" is Kings County, "Manhattan, NY" New York County, "Staten Island, NY" Richmond County. At any other level it is no_match, and at place, economic place, state, tract, or consolidated city the hint names the county.',
       ),
     geography_type: z
       .enum(GEOGRAPHY_TYPES)
@@ -83,6 +83,15 @@ export const censusResolveGeography = tool('census_resolve_geography', {
       ),
   }),
 
+  enrichment: {
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Present when the name was a New York City borough ("Brooklyn", "The Bronx", "Queens borough") resolved to the county it is coextensive with.',
+      ),
+  },
+
   errors: [
     {
       reason: 'no_match',
@@ -120,12 +129,11 @@ export const censusResolveGeography = tool('census_resolve_geography', {
 
   async handler(input, ctx) {
     if (!input.name.trim()) {
-      throw validationError(
-        'Place name is required — provide a city, county, state, or street address.',
-        {
-          recovery: { hint: 'Provide a non-empty name such as "King County, WA" or "Washington".' },
+      throw validationError('Place name is required.', {
+        recovery: {
+          hint: 'Provide a city, county, state, or street address, such as "King County, WA" or "Washington".',
         },
-      );
+      });
     }
 
     ctx.log.info('Resolving geography', {
@@ -143,6 +151,12 @@ export const censusResolveGeography = tool('census_resolve_geography', {
       },
       ctx,
     );
+
+    if (resolved.borough) {
+      ctx.enrich.notice(
+        `"${resolved.borough}" is the New York City borough coextensive with ${resolved.name}.`,
+      );
+    }
 
     return {
       name: resolved.name,

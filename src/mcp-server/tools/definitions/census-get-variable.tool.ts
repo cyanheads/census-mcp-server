@@ -15,7 +15,7 @@ import {
 export const censusGetVariable = tool('census_get_variable', {
   title: 'Get Census Variable Metadata',
   description:
-    "Fetch full metadata for one or more Census variable codes — label, concept group, predicate type, the table's universe, and margin-of-error sibling references. Use to confirm a variable code before building a query, or to look up what a known code means. On ACS datasets it returns estimate_code and moe_code sibling references so you can request both without a separate search, and a margin-of-error code carries attribute_of and attribute_type MARGIN_OF_ERROR as the Census publishes them; the ACS comparison profiles (acs/acs5/cprofile, acs/acs1/cprofile) and the other dataset families publish no margins of error and carry none of these fields. It also resolves the annotation and flag columns the data tools accept, such as B19013_001EA or EMP_F, naming the column each one belongs to, and predicate codes such as NAICS2017 or SEX, confirming a filter dimension exists in a dataset before a query uses it — for the values a dimension accepts rather than the dimension itself, call census_list_predicate_values.",
+    "Fetch full metadata for one or more Census variable codes — label, concept group, predicate type, the table's universe, and margin-of-error sibling references. Use to confirm a variable code before building a query, or to look up what a known code means. On ACS datasets it returns estimate_code and moe_code sibling references so you can request both without a separate search, and a margin-of-error code carries attribute_of (its estimate) and attribute_type MARGIN_OF_ERROR; the ACS comparison profiles (acs/acs5/cprofile, acs/acs1/cprofile) and the other dataset families publish no margins of error and carry none of these fields. It also resolves the annotation and flag columns the data tools accept, such as B19013_001EA or EMP_F, naming the column each one belongs to, and predicate codes such as NAICS2017 or SEX, confirming a filter dimension exists in a dataset before a query uses it — for the values a dimension accepts rather than the dimension itself, call census_list_predicate_values.",
   annotations: { readOnlyHint: true, openWorldHint: false },
   input: z.object({
     variables: z
@@ -52,7 +52,7 @@ export const censusGetVariable = tool('census_get_variable', {
               .string()
               .optional()
               .describe(
-                'Universe of the variable\'s table (e.g., "Households", "Population 25 years and over"). Absent when the table publishes none — the ACS subject, profile, and selected population profile tables, dec/dp, the business datasets, pep/charv, and every ACS and dec/pl vintage before 2020 publish none — and for a column that belongs to no single table.',
+                'Universe of the variable\'s table (e.g., "Households", "Population 25 years and over"). Absent when the table publishes none — the ACS subject, profile, and selected population profile tables, dec/dp, the business datasets, pep/charv, and every ACS and dec/pl vintage before 2020 publish none — and for a column that belongs to no single table. Also absent when the universe lookup failed, which the notice names along with the affected codes; retrying can return it.',
               ),
             attribute_of: z
               .string()
@@ -64,7 +64,7 @@ export const censusGetVariable = tool('census_get_variable', {
               .string()
               .optional()
               .describe(
-                'For an annotation, flag, or margin-of-error column, its kind as the Census publishes it (e.g., "ANNOTATION", "FLAG", "MARGIN_OF_ERROR"). Absent on ordinary variables.',
+                'For an annotation, flag, or margin-of-error column, its kind in upper-snake case (e.g., "ANNOTATION", "FLAG", "MARGIN_OF_ERROR"), whatever spelling the vintage publishes — older vintages write "Annotation" or "Margin of Error". Absent on ordinary variables.',
               ),
             estimate_code: z
               .string()
@@ -86,6 +86,15 @@ export const censusGetVariable = tool('census_get_variable', {
     year: z.number().describe('Vintage year queried.'),
   }),
 
+  enrichment: {
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        "Present when the dataset's universe lookup failed: names the codes returned without universe for that reason, and says to retry.",
+      ),
+  },
+
   errors: [
     {
       reason: 'variable_not_found',
@@ -93,7 +102,7 @@ export const censusGetVariable = tool('census_get_variable', {
       when: 'One or more variable codes were not found in the dataset and year.',
       thrownBy: 'service',
       recovery:
-        'Use census_search_variables to discover valid variable codes for this dataset and year.',
+        'When a lookup confirms a sibling dataset publishes a missing code, the error names it, so look the code up there. Otherwise use census_search_variables to discover valid variable codes for this dataset and year.',
     },
     {
       reason: 'dataset_not_found',
@@ -113,11 +122,20 @@ export const censusGetVariable = tool('census_get_variable', {
     {
       reason: 'variables_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: "Variable metadata — the dataset's variables.json, groups.json, or an attribute column's own entry — could not be fetched or parsed.",
+      when: "The dataset's variables.json came back as HTML or unparseable, or an attribute column's own entry could not be fetched or parsed.",
       retryable: true,
       thrownBy: 'service',
       recovery:
         'Retry the request; if persistent, the dataset and year combination may not be available.',
+    },
+    {
+      reason: 'upstream_error',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: "The Census API answered the dataset's variables.json with an HTTP error, after any retries a transient status earns.",
+      retryable: true,
+      thrownBy: 'service',
+      recovery:
+        'Retry the request if the failure was transient; if the Census API rejected the request outright, retrying it unchanged returns the same status, so change the dataset or year.',
     },
   ],
 
@@ -126,13 +144,22 @@ export const censusGetVariable = tool('census_get_variable', {
     const { defaultYear } = getDiscoveryConfig();
     const year = input.year ?? DATASET_LATEST_YEARS[dataset] ?? defaultYear;
 
-    // Every supported dataset names its columns in uppercase, as the data tools assume.
-    const codes = input.variables.map((code) => code.trim().toUpperCase());
+    // Case is resolved against the dataset's own spellings by the variable cache.
+    const codes = input.variables.map((code) => code.trim());
 
     ctx.log.info('Getting Census variable metadata', { variables: codes, dataset, year });
 
     const service = getVariableCacheService();
     const variables = await service.getVariablesByCode(codes, dataset, year, ctx);
+
+    const universeless = [
+      ...new Set(variables.filter((v) => v.universeUnavailable).map((v) => v.code)),
+    ];
+    if (universeless.length > 0) {
+      ctx.enrich.notice(
+        `No universe returned for ${universeless.join(', ')}: the Census groups.json for ${dataset} (${year}) could not be read, so their tables may still publish one. A retry returns it for each table that does.`,
+      );
+    }
 
     return {
       variables: variables.map((v) => ({

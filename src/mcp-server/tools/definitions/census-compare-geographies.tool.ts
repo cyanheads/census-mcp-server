@@ -27,6 +27,7 @@ import {
   defaultLabelColumnsFor,
   describeAmbiguousRows,
   describeEmptyPredicatedResult,
+  describeTableSplit,
   describeUnsetPredicates,
   flagColumnsFor,
   getVariableCacheService,
@@ -38,13 +39,13 @@ import {
 export const censusCompareGeographies = tool('census_compare_geographies', {
   title: 'Compare Census Geographies',
   description:
-    'Compare one or more variables across multiple geographies at the same level — all counties in a state, all states nationally, or a named set of specific geographies — ranked on the value of one of them. Covers queries like "compare median income across WA counties" or "which states have the most people below the poverty line." A count ranks geographies by size, not by rate, so to rank a rate, rank a published percentage: S1701_C03_001E (percent below the poverty level, dataset acs/acs5/subject), DP03_0128PE (the same percentage, acs/acs5/profile), or DP04_0047PE (percent of occupied housing units that are renter-occupied, acs/acs5/profile). Profile and subject tables reach tracts but not block groups. Omit within to compare all geographies nationally at the level. Suppressed values are decoded to human-readable labels rather than passed through as raw negative sentinels. On the business datasets (cbp, ecnbasic, nonemp), pep/charv, dec/ddhca, and acs/acs1/spp, use predicates to rank within one industry, size class, or population group — a comparison that omits one ranks on a default the Census API picks, which is an all-categories total on some dimensions and a single category on others. Each row names the defaults that were applied in applied_filters, and census_list_predicate_values enumerates the codes a dimension accepts. A dataset that publishes several records per geography cannot be ranked until one is pinned: pep/charv publishes an April estimates base and a July estimate, so a comparison that pins neither fails with ambiguous_rows rather than giving every geography two ranks — pass predicates {"MONTH": "7"} for the July estimate.',
+    'Compare one or more variables across multiple geographies at the same level — all counties in a state, all states nationally, or a named set of specific geographies — ranked on the value of one of them. Covers queries like "compare median income across WA counties" or "which states have the most people below the poverty line." A count ranks geographies by size, not by rate, so to rank a rate, rank a published percentage: S1701_C03_001E (percent below the poverty level, dataset acs/acs5/subject), DP03_0128PE (the same percentage, acs/acs5/profile), or DP04_0047PE (percent of occupied housing units that are renter-occupied, acs/acs5/profile). Profile and subject tables reach tracts but not block groups. Omit within to compare all geographies nationally at the level. Suppressed values are decoded to human-readable labels rather than passed through as raw negative sentinels. On the business datasets (cbp, ecnbasic, nonemp), pep/charv, dec/ddhca, dec/ddhcb, and acs/acs1/spp, use predicates to rank within one industry, size class, or population group — a comparison that omits one ranks on a default the Census API picks, which is an all-categories total on some dimensions and a single category on others. Each row names the defaults that were applied in applied_filters, and census_list_predicate_values enumerates the codes a dimension accepts. Some dec/ddhca and dec/ddhcb tables split the population groups between them, publishing each group at a geography in only one table of the family, so a ranking on one of them leaves out the geographies whose group sits in a sibling table — the notice names those tables. A dataset that publishes several records per geography cannot be ranked until one is pinned: pep/charv publishes an April estimates base and a July estimate, so a comparison that pins neither fails with ambiguous_rows rather than giving every geography two ranks — pass predicates {"MONTH": "7"} for the July estimate.',
   annotations: { readOnlyHint: true, openWorldHint: false },
   input: z.object({
     variables: z
       .array(z.string())
       .describe(
-        'Variable codes to compare (e.g., ["B19013_001E", "B19013_001M"]); the ranking is on one of them, set by sort_by. Codes are uppercased before the request, and each row is keyed by the uppercase code. At most 49 per call: the Census API accepts 50 columns per request and every query also sends NAME. On datasets where a label column is added for each filter dimension left unset, or record columns are added (cbp, ecnbasic, nonemp, pep/charv, dec/ddhca, acs/acs1/spp), the maximum is lower, and too_many_variables states the exact number for the comparison. On ACS datasets, add the margin-of-error counterpart of a code (same code, E suffix swapped for M) for reliability context. The ACS comparison profiles (acs/acs5/cprofile, acs/acs1/cprofile) and the other dataset families (pep, dec, cbp, ecnbasic, nonemp) publish no margins of error.',
+        'Variable codes to compare (e.g., ["B19013_001E", "B19013_001M"]); the ranking is on one of them, set by sort_by. Codes are matched regardless of case and sent in the dataset\'s own spelling, which keys each row — uppercase everywhere except the comparison profiles\' significance columns (CP03_2024to2019_062SS). A code the dataset does not list is sent uppercased. At most 49 per call: the Census API accepts 50 columns per request and every query also sends NAME. On datasets where a label column is added for each filter dimension left unset, or record columns are added (cbp, ecnbasic, nonemp, pep/charv, dec/ddhca, dec/ddhcb, acs/acs1/spp), the maximum is lower, and too_many_variables states the exact number for the comparison. On ACS datasets, add the margin-of-error counterpart of a code (same code, E suffix swapped for M) for reliability context. The ACS comparison profiles (acs/acs5/cprofile, acs/acs1/cprofile) and the other dataset families (pep, dec, cbp, ecnbasic, nonemp) publish no margins of error.',
       ),
     geography_level: z
       .string()
@@ -85,7 +86,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
       .record(z.string(), z.string())
       .optional()
       .describe(
-        'Filter values keyed by variable code, applied to every geography in the comparison — e.g. {"NAICS2017": "5112"} to rank counties by their software-publisher establishment count in cbp. The business datasets (cbp, ecnbasic, nonemp), pep/charv, dec/ddhca, and acs/acs1/spp declare filter dimensions such as industry (NAICS2017/NAICS2022), legal form (LFO), size class (EMPSZES/RCPSZES), tax status (TAXSTAT), operation type (TYPOP), sex (SEX), age (AGE), and population group (POPGROUP). Leaving one unset is not an error: the Census API substitutes its own default, which is the all-categories total on cbp NAICS2017 but a single population group on dec/ddhca POPGROUP and a single sector on ecnbasic NAICS2022 — so a ranking can read like an overall one without being it. Every unset dimension is named in the response notice and its applied default is echoed per row in applied_filters. Keys are matched case-insensitively, and a blank value is treated as omitted. A value of "*" returns every geography once per category of that dimension, which a ranking cannot hold, so it fails with ambiguous_rows naming the dimension to pin — use census_query_data for a per-category breakdown. Code names vary by dataset and vintage — cbp 2023 uses NAICS2017 while nonemp 2023 uses NAICS2022 — so read them from the notice or from census_search_variables. Call census_list_predicate_values for the codes a dimension accepts; NAICS values are standard North American Industry Classification System codes at any depth (51 information, 5112 software publishers).',
+        'Filter values keyed by variable code, applied to every geography in the comparison — e.g. {"NAICS2017": "5112"} to rank counties by their software-publisher establishment count in cbp. The business datasets (cbp, ecnbasic, nonemp), pep/charv, dec/ddhca, dec/ddhcb, and acs/acs1/spp declare filter dimensions such as industry (NAICS2017/NAICS2022), legal form (LFO), size class (EMPSZES/RCPSZES), tax status (TAXSTAT), operation type (TYPOP), sex (SEX), age (AGE), and population group (POPGROUP). Leaving one unset is not an error: the Census API substitutes its own default, which is the all-categories total on cbp NAICS2017 but a single population group on dec/ddhca and dec/ddhcb POPGROUP and a single sector on ecnbasic NAICS2022 — so a ranking can read like an overall one without being it. Every unset dimension is named in the response notice and its applied default is echoed per row in applied_filters. Keys are matched case-insensitively, and a blank value is treated as omitted. A value of "*" returns every geography once per category of that dimension, which a ranking cannot hold, so it fails with ambiguous_rows naming the dimension to pin — use census_query_data for a per-category breakdown. Code names vary by dataset and vintage — cbp 2023 uses NAICS2017 while nonemp 2023 uses NAICS2022 — so read them from the notice or from census_search_variables. Call census_list_predicate_values for the codes a dimension accepts; NAICS values are standard North American Industry Classification System codes at any depth (51 information, 5112 software publishers).',
       ),
     dataset: z
       .string()
@@ -101,7 +102,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
       .string()
       .optional()
       .describe(
-        "Variable code to rank on (default: the first code in variables), uppercased like the variables. Must be one of the requested codes, or the call fails with sort_by_not_requested. Geographies rank on that code's own value, so a count ranks by size and only a published percentage such as S1701_C03_001E or DP03_0128PE ranks by rate.",
+        "Variable code to rank on (default: the first code in variables), matched regardless of case like the variables. Must be one of the requested codes, or the call fails with sort_by_not_requested. Geographies rank on that code's own value, so a count ranks by size and only a published percentage such as S1701_C03_001E or DP03_0128PE ranks by rate.",
       ),
     sort_dir: z
       .enum(['asc', 'desc'])
@@ -137,7 +138,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
               .object({})
               .passthrough()
               .describe(
-                'Map of variable code to value entry. Each key is a variable code from the variables input, uppercased; each value has: estimate (number|null), moe (number|null, optional), label (string), suppressed (boolean), suppression_reason (string, optional), open_ended (true, optional), flag ({code, meaning}, optional), value (string, optional). An estimate of null means one of three things and the other fields say which: suppressed true is a number the Census withheld, a value field is a cell holding text rather than a number (GEO_ID returns "0500000US53033"; the older ACS profile vintages write not-applicable as "(X)" in a column that is a number elsewhere), and neither is a cell with nothing in it. suppression_reason carries the meaning the Census publishes for the sentinel or flag, and a suppressed value ranks after every number in either sort direction. On ACS, a margin of error the Census treats as zero (a controlled estimate) is moe 0. open_ended true marks an ACS median that falls in the lowest or highest interval of an open-ended distribution, so the estimate is that interval\'s boundary (250001 for "250,000+") — it ranks by that figure, so geographies sharing it are tied, and it appears only when the matching M code was requested. flag is the symbol a business dataset (cbp, ecnbasic, nonemp) published beside the value: a withholding flag comes with suppressed true, and so does a noise or data-quality band beside a 0, which is the range a range column such as EMP_N or RCPTOT_IMP publishes in place of a number; a quality note keeps the estimate. Text has no ordering, so sorting on a column of it leaves every row tied and ranked in the order the Census returned them, and the notice says so.',
+                'Map of variable code to value entry. Each key is a variable code from the variables input, in the dataset\'s spelling — uppercase except the comparison profiles\' significance columns (CP03_2024to2019_062SS); each value has: estimate (number|null), moe (number|null, optional), label (string), suppressed (boolean), suppression_reason (string, optional), open_ended (true, optional), flag ({code, meaning}, optional), value (string, optional). An estimate of null means one of three things and the other fields say which: suppressed true is a number the Census withheld, a value field is a cell holding text rather than a number (GEO_ID returns "0500000US53033"; the older ACS profile vintages write not-applicable as "(X)" in a column that is a number elsewhere), and neither is a cell with nothing in it. suppression_reason carries the meaning the Census publishes for the sentinel or flag, and a suppressed value ranks after every number in either sort direction. On ACS, a margin of error the Census treats as zero (a controlled estimate) is moe 0. open_ended true marks an ACS median that falls in the lowest or highest interval of an open-ended distribution, so the estimate is that interval\'s boundary (250001 for "250,000+") — it ranks by that figure, so geographies sharing it are tied, and it appears only when the matching M code was requested. flag is the symbol a business dataset (cbp, ecnbasic, nonemp) published beside the value: a withholding flag comes with suppressed true, and so does a noise or data-quality band beside a 0, which is the range a range column such as EMP_N or RCPTOT_IMP publishes in place of a number; a quality note keeps the estimate. Text has no ordering, so sorting on a column of it leaves every row tied and ranked in the order the Census returned them, and the notice says so.',
               ),
             applied_filters: z
               .object({})
@@ -173,14 +174,16 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
       .describe('True when totalCount exceeds the limit and results were cut off.'),
     sortVariable: z
       .string()
-      .describe('Variable code the rows are ranked on, uppercased as it appears in variables.'),
+      .describe(
+        "Variable code the rows are ranked on, in the dataset's spelling, as it keys each row's variables.",
+      ),
     dataset: z.string().describe('Dataset queried.'),
     year: z.number().describe('Vintage year queried.'),
     notice: z
       .string()
       .optional()
       .describe(
-        'Guidance when results were truncated, when the sort column holds no number on any row (so the rows are in the order the Census returned them rather than ranked), when geographies entries matched no row, when a bare level code matched more than one state, or when the dataset declares filter dimensions the comparison left unset — how to narrow scope, raise the limit, correct the FIPS codes, or add the predicates that pin what the ranking covers. For an unset dimension it also quotes the label of the default the Census API applied, which is what says whether the ranking is on a total or on one category. Also names any variable codes whose flags could not be checked because the request had no room left under the Census 50-column limit — a withheld value there reads as 0 and ranks as one.',
+        'Guidance when results were truncated, when the sort column holds no number on any row (so the rows are in the order the Census returned them rather than ranked), when geographies entries matched no row, when a bare level code matched more than one state, or when the dataset declares filter dimensions the comparison left unset — how to narrow scope, raise the limit, correct the FIPS codes, or add the predicates that pin what the ranking covers. For an unset dimension it also quotes the label of the default the Census API applied, which is what says whether the ranking is on a total or on one category. On dec/ddhca and dec/ddhcb tables that split the population groups between them, it names the sibling tables a geography left out of the ranking may sit in. Also names any variable codes whose flags could not be checked because the request had no room left under the Census 50-column limit — a withheld value there reads as 0 and ranks as one.',
       ),
   },
 
@@ -235,7 +238,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
       when: 'The Census API rejected a variable code as unknown for this dataset and year. It names only the first unknown code in a request.',
       thrownBy: 'service',
       recovery:
-        'Use census_search_variables or census_get_variable to confirm codes for this dataset and year.',
+        'When a lookup confirms a sibling dataset publishes the code, the error names it, so compare in that dataset instead. Otherwise use census_search_variables or census_get_variable to confirm codes for this dataset and year.',
     },
     {
       reason: 'too_many_variables',
@@ -293,12 +296,14 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
   ],
 
   async handler(input, ctx) {
-    const variables = normalizeVariableCodes(input.variables);
-    if (variables.length === 0) {
-      throw validationError(
-        'At least one variable code is required. Use census_search_variables to find codes.',
-        { variableCount: 0 },
-      );
+    const requestedCodes = normalizeVariableCodes(input.variables);
+    if (requestedCodes.length === 0) {
+      throw validationError('At least one variable code is required.', {
+        variableCount: 0,
+        recovery: {
+          hint: 'Pass variable codes such as B01003_001E — census_search_variables finds them.',
+        },
+      });
     }
 
     const dataset = resolveDataset(input.dataset, 'acs/acs5');
@@ -306,16 +311,16 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
     const year = input.year ?? DATASET_LATEST_YEARS[dataset] ?? defaultYear;
     const limit = input.limit ?? 50;
     const sortDir = input.sort_dir ?? 'desc';
-    // Rows are keyed by the uppercase code, so a sort key left in the caller's casing would
-    // match nothing and leave every row tied.
-    const sortBy = input.sort_by?.trim().toUpperCase() || (variables[0] as string);
+    // Compared uppercased, as the variables are: a sort key in the caller's casing would match
+    // nothing and leave every row tied.
+    const sortKey = input.sort_by?.trim().toUpperCase() || (requestedCodes[0] as string);
     // A sort key that names no requested column leaves every row tied, and the Census return order
     // would come back labelled as a ranking. Only the input is needed to tell, so no request is spent.
-    if (!variables.includes(sortBy)) {
+    if (!requestedCodes.includes(sortKey)) {
       throw ctx.fail(
         'sort_by_not_requested',
-        `sort_by "${sortBy}" is not one of the requested variables (${variables.join(', ')}), so there is nothing to rank on.`,
-        { sortBy, variables },
+        `sort_by "${sortKey}" is not one of the requested variables (${requestedCodes.join(', ')}), so there is nothing to rank on.`,
+        { sortBy: sortKey, variables: requestedCodes },
       );
     }
 
@@ -326,7 +331,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
     variableCacheService.validateYear(dataset, year);
 
     ctx.log.info('Comparing geographies', {
-      variables,
+      variables: requestedCodes,
       geographyLevel: input.geography_level,
       within: input.within,
       dataset,
@@ -436,6 +441,18 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
       );
     }
 
+    // The dataset's own spelling of each code, which the request sends and the rows are keyed by.
+    // The predicate check has loaded variables.json, so this spends no request, and the mapping is
+    // one-to-one, so the sort key keeps its place among the codes.
+    const variables = await variableCacheService.resolveSpellings(
+      requestedCodes,
+      dataset,
+      year,
+      ctx,
+    );
+    const sortBy = variables[requestedCodes.indexOf(sortKey)] as string;
+    const tableSplit = describeTableSplit(variables, dataset, false);
+
     const unfiltered = predicateCheck.unset;
     const defaultLabelColumns = defaultLabelColumnsFor(unfiltered);
 
@@ -500,6 +517,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
         Object.keys(predicates),
         dataset,
         year,
+        variables,
       );
       const hint = predicateHint
         ? `${predicateHint} Otherwise confirm the level with census_list_geographies.`
@@ -538,7 +556,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
           geographyLevel: input.geography_level,
           rowsPerGeography: maxRowsPerGeography,
           recordValues: observed,
-          recovery: { hint: describeAmbiguousRows(dataset, year, maxRowsPerGeography, observed) },
+          recovery: { hint: describeAmbiguousRows(observed) },
         },
       );
     }
@@ -577,7 +595,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
             geographyLevel: input.geography_level,
             unmatchedGeographies,
             recovery: {
-              hint: `The geographies filter matches a row's full GEOID (level plus parents, e.g. "53033" for a WA county) or its bare level code ("033") when within scopes the comparison to one state. Take a GEOID from the geography_geoid field of a census_query_data row, or build it from census_resolve_geography by concatenating state_fips, then county_fips when present, then fips_summary.`,
+              hint: `The geographies filter matches a row's full GEOID (level plus parents, e.g. "53033" for a WA county) or its bare level code ("033") when within scopes the comparison to one state. Take a GEOID from the geography_geoid field of a census_query_data row, or build it from census_resolve_geography by concatenating state_fips, then county_fips when present, then fips_summary.${tableSplit ? ` ${tableSplit}` : ''}`,
             },
           },
         );
@@ -631,6 +649,10 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
         describeUnsetPredicates(unfiltered, dataset, year, rows[0]?.appliedFilters ?? {}),
       );
     }
+    // On tables that split POPGROUP groups, a geography whose group sits in a sibling table drops
+    // out of the ranking, or has no row to match a `geographies` entry, with nothing in the rows
+    // to say so.
+    if (tableSplit) notices.push(tableSplit);
     // Text, or a column the Census withheld on every row, has no ordering: every row ties and the
     // ranks are just the order the rows arrived in.
     const ranked = filteredRows.some((row) => typeof row.variables[sortBy]?.estimate === 'number');

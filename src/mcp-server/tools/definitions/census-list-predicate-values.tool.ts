@@ -26,16 +26,27 @@ const NAICS_DIMENSION = /^NAICS\d{4}$/;
 const WITHHELD_SAMPLE_SIZE = 3;
 
 /**
+ * Time each publication probe gets, every attempt and backoff included. The check is best-effort, so
+ * a probe that never answers must not hold the call past the 60-second request timeout MCP SDK
+ * clients default to — four 15-second attempts plus backoff came to 66 s. A failing probe's four
+ * fast attempts and their 1/2/4 s backoff (at most 8.75 s with jitter) still fit; the probes run in
+ * parallel, so two of them do not lengthen it.
+ */
+const PUBLICATION_CHECK_DEADLINE_MS = 20_000;
+
+/**
  * The codes a dimension's published value map declares that the dataset actually serves rows for,
  * or `undefined` when the check could not be made.
  *
  * A `values.item` map is a classification the Census shares across products — `dec/ddhca` declares
  * 5,543 `POPGROUP` codes and publishes 2,996 of them, `cbp` declares 6,694 `NAICS2017` codes and
  * publishes 2,003. Wildcarding the dimension against one of the dataset's measure columns answers
- * with the published set in a single call, cached for the discovery TTL.
+ * with the published set, cached for the discovery TTL. That is one call on every dataset but
+ * `dec/ddhcb`, where no table publishes every group and the set is the union of two tables' calls.
  *
  * The check is best-effort by design: a failure downgrades the answer to the unchecked map with a
- * notice saying so, which is worse than a checked list but better than no list at all.
+ * notice saying so, which is worse than a checked list but better than no list at all. A caller's
+ * cancellation is not a failure of the check, so it propagates.
  */
 async function fetchPublishedCodes(
   dataset: string,
@@ -44,17 +55,24 @@ async function fetchPublishedCodes(
   ctx: Context,
 ): Promise<Set<string> | undefined> {
   try {
-    const measure = await getVariableCacheService().findPublicationProbe(dataset, year, ctx);
-    if (!measure) return;
+    const measures = await getVariableCacheService().findPublicationProbes(dataset, year, ctx);
+    if (measures.length === 0) return;
 
-    const published = await getCensusApiService().fetchPredicateValues(
-      { dataset, year, code: predicate, measure },
-      ctx,
+    const answers = await Promise.all(
+      measures.map((measure) =>
+        getCensusApiService().fetchPredicateValues(
+          { dataset, year, code: predicate, measure, deadlineMs: PUBLICATION_CHECK_DEADLINE_MS },
+          ctx,
+        ),
+      ),
     );
     // An empty answer is the probe saying nothing rather than the dimension having no codes —
-    // withholding every code on the strength of it would hide the whole dimension.
-    return published.length > 0 ? new Set(published.map((v) => v.code)) : undefined;
+    // withholding every code on the strength of it would hide the whole dimension, and a union
+    // missing one table's groups would hide those.
+    if (answers.some((published) => published.length === 0)) return;
+    return new Set(answers.flatMap((published) => published.map((v) => v.code)));
   } catch (error) {
+    if (ctx.signal.aborted) throw error;
     ctx.log.warning('Publication check failed; falling back to the unchecked value map', {
       dataset,
       year,
@@ -79,7 +97,7 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
     dataset: z
       .string()
       .describe(
-        'Dataset the dimension belongs to (e.g., "cbp", "nonemp", "ecnbasic", "dec/ddhca", "pep/charv", "acs/acs1/spp"). Use census_list_datasets to discover valid values. Case is ignored, and a two-part code can be given by its last part alone — "ddhca" is dec/ddhca, "charv" is pep/charv. Three-part codes such as acs/acs1/spp must be given in full. The response echoes the resolved code. Dimension codes are vintage-specific, so the dataset and year must match the query the values are for.',
+        'Dataset the dimension belongs to (e.g., "cbp", "nonemp", "ecnbasic", "dec/ddhca", "dec/ddhcb", "pep/charv", "acs/acs1/spp"). Use census_list_datasets to discover valid values. Case is ignored, and a two-part code can be given by its last part alone — "ddhca" is dec/ddhca, "charv" is pep/charv. Three-part codes such as acs/acs1/spp must be given in full. The response echoes the resolved code. Dimension codes are vintage-specific, so the dataset and year must match the query the values are for.',
       ),
     year: z
       .number()
@@ -191,7 +209,7 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
       code: JsonRpcErrorCode.NotFound,
       when: 'The dimension returned no codes for the scope requested.',
       recovery:
-        'Drop within_naics, or try a broader industry code — a narrow leaf industry often publishes only the all-establishments row.',
+        'Try another year of this dataset — census_list_datasets lists the years it serves — or confirm with census_get_variable that the code is the dimension you meant.',
     },
     {
       reason: 'upstream_error',
@@ -202,6 +220,15 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
       recovery:
         'Retry the request; if the error persists, the Census API may be temporarily unavailable.',
     },
+    {
+      reason: 'variables_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: "The dataset's variables.json came back as HTML or unparseable, so the predicate cannot be checked against it.",
+      retryable: true,
+      thrownBy: 'service',
+      recovery:
+        'Retry the request; if persistent, the dataset and year combination may not be available.',
+    },
   ],
 
   async handler(input, ctx) {
@@ -209,7 +236,7 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
     const { defaultYear } = getDiscoveryConfig();
     const year = input.year ?? DATASET_LATEST_YEARS[dataset] ?? defaultYear;
     const limit = input.limit ?? 50;
-    // Every supported dataset names its dimensions in uppercase, as the data tools assume.
+    // Every supported dataset names its dimensions in uppercase.
     const predicate = input.predicate.trim().toUpperCase();
 
     ctx.log.info('Listing predicate values', { predicate, dataset, year });
@@ -292,10 +319,17 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
     }
 
     if (all.length === 0) {
+      // Only an industry scope the call applied is a lever it can loosen; without one, the
+      // contract's hint names what is left to change.
       throw ctx.fail('no_values', `${predicate} returned no codes in ${dataset} (${year}).`, {
         dataset,
         year,
         predicate,
+        ...(naicsScopeApplied && {
+          recovery: {
+            hint: 'Drop within_naics, or try a broader industry code — a narrow leaf industry often publishes only the all-establishments row.',
+          },
+        }),
       });
     }
 

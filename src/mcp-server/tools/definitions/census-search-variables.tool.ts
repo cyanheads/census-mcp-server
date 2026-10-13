@@ -1,5 +1,6 @@
 /**
- * @fileoverview Tool to search Census Bureau variables by keyword across labels and concepts.
+ * @fileoverview Tool to search Census Bureau variables by code, or by keyword across labels and
+ * concepts.
  * @module mcp-server/tools/definitions/census-search-variables
  */
 
@@ -7,21 +8,40 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getDiscoveryConfig } from '@/config/server-config.js';
 import {
+  type CodeMiss,
   DATASET_LATEST_YEARS,
+  describeSiblingHolders,
   getVariableCacheService,
   resolveDataset,
 } from '@/services/variable-cache/variable-cache-service.js';
 
+/** The empty-result notice for a query shaped like a code, by why it matched nothing. */
+function codeMissNotice(
+  query: string,
+  miss: CodeMiss,
+  scope: { dataset: string; year: number },
+): string {
+  const where = `${scope.dataset} (${scope.year})`;
+  switch (miss.kind) {
+    case 'attribute':
+      return `${miss.code} is an attribute column of ${where} — an annotation, flag, label, or significance column published beside a variable, which search does not list. Call census_get_variable with ${miss.code} for its label and the variable it belongs to.`;
+    case 'sibling':
+      return `No variables matched "${query}" in ${where}. ${describeSiblingHolders(new Map([[miss.code, miss.sibling]]))}`;
+    case 'absent':
+      return `No variable or table in ${where} has the code "${miss.code}", and no label or concept contains it. Codes differ by dataset and vintage: check the code and year, or search with words from the variable's label.`;
+  }
+}
+
 export const censusSearchVariables = tool('census_search_variables', {
   title: 'Search Census Variables',
   description:
-    'Search Census variables by keyword across variable labels and concept groups. Returns variable codes with human-readable labels — use this to go from a concept like "median household income" to the variable code B19013_001E needed for data queries. On ACS datasets it returns both estimate (E suffix) and margin-of-error (M suffix) codes so you can request both; the ACS comparison profiles (acs/acs5/cprofile, acs/acs1/cprofile) and the other dataset families publish no margins of error. Also use it to find the predicate codes a dataset filters on, such as NAICS2017 in cbp. Adding a word narrows the results, since every word must match; when totalMatches exceeds the limit, a more specific query reaches the rest.',
+    'Search Census variables by keyword across variable labels and concept groups, or look one up by its code. Returns variable codes with human-readable labels — use this to go from a concept like "median household income" to the variable code B19013_001E needed for data queries. A query that is one variable or table code, such as B19013_001E or B19013, returns that variable or the table\'s variables, in code order, ahead of any keyword matches; a code the dataset does not publish gets a notice naming the dataset that does, when one is confirmed. On ACS datasets it returns both estimate (E suffix) and margin-of-error (M suffix) codes so you can request both; the ACS comparison profiles (acs/acs5/cprofile, acs/acs1/cprofile) and the other dataset families publish no margins of error. Also use it to find the predicate codes a dataset filters on, such as NAICS2017 in cbp. Adding a word narrows the results, since every word must match; when totalMatches exceeds the limit, a more specific query reaches the rest — except past the limit of a table code, where a later variable\'s own code does.',
   annotations: { readOnlyHint: true, openWorldHint: false },
   input: z.object({
     query: z
       .string()
       .describe(
-        'Keywords to search (e.g., "median household income", "poverty", "bachelor\'s degree"). Each word must match a whole word of the label or of the concept, ignoring case and punctuation, so "rate" does not match "separated". A column shared across tables, such as GEO_ID, is matched on its label only, and a margin of error on its estimate\'s label. When no variable contains every word, the results are the variables containing the most words, and the notice says how many that was.',
+        'Keywords to search (e.g., "median household income", "poverty", "bachelor\'s degree"), or one variable or table code (e.g., "B19013_001E", "B19013"). Each word must match a whole word of the label or of the concept, ignoring case and punctuation, so "rate" does not match "separated". A column shared across tables, such as GEO_ID, is matched on its label only, and a margin of error on its estimate\'s label. When no variable contains every word, the results are the variables containing the most words, and the notice says how many that was. A single token that equals a variable code or a table ID, ignoring case and any quotes or punctuation around it, returns those variables first. A token with no digit or underscore, such as "state", is read as a code when no keyword matched; ahead of keyword matches only when typed in the code\'s own uppercase ("STATE").',
       ),
     dataset: z
       .string()
@@ -79,7 +99,7 @@ export const censusSearchVariables = tool('census_search_variables', {
           .describe('A single matching Census variable entry.'),
       )
       .describe(
-        "Matching variables, best first: a variable whose label's last !!-separated segment or whose whole concept equals the query, then the query as a phrase in both label and concept, in the label only, in the concept only, then every word present but not as a phrase; ties go to fewer !! segments in the label, then a shorter concept, then the code, which puts an E estimate before its M margin of error. On ACS datasets, codes ending in E are estimates and M are their margins of error, except on the comparison profiles, which publish no M codes; on other datasets the suffix carries no such meaning.",
+        "Matching variables, best first: the variable whose code equals the query, or every variable of the table whose ID equals it, in code order; then a variable whose label's last !!-separated segment or whose whole concept equals the query, then the query as a phrase in both label and concept, in the label only, in the concept only, then every word present but not as a phrase; ties go to fewer !! segments in the label, then a shorter concept, then the code, which puts an E estimate before its M margin of error. On ACS datasets, codes ending in E are estimates and M are their margins of error, except on the comparison profiles, which publish no M codes; on other datasets the suffix carries no such meaning.",
       ),
   }),
 
@@ -90,7 +110,7 @@ export const censusSearchVariables = tool('census_search_variables', {
     totalMatches: z
       .number()
       .describe(
-        'Variables that contain every query word, before the limit was applied — or, when none does, the variables that contain the most words.',
+        'Variables matched before the limit was applied: those matching the query as a code, plus those containing every query word — or, when none does and no code matched, the variables that contain the most words.',
       ),
     truncated: z
       .boolean()
@@ -102,7 +122,7 @@ export const censusSearchVariables = tool('census_search_variables', {
       .string()
       .optional()
       .describe(
-        'Guidance when no variables matched, when no variable contained every query word and the results hold only some of them, or when results were truncated — suggests other keywords, a narrower query, or a higher limit.',
+        'Guidance when no variables matched, when no variable contained every query word and the results hold only some of them, or when results were truncated — suggests other keywords, a narrower query, or a higher limit. For a code the dataset does not publish, it names the sibling dataset confirmed to hold it, or census_get_variable for an attribute column (annotation, flag, label, or significance); for a table cut at the limit, the last code shown.',
       ),
   },
 
@@ -131,6 +151,15 @@ export const censusSearchVariables = tool('census_search_variables', {
       recovery:
         'Retry the request; if persistent, the dataset and year combination may not be available.',
     },
+    {
+      reason: 'upstream_error',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: "The Census API answered the dataset's variables.json with an HTTP error, after any retries a transient status earns.",
+      retryable: true,
+      thrownBy: 'service',
+      recovery:
+        'Retry the request if the failure was transient; if the Census API rejected the request outright, retrying it unchanged returns the same status, so change the dataset or year.',
+    },
   ],
 
   async handler(input, ctx) {
@@ -142,10 +171,8 @@ export const censusSearchVariables = tool('census_search_variables', {
     ctx.log.info('Searching Census variables', { query: input.query, dataset, year, limit });
 
     const service = getVariableCacheService();
-    const { variables, totalMatches, matchedTermCount, termCount } = await service.searchVariables(
-      { query: input.query, dataset, year, limit },
-      ctx,
-    );
+    const { variables, totalMatches, codeMatches, matchedTermCount, termCount, codeMiss } =
+      await service.searchVariables({ query: input.query, dataset, year, limit }, ctx);
 
     ctx.enrich.echo(input.query);
     ctx.enrich({ dataset, year, totalMatches });
@@ -161,10 +188,17 @@ export const censusSearchVariables = tool('census_search_variables', {
       );
     } else if (variables.length === 0) {
       ctx.enrich.notice(
-        `No variables matched "${input.query}". Try broader keywords or a different dataset.`,
+        codeMiss
+          ? codeMissNotice(input.query, codeMiss, { dataset, year })
+          : `No variables matched "${input.query}". Try broader keywords or a different dataset.`,
       );
     } else if (totalMatches > limit) {
-      const truncation = `${totalMatches} variables matched — ${totalMatches - variables.length} not shown. ${limit < 100 ? 'Narrow the query or raise limit (max 100).' : 'Narrow the query to reach the rest.'}`;
+      const shown = `${totalMatches} variables matched — ${totalMatches - variables.length} not shown`;
+      // A table cut inside its code tier: words added to the code drop it, so narrowing cannot help.
+      const truncation =
+        codeMatches > variables.length
+          ? `${shown}; the table continues in code order after ${variables.at(-1)?.code}. ${limit < 100 ? 'Raise limit (max 100), or search' : 'Search'} a later variable code on its own — a word added to a table code ends the code match.`
+          : `${shown}. ${limit < 100 ? 'Narrow the query or raise limit (max 100).' : 'Narrow the query to reach the rest.'}`;
       ctx.enrich.truncated({
         shown: variables.length,
         cap: limit,

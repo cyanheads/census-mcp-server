@@ -54,6 +54,7 @@ const mockLookupVariables = vi.fn();
 const mockCheckPredicates = vi.fn();
 const mockGetRecordDimensions = vi.fn();
 const mockValidateYear = vi.fn();
+const mockResolveSpellings = vi.fn();
 
 beforeEach(async () => {
   vi.clearAllMocks();
@@ -75,7 +76,13 @@ beforeEach(async () => {
     checkPredicates: mockCheckPredicates,
     getRecordDimensions: mockGetRecordDimensions,
     validateYear: mockValidateYear,
+    resolveSpellings: mockResolveSpellings,
   } as never);
+
+  // Default: the dataset spells every code in uppercase, as every non-comparison-profile one does.
+  mockResolveSpellings.mockImplementation(async (codes: string[]) =>
+    codes.map((code) => code.toUpperCase()),
+  );
 
   /**
    * The real check, not a stub: a test that asserts the year is refused before the first
@@ -630,8 +637,10 @@ describe('censusQueryData', () => {
     const error = await Promise.resolve(censusQueryData.handler(input, ctx)).catch(
       (e: unknown) => e,
     );
-    expect((error as Error).message).toContain('13 geography levels');
-    expect((error as Error).message).not.toContain('level 0');
+    // #62: census_list_geographies is the contract recovery's step, so the message leaves it out.
+    expect((error as Error).message).toBe(
+      'Geography level "tract" does not exist in acs/acs1 (2024). It publishes 13 geography levels.',
+    );
     expect(error).toMatchObject({ data: { availableLevels } });
   });
 
@@ -1263,9 +1272,12 @@ describe('censusQueryData', () => {
       (err: Error) => err,
     );
 
-    expect(error?.message).toContain('cbp cannot be queried for 2009');
-    expect(error?.message).toContain('2012-2023');
+    expect(error?.message).toBe('cbp cannot be queried for 2009.');
     expect(error?.message).not.toMatch(/has no 2009 vintage|does not publish/);
+    // #62: the years to retry with are the hint's, stated once.
+    expect(error).toMatchObject({
+      data: { recovery: { hint: 'Retry with a year this dataset serves: 2012-2023.' } },
+    });
   });
 
   /**

@@ -19,12 +19,14 @@ import {
   describeAmbiguousRows,
   describeEmptyPredicatedResult,
   describeRecordRows,
+  describeTableSplit,
   describeUnsetPredicates,
   getVariableCacheService,
   initVariableCacheService,
   isAcsDataset,
   KNOWN_DATASETS,
   resolveDataset,
+  SIBLING_LOOKUP_DEADLINE_MS,
   VariableCacheService,
 } from '@/services/variable-cache/variable-cache-service.js';
 
@@ -910,17 +912,19 @@ describe('VariableCacheService.getRecordDimensions', () => {
   });
 });
 
-describe('VariableCacheService.findPublicationProbe', () => {
+describe('VariableCacheService.findPublicationProbes', () => {
   /**
    * A wildcard group-by only reads the data file when a measure is in `get=`, and how many codes
    * come back depends on which table that measure belongs to: on dec/ddhca the total-population
    * table publishes far more population groups than the sex-by-age tables do. The coarsest table
    * gives the widest set, and cell count is what identifies it.
    */
-  it('picks a measure from the coarsest table', async () => {
+  it('picks one measure, from the coarsest table', async () => {
     queue({
       variables: {
         T01001_001N: { label: 'Total', predicateType: 'int', group: 'T01001' },
+        T02001_001N: { label: 'Total', predicateType: 'int', group: 'T02001' },
+        T02001_002N: { label: 'Male', predicateType: 'int', group: 'T02001' },
         T02003_001N: { label: 'Total', predicateType: 'int', group: 'T02003' },
         T02003_002N: { label: 'Male', predicateType: 'int', group: 'T02003' },
         T02003_003N: { label: 'Female', predicateType: 'int', group: 'T02003' },
@@ -928,15 +932,63 @@ describe('VariableCacheService.findPublicationProbe', () => {
           label: 'Race/Ethnic Group',
           required: 'default displayed',
           predicateType: 'string',
-          group: 'T01001,T02003',
+          group: 'T01001,T02001,T02003',
         },
         SUMLEVEL: { label: 'Summary Level code', predicateType: 'string', group: 'N/A' },
       },
     });
 
-    const probe = await service.findPublicationProbe('dec/ddhca', 2020, createMockContext());
+    const probes = await service.findPublicationProbes('dec/ddhca', 2020, createMockContext());
 
-    expect(probe).toBe('T01001_001N');
+    expect(probes).toEqual(['T01001_001N']);
+  });
+
+  /**
+   * dec/ddhcb has no table every group sits in: at each geography a group is published in only
+   * one household-type table and only one tenure table (api.census.gov, 2026-10-13: T03001 alone
+   * publishes 1,497 of the 2,996 groups nationally). The coarsest table would withhold the other
+   * half, so the check unions the two tenure tables, the family with the fewest members.
+   */
+  it('unions the smallest table family on dec/ddhcb, one measure per table', async () => {
+    queue({
+      variables: {
+        T03001_001N: { label: '!!Total', predicateType: 'int', group: 'T03001' },
+        T03002_001N: { label: '!!Total:', predicateType: 'int', group: 'T03002' },
+        T03002_002N: {
+          label: '!!Total:!!Family households',
+          predicateType: 'int',
+          group: 'T03002',
+        },
+        T03003_001N: { label: '!!Total:', predicateType: 'int', group: 'T03003' },
+        T03003_003N: { label: '!!Married couple family', predicateType: 'int', group: 'T03003' },
+        T03003_002N: { label: '!!Family households:', predicateType: 'int', group: 'T03003' },
+        T03004_001N: { label: '!!Total:', predicateType: 'int', group: 'T03004' },
+        T03004_002N: { label: '!!Family households:', predicateType: 'int', group: 'T03004' },
+        T03004_003N: { label: '!!Married couple family', predicateType: 'int', group: 'T03004' },
+        T03004_004N: { label: '!!Other family:', predicateType: 'int', group: 'T03004' },
+        T04001_001N: { label: '!!Total', predicateType: 'int', group: 'T04001' },
+        T04002_004N: { label: '!!Total:!!Renter occupied', predicateType: 'int', group: 'T04002' },
+        T04002_001N: { label: '!!Total:', predicateType: 'int', group: 'T04002' },
+        T04002_002N: { label: '!!Owned with a mortgage', predicateType: 'int', group: 'T04002' },
+        POPGROUP: {
+          label: 'Race/Ethnic Group',
+          required: 'default displayed',
+          predicateType: 'string',
+          group: 'T03002,T03001,T04002,T04001,T03004,T03003',
+        },
+        GEO_ID: {
+          label: 'Geography',
+          predicateType: 'string',
+          group: 'T03002,T03001,T04002,T04001,T03004,T03003',
+        },
+        SUMLEVEL: { label: 'Summary Level code', predicateType: 'string', group: 'N/A' },
+      },
+    });
+
+    const probes = await service.findPublicationProbes('dec/ddhcb', 2020, createMockContext());
+
+    expect(probes).toEqual(['T04001_001N', 'T04002_001N']);
+    expect(requestedUrls).toHaveLength(1);
   });
 
   /**
@@ -956,9 +1008,9 @@ describe('VariableCacheService.findPublicationProbe', () => {
       },
     });
 
-    const probe = await service.findPublicationProbe('nonemp', 2007, createMockContext());
+    const probes = await service.findPublicationProbes('nonemp', 2007, createMockContext());
 
-    expect(probe).toBeUndefined();
+    expect(probes).toEqual([]);
   });
 });
 
@@ -1068,6 +1120,7 @@ describe('describeEmptyPredicatedResult', () => {
       [],
       'ecnbasic',
       2022,
+      ['ESTAB'],
     );
 
     expect(text).toContain('until NAICS2022 is set');
@@ -1079,7 +1132,7 @@ describe('describeEmptyPredicatedResult', () => {
    * the caller supplied rather than from a dimension it left out.
    */
   it('points at the supplied values too, since a bad one returns nothing rather than erroring', () => {
-    const text = describeEmptyPredicatedResult([], ['NAICS2017'], 'cbp', 2023);
+    const text = describeEmptyPredicatedResult([], ['NAICS2017'], 'cbp', 2023, ['ESTAB']);
 
     expect(text).toContain('does not exist in cbp (2023)');
     expect(text).toContain('NAICS2017 value');
@@ -1095,6 +1148,7 @@ describe('describeEmptyPredicatedResult', () => {
       [],
       'ecnbasic',
       2022,
+      ['ESTAB'],
     );
 
     expect(text).toContain('NAICS2022, TAXSTAT, and TYPOP are set');
@@ -1102,7 +1156,108 @@ describe('describeEmptyPredicatedResult', () => {
   });
 
   it('returns nothing when the dataset has no predicates in play', () => {
-    expect(describeEmptyPredicatedResult([], [], 'acs/acs5', 2024)).toBe('');
+    expect(describeEmptyPredicatedResult([], [], 'acs/acs5', 2024, ['B19013_001E'])).toBe('');
+  });
+
+  /**
+   * #68: dec/ddhca publishes 1360 (Alaska Native alone) in T02002 at `us`, so a T02003 query for it
+   * comes back empty although the value exists. The tables that split the groups lead the hint;
+   * the value check stays behind them, since an unknown value also returns nothing.
+   */
+  it('leads with the sibling tables when a dec/ddhca sex-by-age table came back empty (#68)', () => {
+    const text = describeEmptyPredicatedResult([], ['POPGROUP'], 'dec/ddhca', 2020, [
+      'T02003_001N',
+    ]);
+
+    expect(text).toContain('T02001 or T02002');
+    expect(text.indexOf('T02002')).toBeLessThan(text.indexOf('check the POPGROUP value'));
+  });
+
+  it('names T03002, T03003, and T03004 for an empty dec/ddhcb T03001 query (#54)', () => {
+    const text = describeEmptyPredicatedResult([], ['POPGROUP'], 'dec/ddhcb', 2020, [
+      'T03001_001N',
+    ]);
+
+    expect(text).toContain('T03002, T03003, or T03004');
+    expect(text).not.toContain('T04001');
+  });
+
+  /** An unset POPGROUP applies one group, which sits in one table per family like any other. */
+  it('names the sibling tables when POPGROUP was left unset too', () => {
+    const text = describeEmptyPredicatedResult(
+      [{ code: 'POPGROUP', label: 'Race/Ethnic Group', labelAttribute: 'POPGROUP_LABEL' }],
+      [],
+      'dec/ddhcb',
+      2020,
+      ['T04002_004N'],
+    );
+
+    expect(text).toContain('T04001');
+    expect(text).toContain('until POPGROUP is set');
+  });
+
+  /** T01001 publishes every group the dataset serves, so nothing about it is split. */
+  it('adds no table guidance for dec/ddhca T01001 (characterization)', () => {
+    const text = describeEmptyPredicatedResult([], ['POPGROUP'], 'dec/ddhca', 2020, [
+      'T01001_001N',
+    ]);
+
+    expect(text).toBe(
+      'A predicate value that does not exist in dec/ddhca (2020) also returns nothing rather than an error, so check the POPGROUP value this query sent — census_list_predicate_values enumerates the codes each dimension accepts.',
+    );
+  });
+});
+
+describe('describeTableSplit (#54, #68)', () => {
+  it('names every table of the family and the ones to look in', () => {
+    const text = describeTableSplit(['T03001_001N'], 'dec/ddhcb', false);
+
+    expect(text).toContain('in only one of T03001, T03002, T03003, and T03004');
+    expect(text).toContain('missing from T03001');
+    expect(text).toContain('T03002, T03003, or T03004');
+    expect(text).not.toContain('first-listed');
+  });
+
+  it('stays silent on one geography and one group from one table', () => {
+    expect(describeTableSplit(['T03004_002N', 'T03004_003N'], 'dec/ddhcb', true)).toBe('');
+  });
+
+  /**
+   * The Census answers a multi-table query only where the first-listed table publishes the group,
+   * and reads the others as null where they do not — `T03001_001N,T04002_004N` for 3910 in WA is
+   * 997 and null; the reverse order is HTTP 204.
+   */
+  it('explains the first-listed table on a request spanning tables, even for one row', () => {
+    const text = describeTableSplit(['T03001_001N', 'T04002_004N'], 'dec/ddhcb', true);
+
+    expect(text).toContain('missing from T03001');
+    expect(text).toContain('missing from T04002');
+    expect(text).toContain('T04001');
+    expect(text).toMatch(/first-listed one, T03001/);
+    expect(text).toContain('null');
+  });
+
+  /** T01001 nests over the sex-by-age tables, so leading with it still leaves T02001 split. */
+  it('covers a family table listed after one outside every family', () => {
+    const text = describeTableSplit(['T01001_001N', 'T02001_002N'], 'dec/ddhca', true);
+
+    expect(text).toContain('T02002 or T02003');
+    expect(text).toMatch(/first-listed one, T01001/);
+  });
+
+  it('points at the rest of the family when every table of it was requested', () => {
+    const text = describeTableSplit(['T04001_001N', 'T04002_004N'], 'dec/ddhcb', false);
+
+    expect(text).toContain('missing from T04001 or T04002');
+    expect(text).toContain('another of them');
+  });
+
+  it.each([
+    ['dec/ddhca', ['T01001_001N']],
+    ['acs/acs5', ['B19013_001E', 'B01003_001E']],
+    ['dec/dhc', ['T03001_001N']],
+  ])('says nothing on %s %j, which no family splits', (dataset, codes) => {
+    expect(describeTableSplit(codes, dataset, false)).toBe('');
   });
 });
 
@@ -1132,6 +1287,7 @@ describe('resolveDataset (#32)', () => {
     ['charv', 'pep/charv'],
     ['pl', 'dec/pl'],
     ['ddhca', 'dec/ddhca'],
+    ['ddhcb', 'dec/ddhcb'],
     ['dhc', 'dec/dhc'],
     ['DP', 'dec/dp'],
     ['sdhc', 'dec/sdhc'],
@@ -1159,6 +1315,23 @@ describe('resolveDataset (#32)', () => {
     }
   });
 
+  /** #62: the message says what was wrong, the hint the next step — never both in each. */
+  it('states a blank required code in the message and leaves census_list_datasets to the hint', () => {
+    const error = rejectionOf('  ');
+    const hint = (error?.data as { recovery: { hint: string } } | undefined)?.recovery.hint;
+
+    expect(error?.message).toBe('No dataset code was given.');
+    expect(hint).toBe('Call census_list_datasets to discover valid dataset codes like acs/acs5.');
+  });
+
+  it('states an unknown code in the message and leaves census_list_datasets to the hint', () => {
+    const error = rejectionOf('bogus');
+    const hint = (error?.data as { recovery: { hint: string } } | undefined)?.recovery.hint;
+
+    expect(error?.message).toBe('Unknown dataset: "bogus".');
+    expect(hint).toBe('Call census_list_datasets to discover valid dataset codes like acs/acs5.');
+  });
+
   /**
    * A third segment is shared: `profile` is the last segment of both acs/acs5/profile and
    * acs/acs1/profile, and `subject` became shared once acs/acs1/subject joined acs/acs5/subject.
@@ -1169,12 +1342,23 @@ describe('resolveDataset (#32)', () => {
     ['Subject', ['acs/acs5/subject', 'acs/acs1/subject']],
     ['cprofile', ['acs/acs5/cprofile', 'acs/acs1/cprofile']],
     ['spp', ['acs/acs1/spp']],
-  ])('never resolves the third segment %j, and names the codes ending in it', (input, codes) => {
-    const error = rejectionOf(input);
+  ])(
+    'never resolves the third segment %j, and its hint names the codes ending in it',
+    (input, codes) => {
+      const error = rejectionOf(input);
+      const hint = (error?.data as { recovery: { hint: string } } | undefined)?.recovery.hint;
 
-    expect(error?.data).toMatchObject({ reason: 'dataset_not_found', dataset: input });
-    for (const code of codes) expect(error?.message).toContain(code);
-  });
+      expect(error?.data).toMatchObject({ reason: 'dataset_not_found', dataset: input });
+      expect(error?.message).toBe(
+        `Unknown dataset: "${input}" is the last segment of a dataset code, not a dataset code of its own.`,
+      );
+      for (const code of codes) {
+        expect(hint).toContain(code);
+        expect(error?.message).not.toContain(code);
+      }
+      expect(hint).toMatch(/^Pass the full code/);
+    },
+  );
 
   it.each(['acs', 'dec', 'pep', 'acs5/subject', 'nonemployer-statistics/ns'])(
     'rejects %j as an unknown dataset',
@@ -1219,6 +1403,20 @@ describe('VariableCacheService.validateDataset', () => {
   it('rejects an unregistered dataset', () => {
     expect(() => service.validateDataset('nonemployer-statistics/ns')).toThrow(/Unknown dataset/);
   });
+
+  it('names the step only in the hint', () => {
+    let error: McpError | undefined;
+    try {
+      service.validateDataset('nonemployer-statistics/ns');
+    } catch (err) {
+      error = err as McpError;
+    }
+
+    expect(error?.message).toBe('Unknown dataset: "nonemployer-statistics/ns".');
+    expect((error?.data as { recovery: { hint: string } } | undefined)?.recovery.hint).toBe(
+      'Call census_list_datasets to discover valid dataset codes like acs/acs5.',
+    );
+  });
 });
 
 /**
@@ -1247,9 +1445,10 @@ describe('VariableCacheService — a vintage the dataset does not serve', () => 
       );
 
     expect(error).toBeDefined();
-    expect(error?.message).toContain('2012-2023');
+    // #62: the years are the next step, so they sit in the hint alone.
+    expect(error?.message).toBe('cbp cannot be queried for 2009.');
     const data = error?.data as { recovery: { hint: string }; availableYears: number[] };
-    expect(data.recovery.hint).toContain('2012-2023');
+    expect(data.recovery.hint).toBe('Retry with a year this dataset serves: 2012-2023.');
     expect(data.availableYears).toContain(2012);
   });
 
@@ -1328,9 +1527,10 @@ describe('VariableCacheService — a vintage the dataset does not serve', () => 
     expect(error?.data).toMatchObject({ upstreamMessage: "error: unknown variable 'NAME'" });
     const data = error?.data as { recovery: { hint: string } };
     // A 400 is deterministic, so the hint must not send the caller back for another attempt.
-    expect(data.recovery.hint).toContain("error: unknown variable 'NAME'");
-    expect(data.recovery.hint).toMatch(/rejected/i);
-    expect(data.recovery.hint).not.toMatch(/^Retry/);
+    // #62: the upstream line is the diagnosis, so it stays in the message and out of the hint.
+    expect(data.recovery.hint).toBe(
+      'Change the query — the Census API rejected it rather than failing transiently, so retrying it unchanged returns the same status.',
+    );
   });
 });
 
@@ -1351,7 +1551,12 @@ describe('censusHttpError', () => {
     }) as McpError;
 
     expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
-    expect((error.data as { recovery: { hint: string } }).recovery.hint).toMatch(/^Retry/);
+    expect((error.data as { recovery: { hint: string } }).recovery.hint).toBe(
+      'Retry the request; if it persists, the Census API is temporarily unavailable for this dataset and year.',
+    );
+    expect(error.message).toBe(
+      'Census API returned HTTP 503 for acs/acs5 (2024). Upstream: upstream unavailable',
+    );
   });
 
   it('leaves a timeout or network failure for its own handling', () => {
@@ -1398,6 +1603,7 @@ describe('dataset registries derived from DATASET_AVAILABLE_YEARS', () => {
       'dec/dp': 2020,
       'dec/sdhc': 2020,
       'dec/ddhca': 2020,
+      'dec/ddhcb': 2020,
       cbp: 2023,
       ecnbasic: 2022,
       nonemp: 2023,
@@ -1412,6 +1618,7 @@ describe('dataset registries derived from DATASET_AVAILABLE_YEARS', () => {
     ['dec/dhc', [2020]],
     ['dec/dp', [2020]],
     ['dec/sdhc', [2020]],
+    ['dec/ddhcb', [2020]],
     [
       'acs/acs1/subject',
       [2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024],
@@ -1616,11 +1823,21 @@ describe('record-row notices over a wildcarded dimension', () => {
   });
 
   it('describeAmbiguousRows names the dimension to pin the same way', () => {
-    const text = describeAmbiguousRows('cbp', 2023, 1552, { NAICS2017: naics });
+    const text = describeAmbiguousRows({ NAICS2017: naics });
 
     expect(text).toContain('NAICS2017');
     expect(text).toContain('1,542 more');
     expect(text.length).toBeLessThan(1500);
+    // #62: the row count is the paired message's diagnosis, so the hint opens on the pin.
+    expect(text).toMatch(
+      /^Add the record you want to predicates, e\.g\. \{"NAICS2017": "1009"\} — /,
+    );
+  });
+
+  it('describeAmbiguousRows keeps only the steps when nothing in the response separates the rows', () => {
+    expect(describeAmbiguousRows({})).toBe(
+      "Set the dataset's filter dimensions explicitly in predicates — census_list_predicate_values enumerates the codes each one accepts — or query one geography at a time with census_query_data.",
+    );
   });
 
   it('lists every value when there are only a few', () => {
@@ -1650,15 +1867,16 @@ describe('record-row notices over a wildcarded dimension', () => {
     expect(text).not.toContain('pick the record you want rather than the first row');
   });
 
-  /** Every other count in the notices is grouped ("1,542 more"), so the row count is too. */
+  /**
+   * Every other count in the notices is grouped ("1,542 more"), so the row count is too. The
+   * ambiguous-rows count lives in census_compare_geographies' message, whose test pins it there.
+   */
   it('groups the thousands of a per-geography row count', () => {
     const split = { NAICS2017: naics };
     for (const text of [
       describeRecordRows('cbp', 2023, 1552, split, ['NAICS2017']),
       describeRecordRows('cbp', 2023, 1552, split),
       describeRecordRows('cbp', 2023, 1552, {}),
-      describeAmbiguousRows('cbp', 2023, 1552, split),
-      describeAmbiguousRows('cbp', 2023, 1552, {}),
     ]) {
       expect(text).toContain('1,552 rows');
       expect(text).not.toContain('1552');
@@ -1689,6 +1907,17 @@ describe('record-row notices over a wildcarded dimension', () => {
   });
 });
 
+/** A route that answers each request itself — a hang, a rejection, or a different answer per call. */
+type RouteFn = (init?: RequestInit) => Promise<Response>;
+
+/** Rejects with the signal's reason once it aborts, as fetch does; never answers otherwise. */
+const hang: RouteFn = (init) =>
+  new Promise((_resolve, reject) => {
+    const signal = init?.signal;
+    if (signal?.aborted) return reject(signal.reason);
+    signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+  });
+
 /**
  * Serve bodies by URL path, recording each request, for the lookups that reach more than one
  * endpoint per dataset. A path with no route fails the request, so an unexpected fetch surfaces.
@@ -1696,11 +1925,12 @@ describe('record-row notices over a wildcarded dimension', () => {
 const serve = (routes: Record<string, unknown>) => {
   vi.stubGlobal(
     'fetch',
-    vi.fn((url: string | URL) => {
+    vi.fn((url: string | URL, init?: RequestInit) => {
       const href = String(url);
       requestedUrls.push(href);
       const body = routes[new URL(href).pathname];
       if (body === undefined) return Promise.reject(new Error(`unrouted fetch: ${href}`));
+      if (typeof body === 'function') return (body as RouteFn)(init);
       if (body instanceof Response) return Promise.resolve(body.clone());
       return Promise.resolve(
         new Response(JSON.stringify(body), {
@@ -1921,7 +2151,13 @@ describe('VariableCacheService.searchVariables — whole-word, all-terms ranking
   it('returns nothing for a query with no letters or digits', async () => {
     for (const query of ['', '   ', '!!--!!']) {
       const result = await acs(query);
-      expect(result).toEqual({ variables: [], totalMatches: 0, matchedTermCount: 0, termCount: 0 });
+      expect(result).toEqual({
+        variables: [],
+        totalMatches: 0,
+        codeMatches: 0,
+        matchedTermCount: 0,
+        termCount: 0,
+      });
     }
   });
 
@@ -2215,6 +2451,65 @@ describe('VariableCacheService — annotation and flag columns (#48)', () => {
     expect(flag?.attributeOf).toBe('NAICS2017_LABEL');
   });
 
+  /** Serve the B19013_001EA record with `attribute type` set to `published`. */
+  const serveAttributeType = (published: string) =>
+    serve({
+      ...acsRoutes,
+      '/data/2024/acs/acs5/variables/B19013_001EA.json': {
+        ...acsRoutes['/data/2024/acs/acs5/variables/B19013_001EA.json'],
+        'attribute type': published,
+      },
+    });
+
+  /**
+   * Spellings the per-variable endpoint publishes on the 5-year ACS through 2010, the 1-year ACS
+   * through 2011, and 2010 `dec/pl`, beside a padded run of whitespace and a kind no vintage
+   * publishes yet.
+   */
+  it.each([
+    ['Annotation', 'ANNOTATION'],
+    ['Margin of Error', 'MARGIN_OF_ERROR'],
+    ['Label', 'LABEL'],
+    ['Statistical Significance', 'STATISTICAL_SIGNIFICANCE'],
+    ['Errata', 'ERRATA'],
+    ['  Statistical \t Significance ', 'STATISTICAL_SIGNIFICANCE'],
+    ['Coverage note', 'COVERAGE_NOTE'],
+  ])('normalizes a published attribute type of %j to %s (#61)', async (published, expected) => {
+    serveAttributeType(published);
+
+    const [annotation] = await lookup(['B19013_001EA']);
+
+    expect(annotation?.attributeType).toBe(expected);
+    expect(annotation?.attributeOf).toBe('B19013_001E');
+  });
+
+  it.each([
+    'ANNOTATION',
+    'FLAG',
+    'GROUPING',
+    'LABEL',
+    'MARGIN_OF_ERROR',
+    'STATISTICAL_SIGNIFICANCE',
+  ])(
+    'keeps the current-vintage attribute type %s unchanged (#61, characterization)',
+    async (published) => {
+      serveAttributeType(published);
+
+      const [annotation] = await lookup(['B19013_001EA']);
+
+      expect(annotation?.attributeType).toBe(published);
+    },
+  );
+
+  it('leaves out an attribute type that is only whitespace (#61)', async () => {
+    serveAttributeType('   ');
+
+    const [annotation] = await lookup(['B19013_001EA']);
+
+    expect(annotation).not.toHaveProperty('attributeType');
+    expect(annotation?.attributeOf).toBe('B19013_001E');
+  });
+
   it('refuses a code in neither the variable map nor the attributes index without a request', async () => {
     serve(acsRoutes);
 
@@ -2222,7 +2517,8 @@ describe('VariableCacheService — annotation and flag columns (#48)', () => {
       code: JsonRpcErrorCode.NotFound,
       data: { reason: 'variable_not_found', missingCodes: ['B19013_001XA'] },
     });
-    expect(requestedUrls.filter((url) => url.includes('/variables/'))).toEqual([]);
+    // No attribute fetch from acs/acs5 itself; a sibling probe of acs/acs1 may follow the miss.
+    expect(requestedUrls.filter((url) => url.includes('/acs/acs5/variables/'))).toEqual([]);
   });
 
   it('resolves an estimate and its synthesized margin of error without a per-variable request', async () => {
@@ -2261,6 +2557,68 @@ describe('VariableCacheService — annotation and flag columns (#48)', () => {
     expect(error?.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
     expect(error?.data).toMatchObject({ reason: 'variables_unavailable' });
     expect(JSON.stringify(error?.data)).not.toContain('HTTP Status 404');
+  });
+
+  it('rethrows a caller cancellation during the per-variable fetch, not variables_unavailable', async () => {
+    const controller = new AbortController();
+    serve({
+      ...acsRoutes,
+      '/data/2024/acs/acs5/variables/B19013_001EA.json': ((init) => {
+        queueMicrotask(() => controller.abort());
+        return hang(init);
+      }) satisfies RouteFn,
+    });
+
+    const error = await service
+      .getVariablesByCode(
+        ['B19013_001EA'],
+        'acs/acs5',
+        2024,
+        createMockContext({ signal: controller.signal }),
+      )
+      .then(
+        () => undefined,
+        (err: McpError) => err,
+      );
+
+    expect(error?.code).toBe(JsonRpcErrorCode.RequestCancelled);
+    expect(error?.data?.reason).not.toBe('variables_unavailable');
+  });
+
+  it('rethrows a caller cancellation during the per-variable retry backoff, untouched', async () => {
+    serve({
+      ...acsRoutes,
+      '/data/2024/acs/acs5/variables/B19013_001EA.json': new Response('Service Unavailable', {
+        status: 503,
+      }),
+    });
+    const controller = new AbortController();
+    const reason = new Error('caller went away');
+
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const settled = service
+        .getVariablesByCode(
+          ['B19013_001EA'],
+          'acs/acs5',
+          2024,
+          createMockContext({ signal: controller.signal }),
+        )
+        .then(
+          () => undefined,
+          (err: unknown) => err,
+        );
+      await vi.advanceTimersByTimeAsync(100);
+      expect(requestsTo('/variables/B19013_001EA.json')).toHaveLength(1);
+
+      controller.abort(reason);
+      await vi.advanceTimersByTimeAsync(300_000);
+
+      expect(await settled).toBe(reason);
+      expect(requestsTo('/variables/B19013_001EA.json')).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('leaves out whatever the per-variable endpoint does not publish', async () => {
@@ -2370,6 +2728,9 @@ describe('VariableCacheService — universe from groups.json (#53)', () => {
 
     expect(income?.code).toBe('B19013_001E');
     expect(income).not.toHaveProperty('universe');
+    // A 404 is an answer, not a failure: nothing is flagged and nothing is retried.
+    expect(income).not.toHaveProperty('universeUnavailable');
+    expect(requestsTo('/groups.json')).toHaveLength(1);
   });
 
   it('sends no groups.json request for columns that belong to no single table', async () => {
@@ -2380,5 +2741,1350 @@ describe('VariableCacheService — universe from groups.json (#53)', () => {
     expect(geoId).not.toHaveProperty('universe');
     expect(name).not.toHaveProperty('universe');
     expect(requestsTo('/groups.json')).toEqual([]);
+  });
+
+  describe('when groups.json fails (#60)', () => {
+    const GROUPS = '/data/2024/acs/acs5/groups.json';
+
+    /**
+     * Each way groups.json can fail short of a 404, with the requests it gets. Every one is
+     * transient to the retry loop, so a fast failure is asked four times; a hang holds its first
+     * attempt until the universe deadline ends the lookup.
+     */
+    const failures: Array<[string, unknown, number]> = [
+      ['an HTTP 503', new Response('Service Unavailable', { status: 503 }), 4],
+      ['an HTTP 500', new Response('Internal Server Error', { status: 500 }), 4],
+      [
+        'a network error',
+        (() => Promise.reject(new TypeError('fetch failed'))) satisfies RouteFn,
+        4,
+      ],
+      ['a hang', hang, 1],
+      [
+        'an HTML page answered 200',
+        new Response('<!DOCTYPE html><html><body>Maintenance</body></html>', {
+          status: 200,
+          headers: { 'content-type': 'text/html' },
+        }),
+        4,
+      ],
+      [
+        'an unparseable body answered 200',
+        new Response('{"groups": [trunc', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+        4,
+      ],
+      ['a JSON body with no groups list', { error: 'unexpected' }, 1],
+    ];
+
+    /**
+     * Settle `run` with fake timers driven past every backoff and the 30-second attempt timeout,
+     * so the real retry loop runs in full without the test waiting it out.
+     */
+    const settleWithTimers = async <T>(
+      run: () => Promise<T>,
+    ): Promise<{ value?: T; error?: unknown }> => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        const settled = run().then(
+          (value) => ({ value }),
+          (error: unknown) => ({ error }),
+        );
+        await vi.advanceTimersByTimeAsync(300_000);
+        return await settled;
+      } finally {
+        vi.useRealTimers();
+      }
+    };
+
+    it.each(failures)(
+      'returns the variables without universe after %s, flagging the single-table codes',
+      async (_name, failure, requests) => {
+        serve({ '/data/2024/acs/acs5/variables.json': acsSearchVariablesJson, [GROUPS]: failure });
+
+        const { value, error } = await settleWithTimers(() =>
+          lookup(['GEO_ID', 'B19013_001E', 'B19013_001M', 'NAME']),
+        );
+
+        expect(error).toBeUndefined();
+        const [geoId, income, moe, name] = value ?? [];
+        expect(income).toMatchObject({ code: 'B19013_001E', universeUnavailable: true });
+        expect(moe).toMatchObject({ code: 'B19013_001M', universeUnavailable: true });
+        expect(income).not.toHaveProperty('universe');
+        expect(moe).not.toHaveProperty('universe');
+        // GEO_ID spans several tables and NAME none, so neither lost a universe.
+        expect(geoId).not.toHaveProperty('universeUnavailable');
+        expect(name).not.toHaveProperty('universeUnavailable');
+        expect(requestsTo('/groups.json')).toHaveLength(requests);
+      },
+    );
+
+    /**
+     * groups.json adds one optional field, so a stalled one is given up on well inside the
+     * 60-second request timeout MCP SDK clients apply by default; four 30-second attempt timeouts
+     * and their backoff would answer after the client had already stopped waiting.
+     */
+    it('settles within 25 seconds when groups.json hangs, without universe', async () => {
+      serve({ '/data/2024/acs/acs5/variables.json': acsSearchVariablesJson, [GROUPS]: hang });
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        let value: Awaited<ReturnType<typeof lookup>> | undefined;
+        const settled = lookup(['B19013_001E']).then((v) => {
+          value = v;
+        });
+        await vi.advanceTimersByTimeAsync(25_000);
+
+        expect(value?.[0]).toMatchObject({ code: 'B19013_001E', universeUnavailable: true });
+        await vi.advanceTimersByTimeAsync(300_000);
+        await settled;
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('keeps an empty groups list as the answer that no table publishes a universe (characterization)', async () => {
+      serve({
+        '/data/2024/acs/acs5/variables.json': acsSearchVariablesJson,
+        [GROUPS]: { groups: [] },
+      });
+
+      const [income] = await lookup(['B19013_001E']);
+      await lookup(['B19013_001E']);
+
+      expect(income).not.toHaveProperty('universe');
+      expect(income).not.toHaveProperty('universeUnavailable');
+      expect(requestsTo('/groups.json')).toHaveLength(1);
+    });
+
+    it('does not cache a body with no groups list: the next lookup refetches and joins the universe', async () => {
+      const routes: Record<string, unknown> = {
+        '/data/2024/acs/acs5/variables.json': acsSearchVariablesJson,
+        [GROUPS]: { error: 'unexpected' },
+      };
+      serve(routes);
+
+      const [first] = await lookup(['B19013_001E']);
+      expect(first).toMatchObject({ code: 'B19013_001E', universeUnavailable: true });
+
+      routes[GROUPS] = groupsJson;
+      const [income] = await lookup(['B19013_001E']);
+
+      expect(income?.universe).toBe('Households');
+      expect(requestsTo('/groups.json')).toHaveLength(2);
+    });
+
+    it('returns the universe when a retry of groups.json succeeds (characterization)', async () => {
+      let attempts = 0;
+      serve({
+        '/data/2024/acs/acs5/variables.json': acsSearchVariablesJson,
+        [GROUPS]: (() =>
+          Promise.resolve(
+            ++attempts < 3
+              ? new Response('Service Unavailable', { status: 503 })
+              : Response.json(groupsJson),
+          )) satisfies RouteFn,
+      });
+
+      const { value } = await settleWithTimers(() => lookup(['B19013_001E']));
+
+      expect(value?.[0]).toMatchObject({ universe: 'Households' });
+      expect(value?.[0]).not.toHaveProperty('universeUnavailable');
+      expect(requestsTo('/groups.json')).toHaveLength(3);
+    });
+
+    it('does not cache the failure: the next lookup refetches groups.json and joins the universe', async () => {
+      const routes: Record<string, unknown> = {
+        '/data/2024/acs/acs5/variables.json': acsSearchVariablesJson,
+        [GROUPS]: new Response('Service Unavailable', { status: 503 }),
+      };
+      serve(routes);
+
+      const first = await settleWithTimers(() => lookup(['B19013_001E']));
+      expect(first.value?.[0]).toMatchObject({ universeUnavailable: true });
+
+      routes[GROUPS] = groupsJson;
+      const [income] = await lookup(['B19013_001E']);
+
+      expect(income?.universe).toBe('Households');
+      expect(income).not.toHaveProperty('universeUnavailable');
+      expect(requestsTo('/groups.json')).toHaveLength(5);
+      expect(requestsTo('/variables.json')).toHaveLength(1);
+    });
+
+    it('rethrows a caller cancellation during the groups.json fetch', async () => {
+      const controller = new AbortController();
+      serve({
+        '/data/2024/acs/acs5/variables.json': acsSearchVariablesJson,
+        [GROUPS]: ((init) => {
+          queueMicrotask(() => controller.abort());
+          return hang(init);
+        }) satisfies RouteFn,
+      });
+
+      const error = await service
+        .getVariablesByCode(
+          ['B19013_001E'],
+          'acs/acs5',
+          2024,
+          createMockContext({ signal: controller.signal }),
+        )
+        .then(
+          () => undefined,
+          (err: McpError) => err,
+        );
+
+      expect(error?.code).toBe(JsonRpcErrorCode.RequestCancelled);
+      expect(error?.data?.reason).not.toBe('variables_unavailable');
+      expect(requestsTo('/groups.json')).toHaveLength(1);
+    });
+
+    /**
+     * An abort that lands while `withRetry` sleeps between attempts rejects with the signal's raw
+     * reason, not a `RequestCancelled` — so only the signal itself can tell it apart from a failure.
+     */
+    it('rethrows a caller cancellation during the retry backoff, untouched', async () => {
+      serve({
+        '/data/2024/acs/acs5/variables.json': acsSearchVariablesJson,
+        [GROUPS]: new Response('Service Unavailable', { status: 503 }),
+      });
+      const controller = new AbortController();
+      const reason = new Error('caller went away');
+
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        const settled = service
+          .getVariablesByCode(
+            ['B19013_001E'],
+            'acs/acs5',
+            2024,
+            createMockContext({ signal: controller.signal }),
+          )
+          .then(
+            () => undefined,
+            (err: unknown) => err,
+          );
+        await vi.advanceTimersByTimeAsync(100);
+        expect(requestsTo('/groups.json')).toHaveLength(1);
+
+        controller.abort(reason);
+        await vi.advanceTimersByTimeAsync(300_000);
+
+        // A degraded success would settle to undefined here.
+        expect(await settled).toBe(reason);
+        expect(requestsTo('/groups.json')).toHaveLength(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+});
+
+describe('VariableCacheService.resolveSpellings (#59)', () => {
+  const resolve = (codes: string[], dataset = 'acs/acs5/cprofile') =>
+    service.resolveSpellings(codes, dataset, 2024, createMockContext());
+
+  beforeEach(() =>
+    serve({
+      '/data/2024/acs/acs5/cprofile/variables.json': cprofileVariablesJson,
+      '/data/2024/acs/acs5/variables.json': acsSearchVariablesJson,
+    }),
+  );
+
+  it('maps every casing of a significance column to the spelling the dataset publishes', async () => {
+    await expect(
+      resolve([
+        'cp03_2024to2019_062ss',
+        'CP03_2024TO2019_062SS',
+        'CP03_2024to2019_062SS',
+        'cp03_2024_062e',
+      ]),
+    ).resolves.toEqual([
+      'CP03_2024to2019_062SS',
+      'CP03_2024to2019_062SS',
+      'CP03_2024to2019_062SS',
+      'CP03_2024_062E',
+    ]);
+  });
+
+  it('uppercases a code the dataset does not list, so a rejection names it that way', async () => {
+    await expect(resolve(['cp03_2024to2019_999ss', 'b19013_001x'])).resolves.toEqual([
+      'CP03_2024TO2019_999SS',
+      'B19013_001X',
+    ]);
+  });
+
+  it('uppercases on a dataset that spells every column in uppercase', async () => {
+    await expect(resolve(['b19013_001e', 'B19013_001M'], 'acs/acs5')).resolves.toEqual([
+      'B19013_001E',
+      'B19013_001M',
+    ]);
+  });
+
+  it('reads the cached variables.json, so a repeat spends no request', async () => {
+    await resolve(['cp03_2024to2019_062ss']);
+    await resolve(['cp03_2024to2019_062ss']);
+
+    expect(requestedUrls).toEqual([
+      'https://api.census.gov/data/2024/acs/acs5/cprofile/variables.json',
+    ]);
+  });
+});
+
+describe('VariableCacheService.findSiblingDatasets (#65)', () => {
+  const notHeld = () =>
+    new Response(TOMCAT_404, { status: 404, headers: { 'content-type': 'text/html' } });
+
+  /** A per-variable record as the endpoint publishes it; only its 200 is read. */
+  const held = (code: string) => ({ name: code, label: `Estimate!!${code}`, predicateType: 'int' });
+
+  const probes = () => requestedUrls.map((url) => new URL(url).pathname);
+
+  const find = (
+    codes: string[],
+    dataset: string,
+    year = 2024,
+    ctx = createMockContext(),
+    kind?: 'variables' | 'groups',
+  ) => service.findSiblingDatasets(codes, dataset, year, ctx, kind);
+
+  it('walks the chain past its first candidates: S0201_001E on acs/acs5 is in acs/acs1/spp', async () => {
+    serve({
+      '/data/2024/acs/acs5/subject/variables/S0201_001E.json': notHeld(),
+      '/data/2024/acs/acs1/subject/variables/S0201_001E.json': notHeld(),
+      '/data/2024/acs/acs1/spp/variables/S0201_001E.json': held('S0201_001E'),
+    });
+
+    await expect(find(['S0201_001E'], 'acs/acs5')).resolves.toEqual(
+      new Map([['S0201_001E', 'acs/acs1/spp']]),
+    );
+    expect(probes()).toEqual([
+      '/data/2024/acs/acs5/subject/variables/S0201_001E.json',
+      '/data/2024/acs/acs1/subject/variables/S0201_001E.json',
+      '/data/2024/acs/acs1/spp/variables/S0201_001E.json',
+    ]);
+  });
+
+  it('tries the requested survey first: S0201_001E on acs/acs1/subject goes to acs/acs1/spp', async () => {
+    serve({ '/data/2024/acs/acs1/spp/variables/S0201_001E.json': held('S0201_001E') });
+
+    await expect(find(['S0201_001E'], 'acs/acs1/subject')).resolves.toEqual(
+      new Map([['S0201_001E', 'acs/acs1/spp']]),
+    );
+    expect(probes()).toEqual(['/data/2024/acs/acs1/spp/variables/S0201_001E.json']);
+  });
+
+  it.each([
+    ['S1701_C03_001E', 'acs/acs5', 2024, 'acs/acs5/subject'],
+    ['B19013_001E', 'acs/acs5/subject', 2024, 'acs/acs5'],
+    ['C27005_001E', 'acs/acs1/profile', 2024, 'acs/acs1'],
+    ['DP03_0062E', 'acs/acs5', 2024, 'acs/acs5/profile'],
+    ['CP03_2024_062E', 'acs/acs5', 2024, 'acs/acs5/cprofile'],
+    ['K200101_001E', 'acs/acs1', 2024, 'acs/acsse'],
+  ])('sends %s on %s (%i) to %s first', async (code, dataset, year, sibling) => {
+    serve({ [`/data/${year}/${sibling}/variables/${code}.json`]: held(code) });
+
+    await expect(find([code], dataset, year)).resolves.toEqual(new Map([[code, sibling]]));
+    expect(probes()).toEqual([`/data/${year}/${sibling}/variables/${code}.json`]);
+  });
+
+  it('skips a candidate the year does not list: DP1_0001C on acs/acs5/profile 2020 is in dec/dp', async () => {
+    serve({ '/data/2020/dec/dp/variables/DP1_0001C.json': held('DP1_0001C') });
+
+    await expect(find(['DP1_0001C'], 'acs/acs5/profile', 2020)).resolves.toEqual(
+      new Map([['DP1_0001C', 'dec/dp']]),
+    );
+    // acs/acs1/profile has no 2020 vintage, so it is never asked.
+    expect(probes()).toEqual(['/data/2020/dec/dp/variables/DP1_0001C.json']);
+  });
+
+  it('asks only the candidates listed for the year', async () => {
+    serve({ '/data/2012/acs/acs1/cprofile/variables/CP03_2024_062E.json': notHeld() });
+
+    await expect(find(['CP03_2024_062E', 'K200101_001E'], 'acs/acs5', 2012)).resolves.toEqual(
+      new Map(),
+    );
+    // acs/acs5/cprofile starts in 2015 and acs/acsse in 2014.
+    expect(probes()).toEqual(['/data/2012/acs/acs1/cprofile/variables/CP03_2024_062E.json']);
+  });
+
+  it('sends nothing for a prefix with no sibling row or one not followed by a digit', async () => {
+    serve({});
+
+    await expect(
+      find(['P1_001N', 'SEX', 'STATE', 'SECTOR', 'CPOP', 'DPX_1', 'H1_001N'], 'acs/acs5'),
+    ).resolves.toEqual(new Map());
+    expect(requestedUrls).toEqual([]);
+  });
+
+  it('probes one code per table and names only the code it confirmed', async () => {
+    serve({ '/data/2024/acs/acs5/subject/variables/S1701_C03_001E.json': held('S1701_C03_001E') });
+
+    await expect(
+      find(['S1701_C03_001E', 'S1701_C03_002E', 'S1701_C01_001E'], 'acs/acs5'),
+    ).resolves.toEqual(new Map([['S1701_C03_001E', 'acs/acs5/subject']]));
+    expect(probes()).toEqual(['/data/2024/acs/acs5/subject/variables/S1701_C03_001E.json']);
+  });
+
+  it('asks for a significance column in the spelling the comparison profiles publish', async () => {
+    // The per-variable endpoint is case-sensitive: the uppercased spelling 404s where this 200s.
+    serve({
+      '/data/2024/acs/acs5/cprofile/variables/CP03_2024to2019_062SS.json':
+        held('CP03_2024to2019_062SS'),
+    });
+
+    await expect(find(['CP03_2024TO2019_062SS'], 'acs/acs5')).resolves.toEqual(
+      new Map([['CP03_2024TO2019_062SS', 'acs/acs5/cprofile']]),
+    );
+    expect(probes()).toEqual(['/data/2024/acs/acs5/cprofile/variables/CP03_2024to2019_062SS.json']);
+  });
+
+  it('looks up the first five tables only, counting only tables that have a candidate', async () => {
+    const codes = [
+      'P1_001N',
+      'S0101_C01_001E',
+      'S0601_C01_001E',
+      'S0801_C01_001E',
+      'S1101_C01_001E',
+      'S1501_C01_001E',
+      'S1701_C03_001E',
+    ];
+    serve(
+      Object.fromEntries(
+        codes.map((code) => [`/data/2024/acs/acs5/subject/variables/${code}.json`, held(code)]),
+      ),
+    );
+
+    const found = await find(codes, 'acs/acs5');
+
+    expect([...found.keys()]).toEqual(codes.slice(1, 6));
+    expect(probes()).toHaveLength(5);
+    expect(probes()).not.toContain('/data/2024/acs/acs5/subject/variables/S1701_C03_001E.json');
+  });
+
+  it('ends a chain at a failed lookup without retrying it, and answers the other tables', async () => {
+    serve({
+      '/data/2024/acs/acs5/subject/variables/S1701_C03_001E.json': new Response('unavailable', {
+        status: 503,
+        headers: { 'content-type': 'text/plain' },
+      }),
+      '/data/2024/acs/acs5/profile/variables/DP03_0062E.json': held('DP03_0062E'),
+    });
+
+    await expect(
+      find(['S1701_C03_001E', 'DP03_0062E', 'CP03_2024_062E'], 'acs/acs5'),
+    ).resolves.toEqual(new Map([['DP03_0062E', 'acs/acs5/profile']]));
+    expect(probes().sort()).toEqual(
+      [
+        '/data/2024/acs/acs5/subject/variables/S1701_C03_001E.json',
+        '/data/2024/acs/acs5/profile/variables/DP03_0062E.json',
+        // Unrouted, so the fetch rejects: a network failure ends that chain the same way.
+        '/data/2024/acs/acs5/cprofile/variables/CP03_2024_062E.json',
+      ].sort(),
+    );
+  });
+
+  it('confirms a table ID against groups/<id>.json', async () => {
+    serve({ '/data/2024/acs/acs5/subject/groups/S1701.json': { variables: {} } });
+
+    await expect(find(['S1701'], 'acs/acs5', 2024, createMockContext(), 'groups')).resolves.toEqual(
+      new Map([['S1701', 'acs/acs5/subject']]),
+    );
+    expect(probes()).toEqual(['/data/2024/acs/acs5/subject/groups/S1701.json']);
+  });
+
+  describe('under the shared deadline', () => {
+    /** A fetch that answers `respond` after `delayMs`, or hangs until its signal aborts. */
+    const scripted = (
+      script: Record<string, { delayMs: number; respond: () => unknown } | 'hang'>,
+    ) =>
+      vi.stubGlobal(
+        'fetch',
+        vi.fn((url: string | URL, init?: RequestInit) => {
+          const href = String(url);
+          requestedUrls.push(href);
+          const step = script[new URL(href).pathname];
+          return new Promise((resolve, reject) => {
+            // As fetch does: an aborted signal rejects at once, a later abort mid-flight.
+            if (init?.signal?.aborted) return reject(init.signal.reason);
+            init?.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+            if (!step) return reject(new Error(`unrouted fetch: ${href}`));
+            if (step === 'hang') return;
+            setTimeout(() => {
+              const body = step.respond();
+              resolve(
+                body instanceof Response
+                  ? body
+                  : new Response(JSON.stringify(body), {
+                      status: 200,
+                      headers: { 'content-type': 'application/json' },
+                    }),
+              );
+            }, step.delayMs);
+          });
+        }),
+      );
+
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('is 2.5 s, enough for a three-candidate chain at the slowest measured lookup', () => {
+      expect(SIBLING_LOOKUP_DEADLINE_MS).toBe(2_500);
+    });
+
+    it('gives up on every lookup at one deadline the whole call shares', async () => {
+      scripted({
+        // 404 after 2 s, then the next candidate hangs: a per-lookup deadline would wait 4.5 s.
+        '/data/2024/acs/acs5/subject/variables/S0201_001E.json': {
+          delayMs: 2_000,
+          respond: notHeld,
+        },
+        '/data/2024/acs/acs1/subject/variables/S0201_001E.json': 'hang',
+        '/data/2024/acs/acs5/profile/variables/DP03_0062E.json': {
+          delayMs: 300,
+          respond: () => held('DP03_0062E'),
+        },
+      });
+
+      let settled = false;
+      const pending = find(['S0201_001E', 'DP03_0062E'], 'acs/acs5').finally(() => {
+        settled = true;
+      });
+
+      await vi.advanceTimersByTimeAsync(SIBLING_LOOKUP_DEADLINE_MS - 1);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+
+      await expect(pending).resolves.toEqual(new Map([['DP03_0062E', 'acs/acs5/profile']]));
+      // The timed-out chain never reached its third candidate.
+      expect(probes()).not.toContain('/data/2024/acs/acs1/spp/variables/S0201_001E.json');
+    });
+
+    it("rethrows the caller's cancellation mid-lookup instead of answering without it", async () => {
+      scripted({ '/data/2024/acs/acs5/subject/variables/S0201_001E.json': 'hang' });
+      const controller = new AbortController();
+
+      const pending = find(
+        ['S0201_001E'],
+        'acs/acs5',
+        2024,
+        createMockContext({ signal: controller.signal }),
+      ).then(
+        () => 'resolved',
+        (error: unknown) => error,
+      );
+      await vi.advanceTimersByTimeAsync(100);
+      expect(probes()).toHaveLength(1);
+      controller.abort();
+
+      await expect(pending).resolves.toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
+      // Nothing more went out once the caller left.
+      await vi.advanceTimersByTimeAsync(SIBLING_LOOKUP_DEADLINE_MS);
+      expect(probes()).toHaveLength(1);
+    });
+
+    it('rejects at the first candidate when the caller has already gone', async () => {
+      scripted({});
+      const controller = new AbortController();
+      controller.abort();
+
+      await expect(
+        find(['S0201_001E'], 'acs/acs5', 2024, createMockContext({ signal: controller.signal })),
+      ).rejects.toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
+      // The one fetch carried the aborted signal; the chain's other two candidates were never asked.
+      expect(probes()).toEqual(['/data/2024/acs/acs5/subject/variables/S0201_001E.json']);
+    });
+  });
+});
+
+describe('VariableCacheService.getVariablesByCode — sibling recovery (#65)', () => {
+  const notHeld = () =>
+    new Response(TOMCAT_404, { status: 404, headers: { 'content-type': 'text/html' } });
+
+  it('names the sibling for each code it confirmed and searches for the rest', async () => {
+    serve({
+      '/data/2024/acs/acs5/variables.json': acsSearchVariablesJson,
+      '/data/2024/acs/acs5/subject/variables/S1701_C03_001E.json': { name: 'S1701_C03_001E' },
+      '/data/2024/acs/acs5/subject/variables/S9999_C99_999E.json': notHeld(),
+      '/data/2024/acs/acs1/subject/variables/S9999_C99_999E.json': notHeld(),
+      '/data/2024/acs/acs1/spp/variables/S9999_C99_999E.json': notHeld(),
+    });
+
+    const error = await service
+      .getVariablesByCode(
+        ['S1701_C03_001E', 's9999_c99_999e', 'B19013_001E'],
+        'acs/acs5',
+        2024,
+        createMockContext(),
+      )
+      .catch((e: unknown) => e as McpError);
+
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      message: 'Variable codes not found in acs/acs5 (2024): S1701_C03_001E, S9999_C99_999E',
+      data: {
+        reason: 'variable_not_found',
+        missingCodes: ['S1701_C03_001E', 'S9999_C99_999E'],
+        recovery: {
+          hint: 'S1701_C03_001E is in acs/acs5/subject — query that dataset instead. For S9999_C99_999E, use census_search_variables to find valid codes for this dataset and year.',
+        },
+      },
+    });
+  });
+
+  it('points a code at the sibling its table was found in, rather than back at the dataset', async () => {
+    serve({
+      '/data/2024/acs/acs5/variables.json': acsSearchVariablesJson,
+      '/data/2024/acs/acs5/subject/variables/S1701_C03_001E.json': { name: 'S1701_C03_001E' },
+    });
+
+    const error = await service
+      .getVariablesByCode(
+        ['S1701_C03_001E', 'S1701_C01_001E'],
+        'acs/acs5',
+        2024,
+        createMockContext(),
+      )
+      .catch((e: unknown) => e as McpError);
+
+    expect(error).toMatchObject({
+      data: {
+        recovery: {
+          hint: 'S1701_C03_001E is in acs/acs5/subject — query that dataset instead. S1701_C01_001E is from a table found in acs/acs5/subject; look it up there.',
+        },
+      },
+    });
+    // One probe per table: the second code rides on the first one's answer.
+    expect(requestsTo('/variables/S1701_C01_001E.json')).toEqual([]);
+  });
+
+  it('keeps the search hint when no sibling holds a missing code', async () => {
+    serve({ '/data/2024/acs/acs5/variables.json': acsSearchVariablesJson });
+
+    await expect(
+      service.getVariablesByCode(['NOPE_1'], 'acs/acs5', 2024, createMockContext()),
+    ).rejects.toMatchObject({
+      message: 'Variable codes not found in acs/acs5 (2024): NOPE_1',
+      data: {
+        recovery: {
+          hint: 'Use census_search_variables to find valid codes for this dataset and year.',
+        },
+      },
+    });
+    expect(requestedUrls).toEqual(['https://api.census.gov/data/2024/acs/acs5/variables.json']);
+  });
+});
+
+/** pep/charv 2023 as variables.json publishes it, `values` left out. */
+const PEP_ALLDATA_CONCEPT =
+  'Vintage 2023 Annual Resident Population Estimates by Age, Sex, Race, and Hispanic Origin: April 1, 2020 to July 1, 2023';
+const PEP_AGESEX_CONCEPT =
+  'Vintage 2023 Annual Resident Population Estimates by Selected Age Groups and Sex: April 1, 2020 to July 1, 2023';
+const PEP_SHARED_CONCEPT = `${PEP_ALLDATA_CONCEPT};${PEP_AGESEX_CONCEPT};Vintage 2023 Annual Resident Population Estimates by Single Year of Age and Sex: April 1, 2020 to July 1, 2023`;
+const PEP_SHARED_GROUP = 'PEP_SYASEX,PEP_AGESEX,PEP_ALLDATA';
+const pepCharvLiveJson = {
+  variables: {
+    for: { label: "Census API FIPS 'for' clause", group: 'N/A', predicateType: 'fips-for' },
+    MONTH: {
+      label: 'Vintage Month',
+      concept: PEP_SHARED_CONCEPT,
+      predicateType: 'string',
+      group: PEP_SHARED_GROUP,
+      attributes: 'MONTH_DESC',
+    },
+    SEX: {
+      label: 'Sex Code',
+      concept: PEP_SHARED_CONCEPT,
+      predicateType: 'string',
+      group: PEP_SHARED_GROUP,
+      required: 'default displayed',
+      attributes: 'SEX_DESC',
+    },
+    STATE: { label: 'State', group: 'N/A' },
+    YEAR: {
+      label: 'Vintage Year',
+      concept: PEP_SHARED_CONCEPT,
+      predicateType: 'string',
+      group: PEP_SHARED_GROUP,
+      required: 'default displayed',
+    },
+    UNIVERSE: {
+      label: 'Universe',
+      concept: PEP_SHARED_CONCEPT,
+      predicateType: 'string',
+      group: PEP_SHARED_GROUP,
+      attributes: 'UNIVERSE_DESC',
+    },
+    AGE: {
+      label: 'Age Group Code',
+      concept: PEP_SHARED_CONCEPT,
+      predicateType: 'string',
+      group: PEP_SHARED_GROUP,
+      required: 'default displayed',
+      attributes: 'AGE_DESC',
+    },
+    MEDAGE: {
+      label: 'Median Age',
+      concept: PEP_AGESEX_CONCEPT,
+      predicateType: 'float',
+      group: 'PEP_AGESEX',
+    },
+    GEO_ID: {
+      label: 'Geography',
+      concept: PEP_SHARED_CONCEPT,
+      predicateType: 'string',
+      group: PEP_SHARED_GROUP,
+      attributes: 'NAME',
+    },
+    POP: {
+      label: 'Population Estimate',
+      concept: PEP_SHARED_CONCEPT,
+      predicateType: 'int',
+      group: PEP_SHARED_GROUP,
+    },
+    POPGROUP: {
+      label: 'Population Group',
+      concept: PEP_ALLDATA_CONCEPT,
+      predicateType: 'string',
+      group: 'PEP_ALLDATA',
+      required: 'default displayed',
+      attributes: 'POPGROUP_LABEL',
+    },
+    HISP: {
+      label: 'Hispanic Origin Code',
+      concept: PEP_ALLDATA_CONCEPT,
+      predicateType: 'string',
+      group: 'PEP_ALLDATA',
+      required: 'default displayed',
+      attributes: 'HISP_DESC',
+    },
+  },
+};
+
+/** acs/acs5 2024 rows for the `state` and `2020` keyword baselines. */
+const acsKeywordBaselineJson = {
+  variables: {
+    B25034_001E: {
+      label: 'Estimate!!Total:',
+      concept: 'Year Structure Built',
+      predicateType: 'int',
+      group: 'B25034',
+      attributes: 'B25034_001EA,B25034_001M,B25034_001MA',
+    },
+    B08007_002E: {
+      label: 'Estimate!!Total:!!Worked in state of residence:',
+      concept: 'Sex of Workers by Place of Work--State and County Level',
+      predicateType: 'int',
+      group: 'B08007',
+      attributes: 'B08007_002EA,B08007_002M,B08007_002MA',
+    },
+    B25034_002E: {
+      label: 'Estimate!!Total:!!Built 2020 or later',
+      concept: 'Year Structure Built',
+      predicateType: 'int',
+      group: 'B25034',
+      attributes: 'B25034_002EA,B25034_002M,B25034_002MA',
+    },
+    STATE: { label: 'State', group: 'N/A' },
+  },
+};
+
+/**
+ * A decennial table whose concept names its own code, the way the 2010 concepts did
+ * (`P1. RACE`), so the code `P1` is also a keyword of every variable in it and of one outside it.
+ */
+const decPlCodeInConceptJson = {
+  variables: {
+    P3_001N: {
+      label: ' !!Total:',
+      concept: 'P3. Race for the Population 18 Years and Over (P1 universe restricted)',
+      predicateType: 'int',
+      group: 'P3',
+    },
+    P1_009N: {
+      label: ' !!Total:!!Population of two or more races:',
+      concept: 'P1. Race',
+      predicateType: 'int',
+      group: 'P1',
+    },
+    P1_003N: {
+      label: ' !!Total:!!Population of one race:!!White alone',
+      concept: 'P1. Race',
+      predicateType: 'int',
+      group: 'P1',
+    },
+    P1_002N: {
+      label: ' !!Total:!!Population of one race:',
+      concept: 'P1. Race',
+      predicateType: 'int',
+      group: 'P1',
+    },
+    P1_001N: { label: ' !!Total:', concept: 'P1. Race', predicateType: 'int', group: 'P1' },
+  },
+};
+
+/** acs/acs5/subject 2024: three S1701 estimates, each with a margin the cache synthesizes. */
+const subjectS1701Json = {
+  variables: {
+    S1701_C03_001E: {
+      label:
+        'Estimate!!Percent below poverty level!!Population for whom poverty status is determined',
+      concept: 'Poverty Status in the Past 12 Months',
+      predicateType: 'float',
+      group: 'S1701',
+    },
+    S1701_C02_001E: {
+      label: 'Estimate!!Below poverty level!!Population for whom poverty status is determined',
+      concept: 'Poverty Status in the Past 12 Months',
+      predicateType: 'int',
+      group: 'S1701',
+    },
+    S1701_C01_001E: {
+      label: 'Estimate!!Total!!Population for whom poverty status is determined',
+      concept: 'Poverty Status in the Past 12 Months',
+      predicateType: 'int',
+      group: 'S1701',
+    },
+    S0101_C01_001E: {
+      label: 'Estimate!!Total!!Total population',
+      concept: 'Age and Sex',
+      predicateType: 'int',
+      group: 'S0101',
+    },
+  },
+};
+
+describe('VariableCacheService.searchVariables — keyword results the code tier leaves alone (#63, characterization)', () => {
+  const search = (query: string, dataset: string, year: number) =>
+    service.searchVariables({ query, dataset, year, limit: 20 }, createMockContext());
+  const summary = async (query: string, dataset: string, year: number) => {
+    const result = await search(query, dataset, year);
+    return { codes: result.variables.map((v) => v.code), totalMatches: result.totalMatches };
+  };
+
+  beforeEach(() =>
+    serve({
+      '/data/2023/pep/charv/variables.json': pepCharvLiveJson,
+      '/data/2024/acs/acs5/variables.json': acsKeywordBaselineJson,
+    }),
+  );
+
+  it('keeps "age" on pep/charv in keyword order, though AGE is also a column code', async () => {
+    // An unguarded code tier would lift AGE above MEDAGE.
+    await expect(summary('age', 'pep/charv', 2023)).resolves.toEqual({
+      codes: ['MEDAGE', 'AGE', 'HISP', 'POPGROUP'],
+      totalMatches: 4,
+    });
+    await expect(summary('AGE', 'pep/charv', 2023)).resolves.toEqual({
+      codes: ['MEDAGE', 'AGE', 'HISP', 'POPGROUP'],
+      totalMatches: 4,
+    });
+  });
+
+  it('keeps "sex" on pep/charv in keyword order', async () => {
+    await expect(summary('sex', 'pep/charv', 2023)).resolves.toEqual({
+      codes: ['SEX', 'MEDAGE', 'HISP', 'POPGROUP'],
+      totalMatches: 4,
+    });
+  });
+
+  it('keeps "state" and "2020" on acs/acs5 in keyword order', async () => {
+    await expect(summary('state', 'acs/acs5', 2024)).resolves.toEqual({
+      codes: ['STATE', 'B08007_002E', 'B08007_002M'],
+      totalMatches: 3,
+    });
+    await expect(summary('2020', 'acs/acs5', 2024)).resolves.toEqual({
+      codes: ['B25034_002E', 'B25034_002M'],
+      totalMatches: 2,
+    });
+  });
+
+  it('sends a keyword query, matched or not, to variables.json alone', async () => {
+    for (const query of ['age', 'sex', 'xyzzy']) await search(query, 'pep/charv', 2023);
+    for (const query of ['state', '2020', 'xyzzy', 'POPGROUP'])
+      await search(query, 'acs/acs5', 2024);
+
+    expect(requestedUrls.map((url) => new URL(url).pathname)).toEqual([
+      '/data/2023/pep/charv/variables.json',
+      '/data/2024/acs/acs5/variables.json',
+    ]);
+  });
+});
+
+describe('VariableCacheService.searchVariables — a query that is a variable or table code (#63)', () => {
+  const search = (query: string, dataset = 'acs/acs5', year = 2024, limit = 20) =>
+    service.searchVariables({ query, dataset, year, limit }, createMockContext());
+  const codesFor = async (query: string, dataset?: string, year?: number) =>
+    (await search(query, dataset, year)).variables.map((v) => v.code);
+
+  it('returns every variable of a table, in code order, for its table ID', async () => {
+    serve({ '/data/2024/acs/acs5/variables.json': acsSearchVariablesJson });
+
+    const result = await search('B19013');
+
+    // GEO_ID lists B19013 among its tables, but belongs to no single one of them.
+    expect(result.variables.map((v) => v.code)).toEqual(['B19013_001E', 'B19013_001M']);
+    expect(result.totalMatches).toBe(2);
+    expect(result.matchedTermCount).toBe(result.termCount);
+  });
+
+  it('returns a variable for its code given in any case, with every query word counted', async () => {
+    serve({ '/data/2024/acs/acs5/variables.json': acsSearchVariablesJson });
+
+    const result = await search('  b19013_001e ');
+
+    expect(result.variables.map((v) => v.code)).toEqual(['B19013_001E']);
+    expect(result.totalMatches).toBe(1);
+    expect(result.matchedTermCount).toBe(2);
+    expect(result.termCount).toBe(2);
+  });
+
+  it('puts the code tier in code order ahead of the keyword matches, counting each variable once', async () => {
+    serve({ '/data/2020/dec/pl/variables.json': decPlCodeInConceptJson });
+
+    const result = await search('P1', 'dec/pl', 2020);
+
+    // By keyword alone: P1_001N, P3_001N, P1_002N, P1_009N, P1_003N.
+    expect(result.variables.map((v) => v.code)).toEqual([
+      'P1_001N',
+      'P1_002N',
+      'P1_003N',
+      'P1_009N',
+      'P3_001N',
+    ]);
+    expect(result.totalMatches).toBe(5);
+  });
+
+  it('drops a most-words keyword fallback once the code itself matched', async () => {
+    serve({ '/data/2020/dec/pl/variables.json': decPlCodeInConceptJson });
+
+    const result = await search('P1_001N', 'dec/pl', 2020);
+
+    expect(result.variables.map((v) => v.code)).toEqual(['P1_001N']);
+    expect(result.totalMatches).toBe(1);
+    expect(result.matchedTermCount).toBe(result.termCount);
+  });
+
+  it('gives a letter-only code the code tier when no keyword match holds its column', async () => {
+    serve({ '/data/2023/pep/charv/variables.json': pepCharvLiveJson });
+
+    await expect(codesFor('POPGROUP', 'pep/charv', 2023)).resolves.toEqual(['POPGROUP']);
+    await expect(codesFor('popgroup', 'pep/charv', 2023)).resolves.toEqual(['POPGROUP']);
+  });
+
+  it('matches a group only where it names a single table', async () => {
+    serve({ '/data/2023/pep/charv/variables.json': pepCharvLiveJson });
+
+    // AGE, SEX, POP, and the rest list PEP_ALLDATA among three tables.
+    await expect(codesFor('PEP_ALLDATA', 'pep/charv', 2023)).resolves.toEqual(['HISP', 'POPGROUP']);
+    await expect(codesFor('PEP_SYASEX,PEP_AGESEX,PEP_ALLDATA', 'pep/charv', 2023)).resolves.toEqual(
+      [],
+    );
+  });
+
+  it('cuts a table at the limit in code order and counts all of it', async () => {
+    serve({ '/data/2024/acs/acs5/subject/variables.json': subjectS1701Json });
+
+    const result = await search('S1701', 'acs/acs5/subject', 2024, 4);
+
+    expect(result.variables.map((v) => v.code)).toEqual([
+      'S1701_C01_001E',
+      'S1701_C01_001M',
+      'S1701_C02_001E',
+      'S1701_C02_001M',
+    ]);
+    expect(result.totalMatches).toBe(6);
+  });
+
+  it('matches a whole code only, never a prefix of one', async () => {
+    serve({ '/data/2024/acs/acs5/variables.json': acsSearchVariablesJson });
+
+    await expect(codesFor('B1901')).resolves.toEqual([]);
+    await expect(codesFor('B19013_001')).resolves.toEqual([]);
+  });
+});
+
+describe('VariableCacheService.searchVariables — why a code matched nothing (#63)', () => {
+  const notHeld = () =>
+    new Response(TOMCAT_404, { status: 404, headers: { 'content-type': 'text/html' } });
+  const paths = () => requestedUrls.map((url) => new URL(url).pathname);
+  const search = (query: string, ctx = createMockContext()) =>
+    service.searchVariables({ query, dataset: 'acs/acs5', year: 2024, limit: 20 }, ctx);
+
+  it('names the sibling that holds a variable code, after one lookup', async () => {
+    serve({
+      '/data/2024/acs/acs5/variables.json': acsSearchVariablesJson,
+      '/data/2024/acs/acs5/subject/variables/S1701_C03_001E.json': { name: 'S1701_C03_001E' },
+    });
+
+    const result = await search('s1701_c03_001e');
+
+    expect(result.variables).toEqual([]);
+    expect(result.totalMatches).toBe(0);
+    expect(result.codeMiss).toEqual({
+      kind: 'sibling',
+      code: 'S1701_C03_001E',
+      sibling: 'acs/acs5/subject',
+    });
+    expect(paths()).toEqual([
+      '/data/2024/acs/acs5/variables.json',
+      '/data/2024/acs/acs5/subject/variables/S1701_C03_001E.json',
+    ]);
+  });
+
+  it('confirms a table ID against groups/<id>.json, walking past the candidates that lack it', async () => {
+    serve({
+      '/data/2024/acs/acs5/variables.json': acsSearchVariablesJson,
+      '/data/2024/acs/acs5/subject/groups/S0201.json': notHeld(),
+      '/data/2024/acs/acs1/subject/groups/S0201.json': notHeld(),
+      '/data/2024/acs/acs1/spp/groups/S0201.json': { variables: {} },
+    });
+
+    const result = await search('S0201');
+
+    expect(result.codeMiss).toEqual({ kind: 'sibling', code: 'S0201', sibling: 'acs/acs1/spp' });
+    expect(paths()).toEqual([
+      '/data/2024/acs/acs5/variables.json',
+      '/data/2024/acs/acs5/subject/groups/S0201.json',
+      '/data/2024/acs/acs1/subject/groups/S0201.json',
+      '/data/2024/acs/acs1/spp/groups/S0201.json',
+    ]);
+  });
+
+  it('names an attribute column the dataset lists without a lookup', async () => {
+    serve({ '/data/2024/acs/acs5/variables.json': acsSearchVariablesJson });
+
+    const result = await search('b19013_001ea');
+
+    expect(result.variables).toEqual([]);
+    expect(result.codeMiss).toEqual({ kind: 'attribute', code: 'B19013_001EA' });
+    expect(paths()).toEqual(['/data/2024/acs/acs5/variables.json']);
+  });
+
+  it('reports a code no candidate holds, after asking each', async () => {
+    serve({
+      '/data/2024/acs/acs5/variables.json': acsSearchVariablesJson,
+      '/data/2024/acs/acs5/subject/variables/S9999_C99_999E.json': notHeld(),
+      '/data/2024/acs/acs1/subject/variables/S9999_C99_999E.json': notHeld(),
+      '/data/2024/acs/acs1/spp/variables/S9999_C99_999E.json': notHeld(),
+    });
+
+    const result = await search('S9999_C99_999E');
+
+    expect(result.codeMiss).toEqual({ kind: 'absent', code: 'S9999_C99_999E' });
+    expect(paths()).toHaveLength(4);
+  });
+
+  it('reports a code with no sibling row without sending a lookup', async () => {
+    serve({ '/data/2024/acs/acs5/variables.json': acsSearchVariablesJson });
+
+    await expect(search('NOPE_1')).resolves.toMatchObject({
+      variables: [],
+      codeMiss: { kind: 'absent', code: 'NOPE_1' },
+    });
+    expect(paths()).toEqual(['/data/2024/acs/acs5/variables.json']);
+  });
+
+  it('answers a failed lookup with the empty result, once and unretried', async () => {
+    serve({
+      '/data/2024/acs/acs5/variables.json': acsSearchVariablesJson,
+      '/data/2024/acs/acs5/subject/groups/S1701.json': new Response('unavailable', {
+        status: 503,
+        headers: { 'content-type': 'text/plain' },
+      }),
+    });
+
+    const result = await search('S1701');
+
+    expect(result).toMatchObject({
+      variables: [],
+      totalMatches: 0,
+      codeMiss: { kind: 'absent', code: 'S1701' },
+    });
+    expect(paths()).toEqual([
+      '/data/2024/acs/acs5/variables.json',
+      '/data/2024/acs/acs5/subject/groups/S1701.json',
+    ]);
+  });
+
+  it('sends no lookup and reports no code for a plain word that matched nothing', async () => {
+    serve({ '/data/2024/acs/acs5/variables.json': acsSearchVariablesJson });
+
+    for (const query of ['xyzzy', 'POPGROUP', 'xyzzy B19013']) {
+      const result = await search(query);
+      expect(result.variables).toEqual([]);
+      expect(result).not.toHaveProperty('codeMiss');
+    }
+    expect(paths()).toEqual(['/data/2024/acs/acs5/variables.json']);
+  });
+
+  it('reports no code for a number or a hyphenated word, which no Census code is shaped like', async () => {
+    serve({ '/data/2024/acs/acs5/variables.json': acsSearchVariablesJson });
+
+    for (const query of ['2020', '65', '1st', 'covid-19']) {
+      const result = await search(query);
+      expect(result.variables).toEqual([]);
+      expect(result).not.toHaveProperty('codeMiss');
+    }
+    expect(paths()).toEqual(['/data/2024/acs/acs5/variables.json']);
+  });
+
+  it("rethrows the caller's cancellation mid-lookup instead of answering", async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url: string | URL, init?: RequestInit) => {
+        const href = String(url);
+        requestedUrls.push(href);
+        if (new URL(href).pathname === '/data/2024/acs/acs5/variables.json') {
+          return Promise.resolve(
+            new Response(JSON.stringify(acsSearchVariablesJson), {
+              status: 200,
+              headers: { 'content-type': 'application/json' },
+            }),
+          );
+        }
+        // Every lookup hangs until its signal aborts.
+        return new Promise((_, reject) => {
+          if (init?.signal?.aborted) return reject(init.signal.reason);
+          init?.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+        });
+      }),
+    );
+    const controller = new AbortController();
+
+    const pending = search('S1701_C03_001E', createMockContext({ signal: controller.signal })).then(
+      () => 'resolved',
+      (error: unknown) => error,
+    );
+    await vi.waitFor(() => expect(paths()).toHaveLength(2));
+    controller.abort();
+
+    await expect(pending).resolves.toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
+    expect(paths()).toEqual([
+      '/data/2024/acs/acs5/variables.json',
+      '/data/2024/acs/acs5/subject/variables/S1701_C03_001E.json',
+    ]);
+  });
+
+  it('names the sibling for a code whose year is also a word of some label', async () => {
+    // "2024" is a word of every income label, so by keyword the code matches 1 of its 3 words.
+    serve({
+      '/data/2024/acs/acs5/variables.json': acsSearchVariablesJson,
+      '/data/2024/acs/acs5/cprofile/variables/CP03_2024_062E.json': { name: 'CP03_2024_062E' },
+    });
+
+    const result = await search('CP03_2024_062E');
+
+    expect(result.variables).toEqual([]);
+    expect(result.totalMatches).toBe(0);
+    expect(result.codeMiss).toEqual({
+      kind: 'sibling',
+      code: 'CP03_2024_062E',
+      sibling: 'acs/acs5/cprofile',
+    });
+  });
+
+  /**
+   * A comparison profile lists its significance columns only as attributes, in mixed case, so a
+   * code typed in any case has to reach the attributes index in the dataset's own spelling.
+   */
+  it.each(['cp03_2024to2019_062ss', 'CP03_2024TO2019_062SS'])(
+    'names the significance column %j in the spelling the comparison profile publishes',
+    async (query) => {
+      serve({ '/data/2024/acs/acs5/cprofile/variables.json': cprofileVariablesJson });
+
+      const result = await service.searchVariables(
+        { query, dataset: 'acs/acs5/cprofile', year: 2024, limit: 20 },
+        createMockContext(),
+      );
+
+      expect(result.variables).toEqual([]);
+      expect(result.totalMatches).toBe(0);
+      expect(result.codeMiss).toEqual({ kind: 'attribute', code: 'CP03_2024to2019_062SS' });
+      expect(paths()).toEqual(['/data/2024/acs/acs5/cprofile/variables.json']);
+    },
+  );
+
+  it('names an attribute column whose year is also a word of some label, without a lookup', async () => {
+    serve({ '/data/2024/acs/acs5/variables.json': acsWithYearAttributeJson });
+
+    // Split into words, it is b19013, 2024, and 001ea; "2024" is a word of the label beside it.
+    const result = await search('B19013_2024_001EA');
+
+    expect(result.variables).toEqual([]);
+    expect(result.codeMiss).toEqual({ kind: 'attribute', code: 'B19013_2024_001EA' });
+    expect(paths()).toEqual(['/data/2024/acs/acs5/variables.json']);
+  });
+
+  it('keeps the most-words keyword results for a code-shaped query no sibling holds', async () => {
+    serve({
+      '/data/2024/acs/acs5/variables.json': acsSearchVariablesJson,
+      '/data/2024/acs/acs5/cprofile/variables/CP03_2024_999E.json': notHeld(),
+      '/data/2024/acs/acs1/cprofile/variables/CP03_2024_999E.json': notHeld(),
+    });
+
+    const result = await search('CP03_2024_999E');
+
+    // The labels holding "2024", one of the query's three words.
+    expect(result.variables.map((v) => v.code)).toEqual([
+      'B19301_001E',
+      'B19301_001M',
+      'B19013_001E',
+      'B19013_001M',
+      'B19013B_001E',
+      'B19013B_001M',
+      'B22008_001E',
+      'B22008_001M',
+    ]);
+    expect(result).toMatchObject({ totalMatches: 8, matchedTermCount: 1, termCount: 3 });
+    expect(result).not.toHaveProperty('codeMiss');
+    // Both comparison profiles were asked before the keyword results were kept.
+    expect(paths()).toEqual([
+      '/data/2024/acs/acs5/variables.json',
+      '/data/2024/acs/acs5/cprofile/variables/CP03_2024_999E.json',
+      '/data/2024/acs/acs1/cprofile/variables/CP03_2024_999E.json',
+    ]);
+  });
+
+  it('reads a code wrapped in quotes, backticks, or trailing punctuation as the code', async () => {
+    serve({ '/data/2024/acs/acs5/variables.json': acsSearchVariablesJson });
+
+    for (const query of ['`B19013`', '"B19013"', 'B19013,']) {
+      const result = await search(query);
+      expect(result.variables.map((v) => v.code)).toEqual(['B19013_001E', 'B19013_001M']);
+    }
+    await expect(search('"b19013_001e".')).resolves.toMatchObject({
+      variables: [expect.objectContaining({ code: 'B19013_001E' })],
+    });
+    expect(paths()).toEqual(['/data/2024/acs/acs5/variables.json']);
+  });
+});
+
+/** acs/acs5 with an attribute column whose name holds a word ("2024") of the labels beside it. */
+const acsWithYearAttributeJson = {
+  variables: {
+    B19013_001E: {
+      label:
+        'Estimate!!Median household income in the past 12 months (in 2024 inflation-adjusted dollars)',
+      concept: 'Median Household Income in the Past 12 Months (in 2024 Inflation-Adjusted Dollars)',
+      predicateType: 'int',
+      group: 'B19013',
+      attributes: 'B19013_001EA,B19013_2024_001EA',
+    },
+  },
+};
+
+describe('VariableCacheService.searchVariables — a letter-only code leads its keyword matches only when typed as spelled (#63)', () => {
+  const ecnbasicBenefitJson = {
+    variables: {
+      BENPEB: {
+        label: "Employer's cost for employee benefit plans ($1,000)",
+        predicateType: 'int',
+        group: 'EC2231BASIC',
+      },
+      BENEFIT: {
+        label: 'Total fringe benefits ($1,000)',
+        predicateType: 'int',
+        group: 'EC2231BASIC,EC2221BASIC',
+      },
+    },
+  };
+
+  it('puts the column first when its own code is not among the keyword matches', async () => {
+    serve({ '/data/2022/ecnbasic/variables.json': ecnbasicBenefitJson });
+
+    const result = await service.searchVariables(
+      { query: 'BENEFIT', dataset: 'ecnbasic', year: 2022, limit: 20 },
+      createMockContext(),
+    );
+
+    // "benefit" is a word of BENPEB's label only; BENEFIT's says "benefits".
+    expect(result.variables.map((v) => v.code)).toEqual(['BENEFIT', 'BENPEB']);
+    expect(result.totalMatches).toBe(2);
+  });
+
+  it('keeps a lowercase word that matched a keyword out of the code tier', async () => {
+    serve({ '/data/2022/ecnbasic/variables.json': ecnbasicBenefitJson });
+
+    const result = await service.searchVariables(
+      { query: 'benefit', dataset: 'ecnbasic', year: 2022, limit: 20 },
+      createMockContext(),
+    );
+
+    expect(result.variables.map((v) => v.code)).toEqual(['BENPEB']);
+    expect(result).toMatchObject({ totalMatches: 1, codeMatches: 0 });
+  });
+
+  /** dec/dhc 2020 as published: STATE is labelled "Geography", so no keyword search reaches it. */
+  const decDhcStateJson = {
+    variables: {
+      STATE: { label: 'Geography', group: 'N/A', limit: 0 },
+      PCT19_008N: {
+        label:
+          ' !!Total:!!Male:!!Under 18 years:!!Institutionalized population (101-106, 201-203, 301, 401-405):!!Correctional facilities for adults (101-106):!!State prisons (103)',
+        concept: 'GROUP QUARTERS POPULATION BY SEX BY AGE BY GROUP QUARTERS TYPE',
+        predicateType: 'int',
+        group: 'PCT19',
+      },
+      PCT19_040N: {
+        label:
+          ' !!Total:!!Male:!!18 to 64 years:!!Institutionalized population (101-106, 201-203, 301, 401-405):!!Correctional facilities for adults (101-106):!!State prisons (103)',
+        concept: 'GROUP QUARTERS POPULATION BY SEX BY AGE BY GROUP QUARTERS TYPE',
+        predicateType: 'int',
+        group: 'PCT19',
+      },
+    },
+  };
+  const searchDhc = (query: string) =>
+    service.searchVariables(
+      { query, dataset: 'dec/dhc', year: 2020, limit: 20 },
+      createMockContext(),
+    );
+
+  it.each(['state', 'State', '"state"'])(
+    'answers %j with its keyword matches alone, leaving the STATE column out',
+    async (query) => {
+      serve({ '/data/2020/dec/dhc/variables.json': decDhcStateJson });
+
+      const result = await searchDhc(query);
+
+      expect(result.variables.map((v) => v.code)).toEqual(['PCT19_008N', 'PCT19_040N']);
+      expect(result).toMatchObject({ totalMatches: 2, codeMatches: 0 });
+    },
+  );
+
+  it.each(['STATE', '"STATE"'])(
+    'puts the STATE column ahead of the keyword matches for %j, typed as the code is spelled',
+    async (query) => {
+      serve({ '/data/2020/dec/dhc/variables.json': decDhcStateJson });
+
+      const result = await searchDhc(query);
+
+      expect(result.variables.map((v) => v.code)).toEqual(['STATE', 'PCT19_008N', 'PCT19_040N']);
+      expect(result).toMatchObject({ totalMatches: 3, codeMatches: 1 });
+    },
+  );
+});
+
+describe('VariableCacheService.searchVariables — how many results the code matched (#63)', () => {
+  it('counts the code tier apart from the keyword matches', async () => {
+    serve({
+      '/data/2024/acs/acs5/subject/variables.json': subjectS1701Json,
+      '/data/2024/acs/acs5/variables.json': acsSearchVariablesJson,
+    });
+    const search = (query: string, dataset: string) =>
+      service.searchVariables({ query, dataset, year: 2024, limit: 4 }, createMockContext());
+
+    await expect(search('S1701', 'acs/acs5/subject')).resolves.toMatchObject({
+      totalMatches: 6,
+      codeMatches: 6,
+    });
+    await expect(search('income', 'acs/acs5')).resolves.toMatchObject({ codeMatches: 0 });
   });
 });

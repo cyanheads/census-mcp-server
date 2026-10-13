@@ -10,9 +10,11 @@ import { fetchWithTimeout, type RequestContext, withRetry } from '@cyanheads/mcp
 import { getDiscoveryConfig, getServerConfig } from '@/config/server-config.js';
 import {
   DATASET_AVAILABLE_YEARS,
+  describeSiblingHolders,
+  getVariableCacheService,
   isAcsDataset,
 } from '@/services/variable-cache/variable-cache-service.js';
-import { censusHttpError } from './errors.js';
+import { censusHttpError, FIRST_UNKNOWN_ONLY } from './errors.js';
 import type {
   CensusDataRow,
   CensusGeographyLevel,
@@ -49,11 +51,13 @@ export function padFips(value: string | undefined, width: number): string | unde
 }
 
 /**
- * Canonicalize caller variable codes. Every supported dataset names its columns in uppercase and
- * the Census API matches `get=` case-sensitively — `b19013_001e` is a 400 — so uppercasing maps a
- * code onto the one spelling that answers, and the response is keyed by that spelling. A blank
- * code names no column, so it is dropped the way a blank scope input is, and a repeat is dropped
- * because the response is keyed by code and can hold each one once.
+ * Canonicalize caller variable codes to the uppercase form they are compared and deduplicated in.
+ * The Census API matches `get=` case-sensitively — `b19013_001e` is a 400 — and every column is
+ * uppercase except the comparison profiles' significance columns (`CP03_2024to2019_062SS`), so the
+ * data tools pass these codes through `VariableCacheService.resolveSpellings` for the spelling the
+ * request sends and the response is keyed by. No two columns collide once uppercased, so the
+ * mapping is one-to-one. A blank code names no column, so it is dropped the way a blank scope input
+ * is, and a repeat is dropped because the response is keyed by code and can hold each one once.
  */
 export function normalizeVariableCodes(codes: readonly string[]): string[] {
   return [...new Set(codes.map((code) => code.trim().toUpperCase()).filter(Boolean))];
@@ -468,15 +472,13 @@ export class CensusApiService {
 
         if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
           if (text.includes('Invalid Key') || text.includes('key_signup')) {
-            throw unauthorized(
-              'Census API key is invalid or missing. Set CENSUS_API_KEY and restart.',
-              { reason: 'missing_api_key' },
-            );
+            throw unauthorized('Census API key is invalid or missing.', {
+              reason: 'missing_api_key',
+            });
           }
-          throw serviceUnavailable(
-            'Census API returned HTML instead of JSON — may be temporarily unavailable.',
-            { reason: 'upstream_error' },
-          );
+          throw serviceUnavailable('Census API returned HTML instead of JSON.', {
+            reason: 'upstream_error',
+          });
         }
 
         let parsed: unknown;
@@ -502,9 +504,35 @@ export class CensusApiService {
         baseDelayMs: 1000,
         signal: ctx.signal,
       },
-    );
+    ).catch(async (error: unknown) => {
+      throw await this.pointAtSibling(error, params, ctx);
+    });
 
     return this.parseResponse(raw, params, ctx);
+  }
+
+  /**
+   * A `variable_not_found` whose code a sibling dataset publishes, with a recovery naming that
+   * dataset; any other error unchanged. Runs once, after the retry loop has given up, so the
+   * sibling probes spend none of its budget.
+   */
+  private async pointAtSibling(
+    error: unknown,
+    scope: { dataset: string; year: number },
+    ctx: Context,
+  ): Promise<unknown> {
+    if (!(error instanceof McpError) || error.data?.reason !== 'variable_not_found') return error;
+    const holders = await getVariableCacheService().findSiblingDatasets(
+      error.data.missingCodes as string[],
+      scope.dataset,
+      scope.year,
+      ctx,
+    );
+    if (holders.size === 0) return error;
+    return new McpError(error.code, error.message, {
+      ...error.data,
+      recovery: { hint: `${describeSiblingHolders(holders)} ${FIRST_UNKNOWN_ONLY}` },
+    });
   }
 
   /**
@@ -694,6 +722,8 @@ export class CensusApiService {
       measure?: string;
       /** NAICS dimension code and industry value to scope the enumeration by. */
       naicsScope?: { code: string; value: string };
+      /** Time every attempt and backoff get together, for a caller that can answer without this. */
+      deadlineMs?: number;
     },
     ctx: Context,
   ): Promise<CensusPredicateValue[]> {
@@ -722,12 +752,15 @@ export class CensusApiService {
     });
 
     const raw = await withRetry(
-      async () => {
+      async ({ signal, remainingMs }) => {
         let response: Response;
         try {
-          response = await fetchWithTimeout(url, 15_000, ctx as unknown as RequestContext, {
-            signal: ctx.signal,
-          });
+          response = await fetchWithTimeout(
+            url,
+            Math.min(15_000, remainingMs),
+            ctx as unknown as RequestContext,
+            { signal },
+          );
         } catch (error) {
           throw censusHttpError(error, {
             dataset: params.dataset,
@@ -768,6 +801,7 @@ export class CensusApiService {
         context: ctx as unknown as RequestContext,
         baseDelayMs: 1000,
         signal: ctx.signal,
+        ...(params.deadlineMs !== undefined && { deadlineMs: params.deadlineMs }),
       },
     );
 

@@ -2,16 +2,21 @@
  * @fileoverview Contract tests for census_query_data and census_compare_geographies, run through
  * the real CensusApiService and VariableCacheService over a strict fetch fake. Response parsing,
  * the column plan, and error classification all sit inside the tools here, so these tests exercise
- * them on both client surfaces rather than a stubbed service's return value.
+ * them on both client surfaces rather than a stubbed service's return value. The file closes with
+ * a sweep across every tool's declared failure reasons, checking that no error repeats itself
+ * between its message and its recovery hint.
  * @module tests/tools/census-data-tools.contract.test
  */
 
+import { readFileSync } from 'node:fs';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { censusCompareGeographies } from '@/mcp-server/tools/definitions/census-compare-geographies.tool.js';
 import { censusQueryData } from '@/mcp-server/tools/definitions/census-query-data.tool.js';
+import { allToolDefinitions } from '@/mcp-server/tools/definitions/index.js';
 import { initCensusApiService } from '@/services/census-api/census-api-service.js';
+import { initGeographyService } from '@/services/geography/geography-service.js';
 import { initVariableCacheService } from '@/services/variable-cache/variable-cache-service.js';
 
 vi.mock('@/config/server-config.js', () => ({
@@ -428,6 +433,324 @@ describe('an unknown variable code is variable_not_found, and case is normalized
     expect(out.rows.map((r) => r.geography_name)).toEqual(['Alaska', 'Arizona', 'Alabama']);
     expect(out.rows[0]?.variables.B19013_001E?.estimate).toBe(95665);
     expect(out.sortVariable).toBe('B19013_001E');
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// #59 — the comparison profiles' mixed-case significance columns
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * acs/acs5/cprofile 2024 names each compared line's significance column in mixed case. The data
+ * fake answers the way the Census API does: the dataset's spelling is a column, the uppercased one
+ * is a 400 naming it. Values are the live response for Alabama, Alaska, and Washington.
+ */
+describe('the comparison-profile significance columns are sent and keyed as the dataset spells them', () => {
+  const CPROFILE_COLUMNS: Record<string, Record<string, string>> = {
+    '01': { NAME: 'Alabama', CP03_2024_062E: '63999', CP03_2024to2019_062SS: '*' },
+    '02': { NAME: 'Alaska', CP03_2024_062E: '92788', CP03_2024to2019_062SS: '*' },
+    '53': { NAME: 'Washington', CP03_2024_062E: '98141', CP03_2024to2019_062SS: '*' },
+  };
+
+  const serveCprofile = () => {
+    serveMetadata('acs/acs5/cprofile', 2024, {
+      CP03_2024_062E: {
+        label:
+          '2020-2024 Estimates!!INCOME AND BENEFITS (IN 2024 INFLATION-ADJUSTED DOLLARS)!!Total households!!Median household income (dollars)',
+        concept: 'Comparative Economic Characteristics',
+        predicateType: 'int',
+        group: 'CP03',
+        attributes: 'CP03_2024_062EA,CP03_2024to2019_062SS',
+      },
+      GEOCOMP: {
+        label: 'GEO_ID Component',
+        required: 'default displayed',
+        predicateType: 'string',
+      },
+    });
+    serveData('acs/acs5/cprofile', 2024, (url) => {
+      const get = getList(url);
+      const unknown = get.find((code) => !(code in (CPROFILE_COLUMNS['53'] ?? {})));
+      if (unknown) {
+        return new Response(`error: unknown variable '${unknown}'`, {
+          status: 400,
+          headers: { 'content-type': 'text/plain' },
+        });
+      }
+      const fips = url.searchParams.get('for')?.split(':')[1] ?? '';
+      const states = fips === '*' ? ['01', '02', '53'] : [fips];
+      return [
+        [...get, 'state'],
+        ...states.map((state) => [...get.map((code) => CPROFILE_COLUMNS[state]?.[code]), state]),
+      ];
+    });
+  };
+
+  it.each(['CP03_2024to2019_062SS', 'cp03_2024to2019_062ss', 'CP03_2024TO2019_062SS'])(
+    'census_query_data sends %s as CP03_2024to2019_062SS and keys the row by it',
+    async (code) => {
+      serveCprofile();
+
+      const result = await runToolContract(censusQueryData, {
+        dataset: 'acs/acs5/cprofile',
+        variables: ['CP03_2024_062E', code],
+        geography_level: 'state',
+        geography_fips: '53',
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(getList(dataCalls('acs/acs5/cprofile', 2024)[0])).toEqual([
+        'NAME',
+        'CP03_2024_062E',
+        'CP03_2024to2019_062SS',
+      ]);
+      const [row] = structured(result).rows;
+      expect(row?.geography_name).toBe('Washington');
+      expect(Object.keys(row?.variables ?? {})).toEqual([
+        'CP03_2024_062E',
+        'CP03_2024to2019_062SS',
+      ]);
+      expect(row?.variables.CP03_2024_062E?.estimate).toBe(98141);
+      expect(row?.variables.CP03_2024to2019_062SS).toMatchObject({ estimate: null, value: '*' });
+      expect(textOf(result)).toContain('CP03_2024to2019_062SS');
+    },
+  );
+
+  it('census_compare_geographies ranks on a lowercase sort_by naming the significance column', async () => {
+    serveCprofile();
+
+    const result = await runToolContract(censusCompareGeographies, {
+      dataset: 'acs/acs5/cprofile',
+      variables: ['CP03_2024_062E', 'cp03_2024to2019_062ss'],
+      geography_level: 'state',
+      sort_by: 'cp03_2024to2019_062ss',
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(getList(dataCalls('acs/acs5/cprofile', 2024)[0])).toEqual([
+      'NAME',
+      'CP03_2024_062E',
+      'CP03_2024to2019_062SS',
+    ]);
+    const out = structured(result);
+    expect(out.sortVariable).toBe('CP03_2024to2019_062SS');
+    expect(out.rows.map((r) => r.variables.CP03_2024to2019_062SS?.value)).toEqual(['*', '*', '*']);
+    // The column holds text on every row, so the notice names it as the unranked sort key.
+    expect(out.notice).toContain('No row carries a number for CP03_2024to2019_062SS');
+    expect(textOf(result)).toContain('No row carries a number for CP03_2024to2019_062SS');
+  });
+
+  it('census_compare_geographies still ranks the estimate when sort_by names it in lowercase', async () => {
+    serveCprofile();
+
+    const result = await runToolContract(censusCompareGeographies, {
+      dataset: 'acs/acs5/cprofile',
+      variables: ['cp03_2024_062e', 'CP03_2024to2019_062SS'],
+      geography_level: 'state',
+      sort_by: 'cp03_2024_062e',
+    });
+
+    const out = structured(result);
+    expect(out.sortVariable).toBe('CP03_2024_062E');
+    expect(out.rows.map((r) => r.geography_name)).toEqual(['Washington', 'Alaska', 'Alabama']);
+  });
+
+  it('refuses a sort_by outside the variables before any request, in uppercase', async () => {
+    serveCprofile();
+
+    const result = await runToolContract(censusCompareGeographies, {
+      dataset: 'acs/acs5/cprofile',
+      variables: ['CP03_2024_062E'],
+      geography_level: 'state',
+      sort_by: 'cp03_2024to2019_062ss',
+    });
+
+    expect(errorOf(result).data).toMatchObject({
+      reason: 'sort_by_not_requested',
+      sortBy: 'CP03_2024TO2019_062SS',
+      variables: ['CP03_2024_062E'],
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('names an unknown code in its uppercased form', async () => {
+    serveMetadata('acs/acs5', 2024, acsVariables);
+    serveData('acs/acs5', 2024, (url) => {
+      const unknown = getList(url).find((code) => code !== 'NAME' && !(code in acsVariables));
+      return new Response(`error: unknown variable '${unknown}'`, {
+        status: 400,
+        headers: { 'content-type': 'text/plain' },
+      });
+    });
+
+    const result = await runToolContract(censusQueryData, {
+      variables: ['b19013_001x'],
+      geography_level: 'state',
+      geography_fips: '53',
+    });
+
+    expect(errorOf(result).data).toMatchObject({
+      reason: 'variable_not_found',
+      missingCodes: ['B19013_001X'],
+    });
+    expect(getList(dataCalls('acs/acs5', 2024)[0])).toEqual(['NAME', 'B19013_001X']);
+  });
+
+  /**
+   * The predicate check has already loaded variables.json when the codes are spelled, so a
+   * successful call sends the same requests it always has: geography.json, variables.json, data.
+   */
+  it.each([
+    [
+      'census_query_data',
+      censusQueryData,
+      { geography_fips: '53', variables: ['CP03_2024_062E', 'cp03_2024to2019_062ss'] },
+    ],
+    [
+      'census_compare_geographies',
+      censusCompareGeographies,
+      { variables: ['CP03_2024_062E', 'cp03_2024to2019_062ss'] },
+    ],
+  ] as const)('%s spends no request on spelling', async (_name, definition, input) => {
+    serveCprofile();
+
+    const result = await runToolContract(
+      definition as typeof censusQueryData,
+      { dataset: 'acs/acs5/cprofile', geography_level: 'state', ...input } as never,
+    );
+
+    expect(result.isError).toBeFalsy();
+    expect(calls.map((u) => u.pathname)).toEqual([
+      '/data/2024/acs/acs5/cprofile/geography.json',
+      '/data/2024/acs/acs5/cprofile/variables.json',
+      '/data/2024/acs/acs5/cprofile',
+    ]);
+  });
+});
+
+/**
+ * A successful call's upstream requests, pinned before the spelling and sibling lookups landed:
+ * neither may add a request to a call that succeeds.
+ */
+describe('a successful data call sends the same requests as before (characterization)', () => {
+  it.each([
+    ['census_query_data', censusQueryData, { geography_fips: '53' }],
+    ['census_compare_geographies', censusCompareGeographies, {}],
+  ] as const)(
+    '%s sends geography.json, variables.json, then the data request',
+    async (_n, def, scope) => {
+      serveMetadata('acs/acs5', 2024, acsVariables);
+      serveData('acs/acs5', 2024, () => [
+        ['NAME', 'B19013_001E', 'state'],
+        ['Washington', '103748', '53'],
+      ]);
+
+      const result = await runToolContract(
+        def as typeof censusQueryData,
+        { variables: ['b19013_001e'], geography_level: 'state', ...scope } as never,
+      );
+
+      expect(result.isError).toBeFalsy();
+      expect(calls.map((u) => u.pathname)).toEqual([
+        '/data/2024/acs/acs5/geography.json',
+        '/data/2024/acs/acs5/variables.json',
+        '/data/2024/acs/acs5',
+      ]);
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------------------------
+// #65 — variable_not_found names the sibling dataset that holds the code
+// ---------------------------------------------------------------------------------------------
+
+describe('variable_not_found names the sibling dataset that publishes the code', () => {
+  /** The servlet container page the per-variable endpoint answers a code it lacks with. */
+  const notHeld = () =>
+    new Response(
+      '<!doctype html><html lang="en"><head><title>HTTP Status 404 – Not Found</title></head><body><h1>HTTP Status 404 – Not Found</h1></body></html>',
+      { status: 404, headers: { 'content-type': 'text/html' } },
+    );
+
+  /** The live 2024 acs/acs5/subject record for S1701_C03_001E. */
+  const S1701_RECORD = {
+    name: 'S1701_C03_001E',
+    label:
+      'Estimate!!Percent below poverty level!!Population for whom poverty status is determined',
+    concept: 'Poverty Status in the Past 12 Months',
+    predicateType: 'float',
+    group: 'S1701',
+    limit: 0,
+    attributes: 'S1701_C03_001EA,S1701_C03_001M,S1701_C03_001MA',
+  };
+
+  const rejectUnknown = (url: URL) => {
+    const unknown = getList(url).find((code) => code !== 'NAME' && !(code in acsVariables));
+    return new Response(`error: unknown variable '${unknown}'`, {
+      status: 400,
+      headers: { 'content-type': 'text/plain' },
+    });
+  };
+
+  const lookups = () => calls.filter((u) => u.pathname.includes('/variables/'));
+
+  it.each([
+    ['census_query_data', censusQueryData, { geography_fips: '53' }],
+    ['census_compare_geographies', censusCompareGeographies, {}],
+  ] as const)(
+    '%s points S1701_C03_001E on acs/acs5 at acs/acs5/subject',
+    async (_n, def, scope) => {
+      serveMetadata('acs/acs5', 2024, acsVariables);
+      serveData('acs/acs5', 2024, rejectUnknown);
+      routes.push({
+        match: (u) => u.pathname === '/data/2024/acs/acs5/subject/variables/S1701_C03_001E.json',
+        respond: () => S1701_RECORD,
+      });
+
+      const result = await runToolContract(
+        def as typeof censusQueryData,
+        { variables: ['S1701_C03_001E'], geography_level: 'state', ...scope } as never,
+      );
+
+      const error = errorOf(result);
+      expect(error.code).toBe(JsonRpcErrorCode.NotFound);
+      expect(error.data).toMatchObject({
+        reason: 'variable_not_found',
+        missingCodes: ['S1701_C03_001E'],
+        dataset: 'acs/acs5',
+      });
+      const hint = (error.data.recovery as { hint: string }).hint;
+      expect(hint).toContain('S1701_C03_001E is in acs/acs5/subject — query that dataset');
+      expect(hint).not.toContain('not acs/acs5');
+      expect(hint).toContain('names only the first unknown code');
+      expect(textOf(result)).toContain('S1701_C03_001E is in acs/acs5/subject');
+      expect(dataCalls('acs/acs5', 2024)).toHaveLength(1);
+      expect(lookups().map((u) => u.pathname)).toEqual([
+        '/data/2024/acs/acs5/subject/variables/S1701_C03_001E.json',
+      ]);
+    },
+  );
+
+  it('keeps the search hint when no candidate holds the code', async () => {
+    serveMetadata('acs/acs5', 2024, acsVariables);
+    serveData('acs/acs5', 2024, rejectUnknown);
+    routes.push({ match: (u) => u.pathname.includes('/variables/S9999_'), respond: notHeld });
+
+    const result = await runToolContract(censusQueryData, {
+      variables: ['S9999_C99_999E'],
+      geography_level: 'state',
+      geography_fips: '53',
+    });
+
+    const hint = (errorOf(result).data.recovery as { hint: string }).hint;
+    expect(hint).toBe(
+      'Call census_search_variables to find valid codes for this dataset and year, or census_get_variable to confirm one. The Census API names only the first unknown code in a request, so check the others before retrying.',
+    );
+    expect(lookups().map((u) => u.pathname)).toEqual([
+      '/data/2024/acs/acs5/subject/variables/S9999_C99_999E.json',
+      '/data/2024/acs/acs1/subject/variables/S9999_C99_999E.json',
+      '/data/2024/acs/acs1/spp/variables/S9999_C99_999E.json',
+    ]);
   });
 });
 
@@ -1661,7 +1984,14 @@ describe('census_compare_geographies refuses a ranking it cannot make', () => {
     expect(result.isError).toBe(true);
     const error = errorOf(result);
     expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
-    expect(error.message).toContain('At least one variable code is required');
+    // #62: the message states what is missing; where to find codes is the hint's.
+    expect(error.message).toBe('At least one variable code is required.');
+    expect(error.data).toMatchObject({
+      variableCount: 0,
+      recovery: {
+        hint: 'Pass variable codes such as B01003_001E — census_search_variables finds them.',
+      },
+    });
     expect(calls).toHaveLength(0);
   });
 
@@ -1694,7 +2024,10 @@ describe('census_compare_geographies refuses a ranking it cannot make', () => {
     });
 
     expect(result.isError).toBe(true);
-    expect(errorOf(result).message).toContain('At least one variable code is required');
+    expect(errorOf(result).message).toBe('At least one variable code is required.');
+    expect(textOf(result)).toContain(
+      'Recovery: Pass variable codes such as B01003_001E — census_search_variables finds them.',
+    );
     expect(calls).toHaveLength(0);
   });
 });
@@ -2013,6 +2346,550 @@ describe('the added datasets answer on both surfaces', () => {
 });
 
 // ---------------------------------------------------------------------------------------------
+// #54, #68 — tables that split POPGROUP groups between them
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A tables-of-one-family model of dec/ddhcb and dec/ddhca, built from api.census.gov answers
+ * captured on 2026-10-13. Each table publishes a group at a geography or it does not; within a
+ * family a group sits in only one table there. A request is answered the way the Census answers
+ * it: rows only where the first-listed table publishes the group (HTTP 204 when none), and null in
+ * a later column whose table does not.
+ */
+interface SplitModel {
+  /** Cell values by `<code>|<group>|<geography key>`; any other published cell reads 100. */
+  cells: Record<string, string>;
+  /** The groups each table publishes, per geography key (`us`, `53`, `53:011`). */
+  publishes: Record<string, Record<string, readonly string[]>>;
+}
+
+const ddhcbWashingtonT03004 = (
+  JSON.parse(
+    readFileSync(new URL('../fixtures/dec-ddhcb-2020-popgroup.json', import.meta.url), 'utf8'),
+  ) as { washington: { T03004_001N: string } }
+).washington.T03004_001N.split(' ');
+
+const WA_COUNTIES_WITH_1002_IN_T03004 = {
+  '011': ['Clark County, Washington', '71093'],
+  '033': ['King County, Washington', '240919'],
+  '053': ['Pierce County, Washington', '108879'],
+  '061': ['Snohomish County, Washington', '103172'],
+  '063': ['Spokane County, Washington', '76863'],
+} as const;
+
+const ddhcbModel: SplitModel = {
+  publishes: {
+    '53': {
+      T03001: ['3910'],
+      T03002: ['1360'],
+      T03003: ['1631'],
+      T03004: ddhcbWashingtonT03004,
+      T04001: ['3910'],
+      T04002: ['1002'],
+    },
+    ...Object.fromEntries(
+      Object.keys(WA_COUNTIES_WITH_1002_IN_T03004).map((county) => [
+        `53:${county}`,
+        { T03004: ['1002'] },
+      ]),
+    ),
+  },
+  cells: {
+    'T03001_001N|3910|53': '997',
+    'T03002_002N|1360|53': '1769',
+    'T03003_003N|1631|53': '9491',
+    'T03004_002N|1002|53': '932571',
+    'T04001_001N|3910|53': '950',
+    'T04002_004N|1002|53': '457109',
+    'T04002_001N|1002|53': '1467827',
+    ...Object.fromEntries(
+      Object.entries(WA_COUNTIES_WITH_1002_IN_T03004).map(([county, [, value]]) => [
+        `T03004_002N|1002|53:${county}`,
+        value,
+      ]),
+    ),
+  },
+};
+
+const ddhcaModel: SplitModel = {
+  publishes: {
+    us: { T01001: ['1002', '1360'], T02002: ['1360'], T02003: ['1002'] },
+    '06': { T01001: ['1002'], T02001: ['1002'] },
+    '53': { T01001: ['1002'], T02001: ['1002'] },
+  },
+  cells: {
+    'T02002_001N|1360|us': '133311',
+    'T01001_001N|1360|us': '133311',
+    'T02003_001N|1002|us': '120113090',
+  },
+};
+
+const GROUP_LABELS: Record<string, string> = {
+  '1002': 'European alone',
+  '1360': 'Alaska Native alone',
+  '1631': 'Mexican',
+  '3910': 'Thai alone',
+};
+
+/** Answer a data request against a model; the default POPGROUP is 1002 (European alone). */
+const answerSplit =
+  (model: SplitModel) =>
+  (url: URL): Body => {
+    const get = getList(url);
+    const measures = get.filter((code) => /^T\d{5}_\d{3}N$/.test(code));
+    const tableOf = (code: string) => code.split('_')[0] as string;
+    const [level, fips] = (url.searchParams.get('for') ?? '').split(':') as [string, string];
+    const state = url.searchParams.get('in')?.split(':')[1];
+    const keys =
+      level === 'us'
+        ? ['us']
+        : level === 'state'
+          ? fips === '*'
+            ? Object.keys(model.publishes).filter((key) => /^\d{2}$/.test(key))
+            : [fips]
+          : Object.keys(model.publishes).filter(
+              (key) =>
+                key.startsWith(`${state}:`) &&
+                (fips === '*' || fips.split(',').some((one) => key === `${state}:${one}`)),
+            );
+    const sent = url.searchParams.get('POPGROUP');
+    const published = (table: string, key: string) => model.publishes[key]?.[table] ?? [];
+    const first = tableOf(measures[0] as string);
+
+    const rows = keys.flatMap((key) => {
+      const groups = sent === '*' ? published(first, key) : [sent ?? '1002'];
+      return groups
+        .filter((group) => published(first, key).includes(group))
+        .map((group) => [
+          ...get.map((code) => {
+            if (code === 'NAME') return level === 'us' ? 'United States' : `Place ${key}`;
+            if (code === 'GEO_ID') return `GEO${key.replace(':', '')}`;
+            if (code === 'POPGROUP_LABEL') return GROUP_LABELS[group] ?? `Group ${group}`;
+            return published(tableOf(code), key).includes(group)
+              ? (model.cells[`${code}|${group}|${key}`] ?? '100')
+              : null;
+          }),
+          ...(sent ? [group] : []),
+          ...(level === 'county' ? [state, key.split(':')[1]] : [key === 'us' ? '1' : key]),
+        ]);
+    });
+    if (rows.length === 0) return new Response(null, { status: 204 });
+    const geoColumns = level === 'county' ? ['state', 'county'] : [level];
+    return [[...get, ...(sent ? ['POPGROUP'] : []), ...geoColumns], ...rows];
+  };
+
+const popgroupDimension = (group: string) => ({
+  POPGROUP: {
+    label: 'Race/Ethnic Group',
+    required: 'default displayed',
+    predicateType: 'string',
+    group,
+    attributes: 'POPGROUP_LABEL',
+  },
+  GEOCOMP: { label: 'GEO_ID Component', required: 'default displayed', predicateType: 'string' },
+});
+
+const ddhcbVariables = {
+  T03001_001N: { label: '!!Total', predicateType: 'int', group: 'T03001' },
+  T03002_002N: { label: '!!Total:!!Family households', predicateType: 'int', group: 'T03002' },
+  T03003_003N: {
+    label: '!!Total:!!Family households:!!Married couple family',
+    predicateType: 'int',
+    group: 'T03003',
+  },
+  T03004_002N: { label: '!!Total:!!Family households:', predicateType: 'int', group: 'T03004' },
+  T04001_001N: { label: '!!Total', predicateType: 'int', group: 'T04001' },
+  T04002_001N: { label: '!!Total:', predicateType: 'int', group: 'T04002' },
+  T04002_004N: { label: '!!Total:!!Renter occupied', predicateType: 'int', group: 'T04002' },
+  ...popgroupDimension('T03002,T03001,T04002,T04001,T03004,T03003'),
+};
+
+const ddhcaVariables = {
+  T01001_001N: { label: ' !!Total', predicateType: 'int', group: 'T01001' },
+  T02001_001N: { label: ' !!Total:', predicateType: 'int', group: 'T02001' },
+  T02002_001N: { label: ' !!Total:', predicateType: 'int', group: 'T02002' },
+  T02003_001N: { label: ' !!Total:', predicateType: 'int', group: 'T02003' },
+  ...popgroupDimension('T02001,T01001,T02002,T02003'),
+};
+
+const serveDdhcb = () => {
+  serveMetadata('dec/ddhcb', 2020, ddhcbVariables);
+  serveData('dec/ddhcb', 2020, answerSplit(ddhcbModel));
+};
+
+const serveDdhca = () => {
+  serveMetadata('dec/ddhca', 2020, ddhcaVariables);
+  serveData('dec/ddhca', 2020, answerSplit(ddhcaModel));
+};
+
+const inWashington = { dataset: 'dec/ddhcb', geography_level: 'state', geography_fips: '53' };
+
+/** The table-split guidance, recognized by the sentence every form of it carries. */
+const SPLIT = /publishes a POPGROUP group in only one of/;
+
+describe('dec/ddhcb answers the acceptance cells in WA, with no guidance on a one-cell result (#54)', () => {
+  it.each([
+    ['T03001_001N', '3910', 997],
+    ['T03002_002N', '1360', 1769],
+    ['T03003_003N', '1631', 9491],
+    ['T03004_002N', '1002', 932571],
+    ['T04001_001N', '3910', 950],
+    ['T04002_004N', '1002', 457109],
+  ])('%s for POPGROUP %s is %d', async (code, group, value) => {
+    serveDdhcb();
+
+    const result = await runToolContract(censusQueryData, {
+      ...inWashington,
+      variables: [code],
+      predicates: { POPGROUP: group },
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(structured(result).rows[0]?.variables[code]?.estimate).toBe(value);
+    expect(structured(result)).not.toHaveProperty('notice');
+    expect(textOf(result)).toContain(value.toLocaleString('en-US'));
+    expect(textOf(result)).not.toMatch(SPLIT);
+    expect(calls.map((u) => u.pathname)).toEqual([
+      '/data/2020/dec/ddhcb/geography.json',
+      '/data/2020/dec/ddhcb/variables.json',
+      '/data/2020/dec/ddhcb',
+    ]);
+  });
+
+  /** An unset POPGROUP applies 1002, European alone — echoed, and the one value asked for. */
+  it('answers T04002_001N with POPGROUP unset as European alone, 1,467,827', async () => {
+    serveDdhcb();
+
+    const result = await runToolContract(censusQueryData, {
+      ...inWashington,
+      variables: ['T04002_001N'],
+    });
+
+    const [row] = structured(result).rows;
+    expect(row?.variables.T04002_001N?.estimate).toBe(1467827);
+    expect(row?.applied_filters).toEqual({ POPGROUP: 'European alone' });
+    expect(structured(result).notice).toContain('the API applied "European alone"');
+    expect(structured(result).notice).not.toMatch(SPLIT);
+    expect(textOf(result)).toContain('**Applied filter defaults:** POPGROUP = European alone');
+  });
+});
+
+describe('dec/ddhcb results that can miss a group or geography carry the table guidance (#54)', () => {
+  it('no_data on T03001_001N for 1002 names T03002, T03003, and T03004, on both surfaces', async () => {
+    serveDdhcb();
+
+    const result = await runToolContract(censusQueryData, {
+      ...inWashington,
+      variables: ['T03001_001N'],
+      predicates: { POPGROUP: '1002' },
+    });
+
+    const error = errorOf(result);
+    expect(error.data).toMatchObject({ reason: 'no_data' });
+    const hint = (error.data.recovery as { hint: string }).hint;
+    expect(hint).toMatch(SPLIT);
+    expect(hint).toContain('T03002, T03003, or T03004');
+    expect(textOf(result)).toContain(`Recovery: ${hint}`);
+    expect(calls).toHaveLength(3);
+  });
+
+  it('explains the null in T04002_004N when T03001_001N leads, on both surfaces', async () => {
+    serveDdhcb();
+
+    const result = await runToolContract(censusQueryData, {
+      ...inWashington,
+      variables: ['T03001_001N', 'T04002_004N'],
+      predicates: { POPGROUP: '3910' },
+    });
+
+    const [row] = structured(result).rows;
+    expect(row?.variables.T03001_001N?.estimate).toBe(997);
+    expect(row?.variables.T04002_004N).toMatchObject({ estimate: null, suppressed: false });
+    const notice = structured(result).notice as string;
+    expect(notice).toContain('missing from T04002');
+    expect(notice).toContain('T04001');
+    expect(notice).toMatch(/first-listed one, T03001/);
+    expect(textOf(result)).toContain(notice);
+    expect(dataCalls('dec/ddhcb', 2020)).toHaveLength(1);
+  });
+
+  it('answers the reverse order with no_data and the same guidance', async () => {
+    serveDdhcb();
+
+    const result = await runToolContract(censusQueryData, {
+      ...inWashington,
+      variables: ['T04002_004N', 'T03001_001N'],
+      predicates: { POPGROUP: '3910' },
+    });
+
+    const hint = (errorOf(result).data.recovery as { hint: string }).hint;
+    expect(errorOf(result).data).toMatchObject({ reason: 'no_data' });
+    expect(hint).toContain('missing from T04002');
+    expect(hint).toContain('T04001');
+    expect(hint).toMatch(/first-listed one, T04002/);
+    expect(textOf(result)).toContain(`Recovery: ${hint}`);
+  });
+
+  it('breaks T03004_002N out by POPGROUP "*" into 160 rows, with the guidance', async () => {
+    serveDdhcb();
+
+    const result = await runToolContract(censusQueryData, {
+      ...inWashington,
+      variables: ['T03004_002N'],
+      predicates: { POPGROUP: '*' },
+      limit: 500,
+    });
+
+    const out = structured(result);
+    expect(out.rows).toHaveLength(160);
+    expect(out.rows.find((r) => r.record?.POPGROUP?.code === '1002')?.variables).toMatchObject({
+      T03004_002N: { estimate: 932571 },
+    });
+    expect(out.notice).toContain('one row per category of POPGROUP');
+    expect(out.notice).toContain('missing from T03004');
+    expect(out.notice).toContain('T03001, T03002, or T03003');
+    expect(textOf(result)).toContain(out.notice as string);
+    expect(dataCalls('dec/ddhcb', 2020)).toHaveLength(1);
+  });
+
+  /** WA has 39 counties; 1002 sits in T03004 in 5 of them, T03003 in 19, T03002 in 10, T03001 in 5. */
+  it('ranks the 5 counties T03004 publishes 1002 in, and says the rest may sit elsewhere', async () => {
+    serveDdhcb();
+
+    const result = await runToolContract(censusCompareGeographies, {
+      dataset: 'dec/ddhcb',
+      variables: ['T03004_002N'],
+      geography_level: 'county',
+      within: '53',
+      predicates: { POPGROUP: '1002' },
+    });
+
+    const out = structured(result);
+    expect(out.rows.map((r) => r.variables.T03004_002N?.estimate)).toEqual([
+      240919, 108879, 103172, 76863, 71093,
+    ]);
+    expect(out.notice).toMatch(SPLIT);
+    expect(out.notice).toContain('T03001, T03002, or T03003');
+    expect(textOf(result)).toContain(out.notice as string);
+    expect(calls.map((u) => u.pathname)).toEqual([
+      '/data/2020/dec/ddhcb/geography.json',
+      '/data/2020/dec/ddhcb/variables.json',
+      '/data/2020/dec/ddhcb',
+    ]);
+  });
+
+  it('carries the guidance on a comparison that came back empty', async () => {
+    serveDdhcb();
+
+    const result = await runToolContract(censusCompareGeographies, {
+      dataset: 'dec/ddhcb',
+      variables: ['T03002_002N'],
+      geography_level: 'county',
+      within: '53',
+      predicates: { POPGROUP: '1360' },
+    });
+
+    expect(errorOf(result).data).toMatchObject({ reason: 'no_data' });
+    const hint = (errorOf(result).data.recovery as { hint: string }).hint;
+    expect(hint).toContain('T03001, T03003, or T03004');
+    expect(textOf(result)).toContain(`Recovery: ${hint}`);
+  });
+
+  it('carries the guidance when a geographies filter matched no row', async () => {
+    serveDdhcb();
+
+    const result = await runToolContract(censusCompareGeographies, {
+      dataset: 'dec/ddhcb',
+      variables: ['T03004_002N'],
+      geography_level: 'county',
+      within: '53',
+      predicates: { POPGROUP: '1002' },
+      geographies: ['53001'],
+    });
+
+    expect(errorOf(result).data).toMatchObject({ reason: 'no_data' });
+    const hint = (errorOf(result).data.recovery as { hint: string }).hint;
+    expect(hint).toContain('GEOID');
+    expect(hint).toContain('T03001, T03002, or T03003');
+  });
+});
+
+describe('dec/ddhca T02001–T02003 carry the same guidance (#68)', () => {
+  const atUs = { dataset: 'dec/ddhca', geography_level: 'us', geography_fips: '1' };
+
+  it('no_data on T02003_001N for 1360 names T02001 and T02002', async () => {
+    serveDdhca();
+
+    const result = await runToolContract(censusQueryData, {
+      ...atUs,
+      variables: ['T02003_001N'],
+      predicates: { POPGROUP: '1360' },
+    });
+
+    expect(errorOf(result).data).toMatchObject({ reason: 'no_data' });
+    const hint = (errorOf(result).data.recovery as { hint: string }).hint;
+    expect(hint).toContain('T02001 or T02002');
+    expect(hint.indexOf('T02002')).toBeLessThan(hint.indexOf('check the POPGROUP value'));
+    expect(textOf(result)).toContain(`Recovery: ${hint}`);
+  });
+
+  it('answers T02002_001N for 1360 with 133,311 and no notice', async () => {
+    serveDdhca();
+
+    const result = await runToolContract(censusQueryData, {
+      ...atUs,
+      variables: ['T02002_001N'],
+      predicates: { POPGROUP: '1360' },
+    });
+
+    expect(structured(result).rows[0]?.variables.T02002_001N?.estimate).toBe(133311);
+    expect(structured(result)).not.toHaveProperty('notice');
+    expect(textOf(result)).toContain('133,311');
+  });
+
+  /** T01001 publishes every group the dataset serves: nothing about it is split. */
+  it('adds nothing to a T01001_001N comparison across states (characterization)', async () => {
+    serveDdhca();
+
+    const result = await runToolContract(censusCompareGeographies, {
+      dataset: 'dec/ddhca',
+      variables: ['T01001_001N'],
+      geography_level: 'state',
+      predicates: { POPGROUP: '1002' },
+    });
+
+    expect(structured(result).rows).toHaveLength(2);
+    expect(structured(result)).not.toHaveProperty('notice');
+  });
+
+  it('adds the guidance to a T02001_001N comparison across states', async () => {
+    serveDdhca();
+
+    const result = await runToolContract(censusCompareGeographies, {
+      dataset: 'dec/ddhca',
+      variables: ['T02001_001N'],
+      geography_level: 'state',
+      predicates: { POPGROUP: '1002' },
+    });
+
+    expect(structured(result).rows).toHaveLength(2);
+    expect(structured(result).notice).toContain('T02002 or T02003');
+    expect(textOf(result)).toContain(structured(result).notice as string);
+    expect(dataCalls('dec/ddhca', 2020)).toHaveLength(1);
+  });
+});
+
+/**
+ * GEO_ID and NAME are columns of every table, not tables: the Census picks the rows by the first
+ * measure listed, so `GEO_ID,T03001_001N` for 1002 in WA is HTTP 204 and `GEO_ID,T03004_002N` is
+ * T03004's one row (api.census.gov, 2026-10-13).
+ */
+describe('table-split guidance reads only measure codes as tables (#54, #68)', () => {
+  it('stays off a one-cell, one-table answer that also asks for GEO_ID, on both surfaces', async () => {
+    serveDdhcb();
+
+    const result = await runToolContract(censusQueryData, {
+      ...inWashington,
+      variables: ['GEO_ID', 'T03004_002N'],
+      predicates: { POPGROUP: '1002' },
+    });
+
+    expect(structured(result).rows[0]?.variables.T03004_002N?.estimate).toBe(932571);
+    expect(structured(result)).not.toHaveProperty('notice');
+    expect(textOf(result)).not.toMatch(SPLIT);
+  });
+
+  it('stays off a one-cell, one-table answer that lists NAME after the measure', async () => {
+    serveDdhcb();
+
+    const result = await runToolContract(censusQueryData, {
+      ...inWashington,
+      variables: ['T03004_002N', 'NAME'],
+      predicates: { POPGROUP: '1002' },
+    });
+
+    expect(structured(result).rows[0]?.variables.T03004_002N?.estimate).toBe(932571);
+    expect(structured(result)).not.toHaveProperty('notice');
+  });
+
+  it('blames the measure table, not GEO_ID, when GEO_ID leads an empty query', async () => {
+    serveDdhcb();
+
+    const result = await runToolContract(censusQueryData, {
+      ...inWashington,
+      variables: ['GEO_ID', 'T03001_001N'],
+      predicates: { POPGROUP: '1002' },
+    });
+
+    expect(errorOf(result).data).toMatchObject({ reason: 'no_data' });
+    const hint = (errorOf(result).data.recovery as { hint: string }).hint;
+    expect(hint).toContain('missing from T03001 may be published in T03002, T03003, or T03004');
+    expect(hint).not.toContain('first-listed');
+    expect(hint).not.toMatch(/\bGEO\b/);
+    expect(textOf(result)).toContain(`Recovery: ${hint}`);
+  });
+
+  it('names the first measure table on a multi-table comparison that leads with GEO_ID', async () => {
+    serveDdhcb();
+
+    const result = await runToolContract(censusCompareGeographies, {
+      dataset: 'dec/ddhcb',
+      variables: ['GEO_ID', 'T03004_002N', 'T04002_004N'],
+      sort_by: 'T03004_002N',
+      geography_level: 'county',
+      within: '53',
+      predicates: { POPGROUP: '1002' },
+    });
+
+    const notice = structured(result).notice as string;
+    expect(notice).toMatch(/first-listed one, T03004/);
+    expect(notice).not.toMatch(/\bGEO\b/);
+    expect(textOf(result)).toContain(notice);
+  });
+});
+
+/**
+ * The Census API takes a comma-separated list in `for=` (`county:033,001`), and the tool passes
+ * geography_fips through, so a list is several geographies: Adams County (001) publishes 1002 in
+ * T03001, not T03004, and drops out of the rows.
+ */
+describe('a comma-separated geography_fips gets the table guidance (#54)', () => {
+  it('names the sibling tables when a listed county has no row, on both surfaces', async () => {
+    serveDdhcb();
+
+    const result = await runToolContract(censusQueryData, {
+      dataset: 'dec/ddhcb',
+      geography_level: 'county',
+      geography_fips: '033,001',
+      parent_fips: '53',
+      variables: ['T03004_002N'],
+      predicates: { POPGROUP: '1002' },
+    });
+
+    expect(structured(result).rows.map((r) => r.geography_geoid)).toEqual(['53033']);
+    const notice = structured(result).notice as string;
+    expect(notice).toContain('missing from T03004 may be published in T03001, T03002, or T03003');
+    expect(textOf(result)).toContain(notice);
+  });
+
+  it('stays off one county named on its own (characterization)', async () => {
+    serveDdhcb();
+
+    const result = await runToolContract(censusQueryData, {
+      dataset: 'dec/ddhcb',
+      geography_level: 'county',
+      geography_fips: '033',
+      parent_fips: '53',
+      variables: ['T03004_002N'],
+      predicates: { POPGROUP: '1002' },
+    });
+
+    expect(structured(result).rows[0]?.variables.T03004_002N?.estimate).toBe(240919);
+    expect(structured(result)).not.toHaveProperty('notice');
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
 // #32 — dataset-code case and shorthand
 // ---------------------------------------------------------------------------------------------
 
@@ -2089,4 +2966,1049 @@ describe('a dataset code resolves regardless of case, padding, or a bare acs5/ac
       expect(calls).toHaveLength(0);
     },
   );
+});
+
+// ---------------------------------------------------------------------------------------------
+// census_list_geographies and the data tools count the same levels
+// ---------------------------------------------------------------------------------------------
+
+describe('census_list_geographies and the data tools give one level count per dataset-year', () => {
+  const listGeographies = allToolDefinitions.find((d) => d.name === 'census_list_geographies');
+
+  /**
+   * 13 levels in 16 entries: geography.json lists a level once per parent hierarchy it is
+   * published under, as acs/acs5 2024 lists county five times (65 entries, 43 levels).
+   */
+  const serveRepeatedLevels = () => {
+    routes.unshift({
+      match: (u) => u.pathname === '/data/2024/acs/acs5/geography.json',
+      respond: () => ({
+        fips: [
+          { name: 'us', geoLevelDisplay: '010' },
+          { name: 'state', geoLevelDisplay: '040' },
+          { name: 'county', geoLevelDisplay: '050', requires: ['state'] },
+          ...[['combined statistical area'], ['urban area'], ['state', 'place']].map(
+            (requires) => ({ name: 'county', geoLevelDisplay: '050', requires }),
+          ),
+          ...Array.from({ length: 10 }, (_, i) => ({
+            name: `level ${i}`,
+            geoLevelDisplay: `9${i}`,
+          })),
+        ],
+      }),
+    });
+    serveMetadata('acs/acs5', 2024, acsVariables);
+  };
+
+  it('census_list_geographies counts distinct levels and names the extra hierarchy entries', async () => {
+    serveRepeatedLevels();
+
+    const result = await runToolContract(
+      listGeographies as never,
+      { dataset: 'acs/acs5' } as never,
+    );
+
+    const out = result.structuredContent as {
+      geography_levels: Array<{ geography_level: string }>;
+      totalLevels: number;
+    };
+    expect(out.geography_levels).toHaveLength(16);
+    expect(out.totalLevels).toBe(13);
+    const text = textOf(result);
+    expect(text).toContain('**13 levels available**');
+    expect(text).toContain('16 entries');
+  });
+
+  it('lists entries with no note when no level repeats', async () => {
+    serveMetadata('acs/acs5', 2024, acsVariables);
+
+    const result = await runToolContract(
+      listGeographies as never,
+      { dataset: 'acs/acs5' } as never,
+    );
+
+    expect((result.structuredContent as { totalLevels: number }).totalLevels).toBe(4);
+    expect(textOf(result)).toContain('**4 levels available**\n');
+    expect(textOf(result)).not.toContain('entries');
+  });
+
+  it.each([
+    ['census_query_data', censusQueryData, { geography_fips: '53' }],
+    ['census_compare_geographies', censusCompareGeographies, {}],
+  ] as const)(
+    '%s refuses an unknown level with the same count',
+    async (_name, definition, scope) => {
+      serveRepeatedLevels();
+
+      const result = await runToolContract(
+        definition as typeof censusQueryData,
+        { variables: ['B01003_001E'], geography_level: 'bogus', ...scope } as never,
+      );
+
+      const error = errorOf(result);
+      expect(error.data).toMatchObject({ reason: 'geography_not_supported' });
+      expect(error.message).toBe(
+        'Geography level "bogus" does not exist in acs/acs5 (2024). It publishes 13 geography levels.',
+      );
+      expect(error.data.availableLevels).toHaveLength(13);
+    },
+  );
+
+  it('census_list_geographies names the years a dataset serves when geography.json 404s for one it does not', async () => {
+    routes.push({
+      match: (u) => u.pathname === '/data/1999/acs/acs5/geography.json',
+      respond: () => new Response('Not Found', { status: 404 }),
+    });
+
+    const result = await runToolContract(
+      listGeographies as never,
+      { dataset: 'acs/acs5', year: 1999 } as never,
+    );
+
+    const error = errorOf(result);
+    expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
+    expect(error.message).toBe('acs/acs5 cannot be queried for 1999.');
+    expect(error.data).toMatchObject({
+      reason: 'year_not_available',
+      dataset: 'acs/acs5',
+      year: 1999,
+      availableYears: expect.arrayContaining([2009, 2024]),
+      recovery: { hint: 'Retry with a year this dataset serves: 2009-2024.' },
+    });
+    const text = textOf(result);
+    expect(text).toContain('Error: acs/acs5 cannot be queried for 1999.');
+    expect(text).toContain('Recovery: Retry with a year this dataset serves: 2009-2024.');
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// #62 — no error says the same thing twice
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Words too common to make two clauses one statement. "no" stays a content word: "No county
+ * matched" and "No county named" open the same miss.
+ */
+const STOPWORDS = new Set([
+  'a',
+  'an',
+  'and',
+  'are',
+  'as',
+  'at',
+  'be',
+  'by',
+  'for',
+  'from',
+  'in',
+  'is',
+  'it',
+  'its',
+  'of',
+  'on',
+  'or',
+  'so',
+  'that',
+  'the',
+  'this',
+  'to',
+  'with',
+]);
+
+const tokensOf = (text: string) =>
+  text
+    .toLowerCase()
+    .split(/\s+/)
+    .map((token) => token.replace(/^[^\w/]+|[^\w/]+$/g, ''))
+    .filter(Boolean);
+
+const clausesOf = (text: string) => text.split(/(?<=[.;!?])\s+|\s+—\s+/).filter(Boolean);
+
+const contentTokensOf = (clause: string) =>
+  new Set(tokensOf(clause).filter((token) => !STOPWORDS.has(token)));
+
+/** Year runs (`2012-2023`) and comma lists of three or more items, each as a set of its items. */
+const valueListsOf = (text: string): Array<Set<string>> => {
+  const runs = (text.match(/\b\d{4}-\d{4}\b/g) ?? []).map((run) => new Set([run]));
+  const item = String.raw`(?:"[^"]*"|[\w/.-]+)`;
+  const lists =
+    text.match(new RegExp(`${item}(?:, ${item})+(?:,? (?:and|or) ${item})?`, 'g')) ?? [];
+  return [
+    ...runs,
+    ...lists
+      .map(
+        (list) =>
+          new Set(list.split(/,\s*(?:and\s+|or\s+)?|\s+(?:and|or)\s+/).map((v) => v.trim())),
+      )
+      .filter((set) => set.size >= 3),
+  ];
+};
+
+/** The longest run of consecutive tokens two token lists share. */
+const longestSharedRun = (a: string[], b: string[]): string[] => {
+  let best: string[] = [];
+  const lengths = Array.from({ length: a.length + 1 }, () =>
+    new Array<number>(b.length + 1).fill(0),
+  );
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      if (a[i - 1] !== b[j - 1]) continue;
+      const length = (lengths[i - 1]?.[j - 1] ?? 0) + 1;
+      (lengths[i] as number[])[j] = length;
+      if (length > best.length) best = a.slice(i - length, i);
+    }
+  }
+  return best;
+};
+
+/**
+ * Every way an error's message and its recovery hint repeat each other, empty when they do not:
+ * a tool both name (the step stated twice), a value list both carry, a run of four or more words
+ * both contain, or a clause of three or more content words of which 60% sit inside a clause of
+ * the other (a diagnosis or a step restated in other words).
+ */
+const repeatsBetween = (message: string, hint: string): string[] => {
+  const found: string[] = [];
+
+  const toolsIn = (text: string) => new Set(text.match(/\bcensus_[a-z_]+/g) ?? []);
+  const hintTools = toolsIn(hint);
+  for (const tool of toolsIn(message)) if (hintTools.has(tool)) found.push(`both name ${tool}`);
+
+  for (const list of valueListsOf(message)) {
+    for (const other of valueListsOf(hint)) {
+      const shared = [...list].filter((value) => other.has(value));
+      if (shared.length === list.size || shared.length >= 3) {
+        found.push(`both list ${shared.join(', ')}`);
+      }
+    }
+  }
+
+  const run = longestSharedRun(tokensOf(message), tokensOf(hint));
+  if (run.length >= 4) found.push(`both say "${run.join(' ')}"`);
+
+  for (const a of clausesOf(message)) {
+    for (const b of clausesOf(hint)) {
+      const [small, large] = [contentTokensOf(a), contentTokensOf(b)].sort(
+        (x, y) => x.size - y.size,
+      );
+      if (!small || !large || small.size < 3) continue;
+      const inside = [...small].filter((token) => large.has(token)).length;
+      if (inside / small.size >= 0.6) found.push(`"${a}" restates "${b}"`);
+    }
+  }
+
+  return found;
+};
+
+describe('repeatsBetween (the detector the sweep below runs)', () => {
+  it.each([
+    [
+      'Unknown dataset: "bogus". Use census_list_datasets to see valid dataset codes.',
+      'Call census_list_datasets to discover valid dataset codes like acs/acs5.',
+    ],
+    [
+      'acs/acs5 cannot be queried for 1999. Years available: 2009-2024.',
+      'Retry with a year acs/acs5 serves: 2009-2024.',
+    ],
+    [
+      "Census API returned HTTP 400 for acs/acs5 (2024). Upstream: error: invalid 'for' argument",
+      "The Census API rejected this request rather than failing transiently: error: invalid 'for' argument. Change the query.",
+    ],
+    [
+      'No county matched "Chatham County, WA".',
+      'No county named "Chatham County" exists in WA — check the spelling.',
+    ],
+    [
+      'Address "1 Main St, Faketown, WA 98999" could not be geocoded. Verify the address format and include a ZIP code.',
+      'Include a full address with ZIP code (e.g., "1600 Pennsylvania Ave NW, Washington, DC 20500").',
+    ],
+    [
+      'Census API key is invalid or missing. Set CENSUS_API_KEY and restart.',
+      'Set the CENSUS_API_KEY environment variable and restart the server.',
+    ],
+  ])('flags %j', (message, hint) => {
+    expect(repeatsBetween(message, hint)).not.toEqual([]);
+  });
+
+  it.each([
+    [
+      'Unknown dataset: "bogus".',
+      'Call census_list_datasets to discover valid dataset codes like acs/acs5.',
+    ],
+    ['acs/acs5 cannot be queried for 1999.', 'Retry with a year this dataset serves: 2009-2024.'],
+    [
+      'No data returned for state in acs/acs5 (2024).',
+      'Confirm the FIPS codes exist in acs/acs5 (2024) — census_resolve_geography returns them.',
+    ],
+  ])('passes %j', (message, hint) => {
+    expect(repeatsBetween(message, hint)).toEqual([]);
+  });
+});
+
+describe('no error repeats itself between its message and its recovery hint (#62)', () => {
+  type Definition = (typeof allToolDefinitions)[number];
+
+  beforeEach(() => {
+    initGeographyService();
+  });
+
+  interface Scenario {
+    /** Drive retry backoffs with fake timers — the failure is one `withRetry` retries. */
+    backoff?: boolean;
+    input: Record<string, unknown>;
+    label: string;
+    /** The `data.reason` the call fails with; `undefined` for a reasonless validation error. */
+    reason: string | undefined;
+    serve?: () => void;
+    tool: Definition;
+  }
+
+  const tool = (name: string) => {
+    const found = allToolDefinitions.find((definition) => definition.name === name);
+    if (!found) throw new Error(`no tool ${name}`);
+    return found;
+  };
+
+  const plain = (status: number, body: string) =>
+    new Response(body, { status, headers: { 'content-type': 'text/plain' } });
+  const htmlPage = (body = 'Maintenance') =>
+    new Response(`<!DOCTYPE html><html><body>${body}</body></html>`, {
+      status: 200,
+      headers: { 'content-type': 'text/html' },
+    });
+  const noContent = () => new Response(null, { status: 204 });
+
+  /** A route for one exact path, ahead of every route already registered. */
+  const override = (path: string, respond: (url: URL) => Body) => {
+    routes.unshift({ match: (u) => u.pathname === path, respond });
+  };
+
+  /** Rows for every geography, one per record, each requested column filled. */
+  const answer =
+    (geoColumn: string, geos: string[], records: Array<Record<string, string>> = [{}]) =>
+    (url: URL): Body => {
+      const header = getList(url);
+      return [
+        [...header, geoColumn],
+        ...geos.flatMap((geo) =>
+          records.map((record) => [
+            ...header.map((h) => (h === 'NAME' ? `Place ${geo}` : (record[h] ?? '100'))),
+            geo,
+          ]),
+        ),
+      ];
+    };
+
+  const serveAcs = () => {
+    serveMetadata('acs/acs5', 2024, acsVariables);
+    routes.push({
+      match: (u) => u.pathname === '/data/2024/acs/acs5/groups.json',
+      respond: () => ({ groups: [] }),
+    });
+    serveData('acs/acs5', 2024, answer('state', ['53', '06']));
+  };
+
+  /** A geography.json that publishes more levels than a message spells out. */
+  const serveManyLevels = () => {
+    override('/data/2024/acs/acs5/geography.json', () => ({
+      fips: Array.from({ length: 13 }, (_, i) => ({
+        name: `level ${i}`,
+        geoLevelDisplay: `9${i}`,
+      })),
+    }));
+    serveAcs();
+  };
+
+  /** A geography.json whose county subdivision needs a county and offers no wildcard for it. */
+  const serveSubdivisions = () => {
+    override('/data/2024/acs/acs5/geography.json', () => ({
+      fips: [
+        { name: 'state', geoLevelDisplay: '040' },
+        { name: 'county', geoLevelDisplay: '050', requires: ['state'] },
+        { name: 'county subdivision', geoLevelDisplay: '060', requires: ['state', 'county'] },
+      ],
+    }));
+    serveAcs();
+  };
+
+  const cbpVariables = {
+    ESTAB: { label: 'Number of establishments', predicateType: 'int', group: 'CB2300CBP' },
+    NAICS2017: {
+      label: 'Meaning of NAICS code',
+      required: 'default displayed',
+      predicateType: 'string',
+      values: { item: { '00': 'Total for all sectors' } },
+    },
+    EMPSZES: {
+      label: 'Employment size of establishments code',
+      required: 'default displayed',
+      predicateType: 'string',
+    },
+  };
+  const serveCbp = () => serveMetadata('cbp', 2023, cbpVariables);
+
+  const charvVariables = {
+    POP: { label: 'Population', predicateType: 'int' },
+    MONTH: { label: 'Vintage Month', predicateType: 'int', attributes: 'MONTH_DESC' },
+  };
+  const serveCharv = () => {
+    serveMetadata('pep/charv', 2023, charvVariables);
+    serveData(
+      'pep/charv',
+      2023,
+      answer(
+        'state',
+        ['53', '06'],
+        [
+          { MONTH: '4', MONTH_DESC: 'April' },
+          { MONTH: '7', MONTH_DESC: 'July' },
+        ],
+      ),
+    );
+  };
+
+  const tigerweb = (respond: (url: URL) => Body = () => ({ features: [] })) => {
+    routes.push({ match: (u) => u.hostname === 'tigerweb.geo.census.gov', respond });
+  };
+  const geocoderMisses = () => {
+    routes.push({
+      match: (u) => u.hostname === 'geocoding.geo.census.gov',
+      respond: () => ({ result: { addressMatches: [] } }),
+    });
+  };
+  const twoWashingtonCounties = (url: URL): Body =>
+    url.pathname.includes('State_County/MapServer/1')
+      ? {
+          features: [
+            {
+              attributes: {
+                NAME: 'Washington County',
+                BASENAME: 'Washington',
+                STATE: '05',
+                COUNTY: '143',
+              },
+            },
+            {
+              attributes: {
+                NAME: 'Washington County',
+                BASENAME: 'Washington',
+                STATE: '51',
+                COUNTY: '191',
+              },
+            },
+          ],
+        }
+      : { features: [] };
+
+  const fiftyCodes = Array.from(
+    { length: 50 },
+    (_, i) => `B99999_${String(i + 1).padStart(3, '0')}E`,
+  );
+  const CBSA = 'metropolitan statistical area/micropolitan statistical area';
+
+  const query = tool('census_query_data');
+  const compare = tool('census_compare_geographies');
+  const atState = { geography_level: 'state', geography_fips: '53' };
+
+  const scenarios: Scenario[] = [
+    // census_search_variables
+    ...(['bogus', 'profile'] as const).map((dataset) => ({
+      tool: tool('census_search_variables'),
+      reason: 'dataset_not_found',
+      label: `dataset "${dataset}"`,
+      input: { query: 'income', dataset },
+    })),
+    {
+      tool: tool('census_search_variables'),
+      reason: 'year_not_available',
+      label: 'a year acs/acs5 does not serve',
+      input: { query: 'income', year: 1999 },
+    },
+    {
+      tool: tool('census_search_variables'),
+      reason: 'variables_unavailable',
+      label: 'variables.json answered as HTML',
+      input: { query: 'income' },
+      serve: () => override('/data/2024/acs/acs5/variables.json', () => htmlPage()),
+      backoff: true,
+    },
+    {
+      tool: tool('census_search_variables'),
+      reason: 'upstream_error',
+      label: 'variables.json rejected with a 400',
+      input: { query: 'income' },
+      serve: () =>
+        override('/data/2024/acs/acs5/variables.json', () =>
+          plain(400, 'error: unsupported request'),
+        ),
+    },
+
+    // census_get_variable
+    {
+      tool: tool('census_get_variable'),
+      reason: 'variable_not_found',
+      label: 'a code no dataset publishes',
+      input: { variables: ['X99_001E'] },
+      serve: serveAcs,
+    },
+    {
+      tool: tool('census_get_variable'),
+      reason: 'dataset_not_found',
+      label: 'dataset "bogus"',
+      input: { variables: ['B19013_001E'], dataset: 'bogus' },
+    },
+    {
+      tool: tool('census_get_variable'),
+      reason: 'year_not_available',
+      label: 'a year acs/acs5 does not serve',
+      input: { variables: ['B19013_001E'], year: 1999 },
+    },
+    {
+      tool: tool('census_get_variable'),
+      reason: 'variables_unavailable',
+      label: 'an attribute record that cannot be fetched',
+      input: { variables: ['B19013_001EA'] },
+      serve: () => {
+        override('/data/2024/acs/acs5/variables/B19013_001EA.json', () =>
+          plain(503, 'unavailable'),
+        );
+        serveAcs();
+      },
+      backoff: true,
+    },
+    {
+      tool: tool('census_get_variable'),
+      reason: 'upstream_error',
+      label: 'variables.json failing with a 503',
+      input: { variables: ['B19013_001E'] },
+      serve: () => override('/data/2024/acs/acs5/variables.json', () => plain(503, 'unavailable')),
+      backoff: true,
+    },
+
+    // census_list_geographies
+    {
+      tool: tool('census_list_geographies'),
+      reason: 'dataset_not_found',
+      label: 'a blank required dataset',
+      input: { dataset: ' ' },
+    },
+    {
+      tool: tool('census_list_geographies'),
+      reason: 'year_not_available',
+      label: 'geography.json answered 404 for a listed year',
+      input: { dataset: 'acs/acs5' },
+      serve: () => override('/data/2024/acs/acs5/geography.json', () => plain(404, 'Not Found')),
+    },
+    {
+      tool: tool('census_list_geographies'),
+      reason: 'year_not_available',
+      label: 'a year acs/acs5 does not serve',
+      input: { dataset: 'acs/acs5', year: 1999 },
+      serve: () => override('/data/1999/acs/acs5/geography.json', () => plain(404, 'Not Found')),
+    },
+    {
+      tool: tool('census_list_geographies'),
+      reason: 'upstream_error',
+      label: 'geography.json rejected with a 400',
+      input: { dataset: 'acs/acs5' },
+      serve: () =>
+        override('/data/2024/acs/acs5/geography.json', () => plain(400, 'error: bad request')),
+    },
+
+    // census_list_predicate_values
+    {
+      tool: tool('census_list_predicate_values'),
+      reason: 'dataset_not_found',
+      label: 'a blank required dataset',
+      input: { dataset: ' ', predicate: 'NAICS2017' },
+    },
+    {
+      tool: tool('census_list_predicate_values'),
+      reason: 'year_not_available',
+      label: 'a year cbp does not serve',
+      input: { dataset: 'cbp', year: 2009, predicate: 'NAICS2017' },
+    },
+    {
+      tool: tool('census_list_predicate_values'),
+      reason: 'predicate_not_supported',
+      label: 'a code cbp does not define',
+      input: { dataset: 'cbp', predicate: 'FOO' },
+      serve: serveCbp,
+    },
+    {
+      tool: tool('census_list_predicate_values'),
+      reason: 'not_a_filter_dimension',
+      label: 'a measure, not a dimension',
+      input: { dataset: 'cbp', predicate: 'ESTAB' },
+      serve: serveCbp,
+    },
+    {
+      tool: tool('census_list_predicate_values'),
+      reason: 'no_values',
+      label: 'a dimension the data endpoint enumerates as empty',
+      input: { dataset: 'cbp', predicate: 'EMPSZES' },
+      serve: () => {
+        serveCbp();
+        serveData('cbp', 2023, noContent);
+      },
+    },
+    {
+      tool: tool('census_list_predicate_values'),
+      reason: 'upstream_error',
+      label: 'the enumeration rejected with a 400',
+      input: { dataset: 'cbp', predicate: 'EMPSZES' },
+      serve: () => {
+        serveCbp();
+        serveData('cbp', 2023, () => plain(400, "error: unknown predicate variable: 'X'"));
+      },
+    },
+    {
+      tool: tool('census_list_predicate_values'),
+      reason: 'variables_unavailable',
+      label: 'variables.json answered as HTML',
+      input: { dataset: 'cbp', predicate: 'EMPSZES' },
+      serve: () => override('/data/2023/cbp/variables.json', () => htmlPage()),
+      backoff: true,
+    },
+
+    // census_resolve_geography
+    ...(
+      [
+        [
+          'a county miss in a named state',
+          { name: 'Chatham County, WA', geography_type: 'county' },
+        ],
+        ['an auto-detected miss in a named state', { name: 'Nonexistent Place XYZ, WA' }],
+        ['a miss with no state', { name: 'Nonexistent Place XYZ' }],
+        [
+          'a county-scoped miss',
+          { name: 'Nowhere County, WA', geography_type: 'county', county_fips: '033' },
+        ],
+        ['a borough asked for as a place', { name: 'Brooklyn, NY', geography_type: 'place' }],
+        ['a borough ruled out by its county scope', { name: 'Brooklyn, NY', county_fips: '061' }],
+        ['an economic place miss', { name: 'Krupp, WA', geography_type: 'economic place' }],
+        ['a statistical area miss', { name: 'Nowhere-Else, CO', geography_type: CBSA }],
+        ['a ZIP with no ZCTA', { name: '98111' }],
+        [
+          'a name sent to the ZCTA level',
+          { name: 'Seattle', geography_type: 'zip code tabulation area' },
+        ],
+        ['an address with a ZIP', { name: '99999 Nonexistent Boulevard, Faketown, WA 98999' }],
+        ['an address without a ZIP', { name: '99999 Nonexistent Boulevard, Faketown, WA' }],
+      ] as const
+    ).map(([label, input]) => ({
+      tool: tool('census_resolve_geography'),
+      reason: 'no_match',
+      label,
+      input,
+      serve: () => {
+        tigerweb();
+        geocoderMisses();
+      },
+    })),
+    {
+      tool: tool('census_resolve_geography'),
+      reason: 'ambiguous_name',
+      label: 'a county name two states share',
+      input: { name: 'Washington County' },
+      serve: () => tigerweb(twoWashingtonCounties),
+    },
+    {
+      tool: tool('census_resolve_geography'),
+      reason: 'county_scope_unsupported',
+      label: 'county_fips on a state',
+      input: { name: 'California', county_fips: '001' },
+    },
+    {
+      tool: tool('census_resolve_geography'),
+      reason: 'resolution_unavailable',
+      label: 'TIGERweb answering with an error',
+      input: { name: 'Seattle, WA' },
+      serve: () => tigerweb(() => ({ error: { message: 'Unable to complete operation.' } })),
+      backoff: true,
+    },
+    {
+      tool: tool('census_resolve_geography'),
+      reason: undefined,
+      label: 'a blank name',
+      input: { name: '   ' },
+    },
+
+    // census_query_data and census_compare_geographies share most of their failures.
+    ...[query, compare].flatMap((definition): Scenario[] => {
+      const base =
+        definition === query
+          ? { variables: ['B19013_001E'], ...atState }
+          : { variables: ['B19013_001E'], geography_level: 'state' };
+      const atLevel = (geography_level: string) =>
+        definition === query
+          ? { variables: ['B19013_001E'], geography_level, geography_fips: '*' }
+          : { variables: ['B19013_001E'], geography_level };
+      const scoped =
+        definition === query
+          ? { ...atLevel('county subdivision'), parent_fips: '53' }
+          : { ...atLevel('county subdivision'), within: '53' };
+      const parented =
+        definition === query ? { ...base, parent_fips: '06' } : { ...base, within: '06' };
+      return [
+        {
+          tool: definition,
+          reason: 'dataset_not_found',
+          label: 'dataset "bogus"',
+          input: { ...base, dataset: 'bogus' },
+        },
+        {
+          tool: definition,
+          reason: 'dataset_not_found',
+          label: 'dataset "profile"',
+          input: { ...base, dataset: 'profile' },
+        },
+        {
+          tool: definition,
+          reason: 'year_not_available',
+          label: 'a year acs/acs5 does not serve',
+          input: { ...base, year: 1999 },
+        },
+        {
+          tool: definition,
+          reason: 'missing_api_key',
+          label: 'the Census API refusing the key',
+          input: base,
+          serve: () => {
+            serveMetadata('acs/acs5', 2024, acsVariables);
+            serveData('acs/acs5', 2024, () => htmlPage('Invalid Key — see key_signup'));
+          },
+        },
+        {
+          tool: definition,
+          reason: 'variable_not_found',
+          label: 'a code the Census API rejects as unknown',
+          input: { ...base, variables: ['X99_001E'] },
+          serve: () => {
+            serveMetadata('acs/acs5', 2024, acsVariables);
+            serveData('acs/acs5', 2024, () => plain(400, "error: unknown variable 'X99_001E'"));
+          },
+        },
+        {
+          tool: definition,
+          reason: 'variables_unavailable',
+          label: 'variables.json answered as HTML',
+          input: base,
+          serve: () => {
+            override('/data/2024/acs/acs5/variables.json', () => htmlPage());
+            serveAcs();
+          },
+          backoff: true,
+        },
+        {
+          tool: definition,
+          reason: 'geography_not_supported',
+          label: 'a level outside a short list',
+          input: atLevel('place'),
+          serve: serveAcs,
+        },
+        {
+          tool: definition,
+          reason: 'geography_not_supported',
+          label: 'a level outside a long list',
+          input: atLevel('place'),
+          serve: serveManyLevels,
+        },
+        {
+          tool: definition,
+          reason: 'parent_required',
+          label: 'a county subdivision with no county',
+          input: scoped,
+          serve: serveSubdivisions,
+        },
+        {
+          tool: definition,
+          reason: 'parent_not_accepted',
+          label: 'a state with a parent',
+          input: parented,
+          serve: serveAcs,
+        },
+        {
+          tool: definition,
+          reason: 'too_many_variables',
+          label: 'fifty codes',
+          input: {
+            ...base,
+            variables: fiftyCodes,
+            ...(definition === compare && { sort_by: fiftyCodes[0] }),
+          },
+          serve: serveAcs,
+        },
+        {
+          tool: definition,
+          reason: 'predicate_not_supported',
+          label: 'a predicate the dataset does not define',
+          input: { ...base, predicates: { FOO: '1' } },
+          serve: serveAcs,
+        },
+        {
+          tool: definition,
+          reason: 'no_data',
+          label: 'a query that matches nothing',
+          input: base,
+          serve: () => {
+            serveMetadata('acs/acs5', 2024, acsVariables);
+            serveData('acs/acs5', 2024, noContent);
+          },
+        },
+        {
+          tool: definition,
+          reason: 'upstream_error',
+          label: 'a query the Census API rejects',
+          input: base,
+          serve: () => {
+            serveMetadata('acs/acs5', 2024, acsVariables);
+            serveData('acs/acs5', 2024, () => plain(400, "error: invalid 'for' argument"));
+          },
+        },
+        {
+          tool: definition,
+          reason: 'upstream_error',
+          label: 'a data response that is an HTML page',
+          input: base,
+          serve: () => {
+            serveMetadata('acs/acs5', 2024, acsVariables);
+            serveData('acs/acs5', 2024, () => htmlPage());
+          },
+          backoff: true,
+        },
+        {
+          tool: definition,
+          reason: undefined,
+          label: 'only blank codes',
+          input: { ...base, variables: ['  '] },
+        },
+      ];
+    }),
+    {
+      tool: compare,
+      reason: 'sort_by_not_requested',
+      label: 'a sort_by outside the variables',
+      input: { variables: ['B19013_001E'], geography_level: 'state', sort_by: 'B01003_001E' },
+    },
+    {
+      tool: compare,
+      reason: 'ambiguous_rows',
+      label: 'two records per state',
+      input: { variables: ['POP'], geography_level: 'state', dataset: 'pep/charv' },
+      serve: serveCharv,
+    },
+    {
+      tool: compare,
+      reason: 'no_data',
+      label: 'a geographies filter that matches no row',
+      input: { variables: ['B19013_001E'], geography_level: 'state', geographies: ['99'] },
+      serve: serveAcs,
+    },
+
+    // Tables that split POPGROUP groups between them (#54, #68).
+    {
+      tool: query,
+      reason: 'no_data',
+      label: 'a dec/ddhcb table that does not publish the group there',
+      input: { ...inWashington, variables: ['T03001_001N'], predicates: { POPGROUP: '1002' } },
+      serve: serveDdhcb,
+    },
+    {
+      tool: query,
+      reason: 'no_data',
+      label: 'a dec/ddhcb request whose first-listed table lacks the group',
+      input: {
+        ...inWashington,
+        variables: ['T04002_004N', 'T03001_001N'],
+        predicates: { POPGROUP: '3910' },
+      },
+      serve: serveDdhcb,
+    },
+    {
+      tool: query,
+      reason: 'no_data',
+      label: 'a dec/ddhca sex-by-age table that does not publish the group',
+      input: {
+        dataset: 'dec/ddhca',
+        geography_level: 'us',
+        geography_fips: '1',
+        variables: ['T02003_001N'],
+        predicates: { POPGROUP: '1360' },
+      },
+      serve: serveDdhca,
+    },
+    {
+      tool: compare,
+      reason: 'no_data',
+      label: 'a dec/ddhcb comparison no county publishes the group in',
+      input: {
+        dataset: 'dec/ddhcb',
+        variables: ['T03002_002N'],
+        geography_level: 'county',
+        within: '53',
+        predicates: { POPGROUP: '1360' },
+      },
+      serve: serveDdhcb,
+    },
+    {
+      tool: compare,
+      reason: 'no_data',
+      label: 'a dec/ddhcb geographies filter that matches no row',
+      input: {
+        dataset: 'dec/ddhcb',
+        variables: ['T03004_002N'],
+        geography_level: 'county',
+        within: '53',
+        predicates: { POPGROUP: '1002' },
+        geographies: ['53001'],
+      },
+      serve: serveDdhcb,
+    },
+
+    // no_values names within_naics only when the call set it.
+    {
+      tool: tool('census_list_predicate_values'),
+      reason: 'no_values',
+      label: 'an industry-scoped enumeration that came back empty',
+      input: { dataset: 'ecnbasic', predicate: 'TAXSTAT', within_naics: '541990' },
+      serve: () => {
+        serveMetadata('ecnbasic', 2022, {
+          ESTAB: { label: 'Number of establishments', predicateType: 'int', group: 'EC2200BASIC' },
+          NAICS2022: {
+            label: '2022 NAICS code',
+            required: 'default displayed',
+            predicateType: 'string',
+            values: { item: { '00': 'Total for all sectors' } },
+          },
+          TAXSTAT: {
+            label: 'Tax status code',
+            required: 'default displayed',
+            predicateType: 'string',
+            attributes: 'TAXSTAT_LABEL',
+          },
+        });
+        serveData('ecnbasic', 2022, noContent);
+      },
+    },
+    {
+      tool: tool('census_list_predicate_values'),
+      reason: 'no_values',
+      label: 'a value map that kept no published code',
+      input: { dataset: 'dec/ddhca', predicate: 'POPGROUP' },
+      serve: () => {
+        serveMetadata('dec/ddhca', 2020, {
+          T01001_001N: { label: ' !!Total', predicateType: 'int', group: 'T01001' },
+          POPGROUP: {
+            label: 'Race/Ethnic Group',
+            required: 'default displayed',
+            predicateType: 'string',
+            values: { item: { '001': 'Total population' } },
+          },
+        });
+        serveData('dec/ddhca', 2020, () => [
+          ['T01001_001N', 'POPGROUP', 'us'],
+          ['191697647', '1002', '1'],
+        ]);
+      },
+    },
+
+    // variable_not_found when a sibling dataset is confirmed to hold the code (#65): the hint
+    // then names that dataset instead of the search step.
+    {
+      tool: tool('census_get_variable'),
+      reason: 'variable_not_found',
+      label: 'a code a sibling dataset holds',
+      input: { variables: ['S1701_C03_001E'] },
+      serve: () => {
+        serveAcs();
+        override('/data/2024/acs/acs5/subject/variables/S1701_C03_001E.json', () => ({
+          name: 'S1701_C03_001E',
+        }));
+      },
+    },
+    {
+      tool: tool('census_get_variable'),
+      reason: 'variable_not_found',
+      label: 'codes a sibling holds, its table holds, and nothing holds',
+      input: { variables: ['S1701_C03_001E', 'S1701_C03_002E', 'X99_001E', 'X98_001E'] },
+      serve: () => {
+        serveAcs();
+        override('/data/2024/acs/acs5/subject/variables/S1701_C03_001E.json', () => ({
+          name: 'S1701_C03_001E',
+        }));
+      },
+    },
+    ...[query, compare].map(
+      (definition): Scenario => ({
+        tool: definition,
+        reason: 'variable_not_found',
+        label: 'a code the Census API rejects and a sibling dataset holds',
+        input:
+          definition === query
+            ? { variables: ['S1701_C03_001E'], ...atState }
+            : { variables: ['S1701_C03_001E'], geography_level: 'state' },
+        serve: () => {
+          serveMetadata('acs/acs5', 2024, acsVariables);
+          serveData('acs/acs5', 2024, () => plain(400, "error: unknown variable 'S1701_C03_001E'"));
+          override('/data/2024/acs/acs5/subject/variables/S1701_C03_001E.json', () => ({
+            name: 'S1701_C03_001E',
+          }));
+        },
+      }),
+    ),
+  ];
+
+  const run = async (scenario: Scenario) => {
+    scenario.serve?.();
+    const pending = runToolContract(scenario.tool as never, scenario.input as never);
+    if (!scenario.backoff) return await pending;
+    await vi.advanceTimersByTimeAsync(300_000);
+    return await pending;
+  };
+
+  it('has a scenario for every reason every tool declares', () => {
+    const covered = new Set(scenarios.map((s) => `${s.tool.name} ${s.reason}`));
+    const declared = allToolDefinitions.flatMap((definition) =>
+      ((definition as { errors?: ReadonlyArray<{ reason: string }> }).errors ?? []).map(
+        (entry) => `${definition.name} ${entry.reason}`,
+      ),
+    );
+
+    expect(declared.filter((key) => !covered.has(key))).toEqual([]);
+  });
+
+  it.each(
+    scenarios.map(
+      (scenario) =>
+        [
+          `${scenario.tool.name} ${scenario.reason ?? '(no reason)'}: ${scenario.label}`,
+          scenario,
+        ] as const,
+    ),
+  )('%s', async (_name, scenario) => {
+    if (scenario.backoff) vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const result = await run(scenario);
+
+      expect(result.isError).toBe(true);
+      const error = errorOf(result);
+      expect(error.data.reason).toBe(scenario.reason);
+      // A reason a tool can fail with is one its contract declares.
+      if (scenario.reason !== undefined) {
+        const declared =
+          (scenario.tool as { errors?: ReadonlyArray<{ reason: string }> }).errors ?? [];
+        expect(declared.map((entry) => entry.reason)).toContain(scenario.reason);
+      }
+
+      const text = textOf(result);
+      const message = text.match(/^Error: (.*)$/m)?.[1];
+      const hint = text.match(/^Recovery: (.*)$/m)?.[1];
+      expect(message).toBe(error.message);
+      expect(hint, 'every failure names a next step').toBeDefined();
+      expect(repeatsBetween(message ?? '', hint ?? '')).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

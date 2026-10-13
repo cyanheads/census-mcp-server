@@ -1,13 +1,15 @@
 /**
  * @fileoverview Tests for GeographyService — TIGERweb layer selection, the
  * place-then-county fallback chain, exact-name preference, and the state
- * abbreviation carried on ambiguous-match candidates.
+ * abbreviation carried on ambiguous-match candidates — plus census_resolve_geography
+ * run through this real service, where its result shape depends on what the service sets.
  * @module tests/services/geography/geography-service.test
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { censusResolveGeography } from '@/mcp-server/tools/definitions/census-resolve-geography.tool.js';
 import {
   getGeographyService,
   initGeographyService,
@@ -309,11 +311,26 @@ describe('GeographyService.resolveGeography — place-then-county fallback', () 
     queue({ features: [] }, { features: [] });
 
     const err = await resolve('Nonexistent Place XYZ, WA').catch((e: unknown) => e);
-    const hint = (err as { data: { recovery: { hint: string } } }).data.recovery.hint;
+    const { message, data } = err as { message: string; data: { recovery: { hint: string } } };
 
-    expect(hint).toContain('WA');
-    expect(hint).toContain('geography_type');
-    expect(hint).not.toContain('Add the state abbreviation');
+    // #62: the parsed place and state are the diagnosis, so the message carries them once.
+    expect(message).toBe('No place or county named "Nonexistent Place XYZ" exists in WA.');
+    expect(data.recovery.hint).toContain('geography_type');
+    expect(data.recovery.hint).not.toContain('WA');
+    expect(data.recovery.hint).not.toContain('Nonexistent');
+    expect(data.recovery.hint).not.toContain('Add the state abbreviation');
+  });
+
+  /** #62's reproduction: the hint used to open by restating the miss the message had stated. */
+  it('states a county miss once, in the message, and keeps only the steps in the hint', async () => {
+    const err = await resolve('Chatham County, WA', 'county').catch((e: unknown) => e);
+    const { message, data } = err as { message: string; data: { recovery: { hint: string } } };
+
+    expect(message).toBe('No county named "Chatham County" exists in WA.');
+    // The level just tried is the miss, so county is not among the levels offered.
+    expect(data.recovery.hint).toBe(
+      'Check the spelling, set geography_type to search a different level (state, place, tract, metropolitan statistical area/micropolitan statistical area, combined statistical area, consolidated city, zip code tabulation area, economic place), or pass a full street address.',
+    );
   });
 
   it('no_match asks for a state abbreviation when the name has none', async () => {
@@ -943,10 +960,11 @@ describe('GeographyService.resolveGeography — county scoping', () => {
     queue({ features: [] });
 
     const err = await resolve('Nowhere County, WA', 'county', '033').catch((e: unknown) => e);
-    const hint = (err as { data: { recovery: { hint: string } } }).data.recovery.hint;
+    const { message, data } = err as { message: string; data: { recovery: { hint: string } } };
 
-    expect(hint).toContain('in county 033');
-    expect(hint).toContain('drop county_fips');
+    expect(message).toBe('No county named "Nowhere County" exists in county 033 of WA.');
+    expect(data.recovery.hint).toContain('drop county_fips');
+    expect(data.recovery.hint).not.toContain('033');
   });
 });
 
@@ -1345,13 +1363,16 @@ describe('GeographyService.resolveGeography — state suffix forms', () => {
     expect(whereClauses()[0]).toMatch(/LIKE '%Omaha-Council Bluffs%'$/i);
   });
 
-  it('builds the no_match hint from the split place and state', async () => {
+  /** #62: the split place and state moved from the hint into the message, which names them once. */
+  it('builds the no_match message from the split place and state', async () => {
     const err = await resolve('Chatham County, Georgia').catch((e: unknown) => e);
+    const { message } = err as { message: string };
 
     expect(err).toMatchObject({ data: { reason: 'no_match' } });
-    expect(hintOf(err)).toContain('"Chatham County"');
-    expect(hintOf(err)).toContain('GA');
-    expect(hintOf(err)).not.toContain('Georgia');
+    expect(message).toContain('named "Chatham County" exists in GA.');
+    expect(message).not.toContain('Georgia');
+    expect(hintOf(err)).not.toContain('Chatham');
+    expect(hintOf(err)).not.toContain('GA');
     expect(hintOf(err)).not.toContain('Add the state abbreviation');
   });
 
@@ -1360,13 +1381,13 @@ describe('GeographyService.resolveGeography — state suffix forms', () => {
     ['Omaha-Council Bluffs, NE-IA', 'Omaha-Council Bluffs', 'NE-IA'],
     ['San Juan, Puerto Rico', 'San Juan', 'PR'],
   ])(
-    'never appends a second state to "%s" in the no_match hint',
+    'never appends a second state to "%s" in the no_match message',
     async (input, placeName, state) => {
       const err = await resolve(input, 'place').catch((e: unknown) => e);
+      const { message } = err as { message: string };
 
-      expect(hintOf(err)).toContain(`"${placeName}"`);
-      expect(hintOf(err)).toContain(state);
-      expect(hintOf(err)).not.toContain(', WA"');
+      expect(message).toBe(`No place named "${placeName}" exists in ${state}.`);
+      expect(hintOf(err)).not.toContain(placeName);
       expect(hintOf(err)).not.toContain('Add the state abbreviation');
     },
   );
@@ -1497,10 +1518,15 @@ describe('GeographyService.resolveGeography — ZIP codes', () => {
       data: { reason: 'no_match', attemptedTypes: [ZCTA] },
     });
     const hint = hintOf(err);
-    expect(hint).toContain('only as a ZIP Code Tabulation Area');
+    // #62: what was checked is the diagnosis; the cbp route is the step.
+    expect((err as { message: string }).message).toBe(
+      'No ZIP Code Tabulation Area (ZCTA) has the code "98111" — it was checked only as a ZCTA, not as a ZIP.',
+    );
     expect(hint).toContain('cbp');
     expect(hint).toContain('geography_fips');
     expect(hint).toContain('"zip code"');
+    expect(hint).not.toContain('98111');
+    expect(hint).not.toContain('only as a ZIP Code Tabulation Area');
     expect(hint).not.toContain(', WA');
     expect(hint).not.toContain('Add the state abbreviation');
     // A ZCTA lookup is an exact code match — there is no spelling variant to retry.
@@ -1871,8 +1897,10 @@ describe('GeographyService.resolveGeography — prior statistical-area names', (
 
     expect(err).toMatchObject({ data: { reason: 'no_match', attemptedTypes: [CBSA] } });
     const hint = hintOf(err);
-    expect(hint).toContain('"Nowhere-Else"');
-    expect(hint).toContain('CO');
+    expect((err as { message: string }).message).toBe(
+      `No ${CBSA} named "Nowhere-Else" covers CO, and none contains its leading city "Nowhere".`,
+    );
+    expect(hint).not.toContain('Nowhere');
     expect(hint).toContain('single city');
     expect(hint).not.toContain('street address');
     expect(hint).not.toContain('geography_type');
@@ -1979,6 +2007,32 @@ describe('GeographyService.resolveGeography — addresses', () => {
     expect(result).not.toHaveProperty('blockGroupFips');
     expect(result).not.toHaveProperty('placeFips');
   });
+
+  /**
+   * #62: the message said to include a ZIP code and the hint said it again — to a caller whose
+   * address already carried one. The message now states the miss alone, and the hint asks for a
+   * ZIP only when the address has none.
+   */
+  it.each([
+    ['99999 Nonexistent Boulevard, Faketown, WA 98999', /^Check the house number and street name/],
+    ['99999 Nonexistent Boulevard, Faketown, WA', /^Add the ZIP code/],
+  ])(
+    'states an unmatched address in the message and the step in the hint: %s',
+    async (address, step) => {
+      queue({ result: { addressMatches: [] } });
+
+      const err = await resolve(address).catch((e: unknown) => e);
+      const { message, data } = err as {
+        message: string;
+        data: { reason: string; recovery: { hint: string } };
+      };
+
+      expect(data.reason).toBe('no_match');
+      expect(message).toBe(`Address "${address}" could not be geocoded.`);
+      expect(data.recovery.hint).toMatch(step);
+      expect(data.recovery.hint).not.toContain(address);
+    },
+  );
 });
 
 describe('GeographyService.resolveGeography — economic places', () => {
@@ -2107,8 +2161,12 @@ describe('GeographyService.resolveGeography — economic places', () => {
       code: JsonRpcErrorCode.NotFound,
       data: { reason: 'no_match', attemptedTypes: ['economic place'] },
     });
+    expect((err as { message: string }).message).toBe(
+      'No 2022 economic place named "Krupp" exists in WA.',
+    );
     expect(hintOf(err)).toContain('2,500');
     expect(hintOf(err)).toContain('Balance of');
+    expect(hintOf(err)).not.toContain('Krupp');
     expect(requestedUrls.some((u) => u.includes('tigerWMS_ACS2022'))).toBe(false);
   });
 
@@ -2120,7 +2178,10 @@ describe('GeographyService.resolveGeography — economic places', () => {
     const err = await resolve('Gone, WA', ECON).catch((e: unknown) => e);
 
     expect(err).toMatchObject({ data: { reason: 'no_match' } });
-    expect(hintOf(err)).toContain('99990');
+    // #62: the place code is stated once, in the message; the hint refers back to it.
+    expect((err as { message: string }).message).toContain('(place code 99990)');
+    expect(hintOf(err)).not.toContain('99990');
+    expect(hintOf(err)).toContain('take the row whose code ends in the place code');
   });
 
   it('fails as resolution_unavailable, never a guessed code, when the county test errors', async () => {
@@ -2156,7 +2217,9 @@ describe('GeographyService.resolveGeography — economic places', () => {
     const err = await resolve('Sunnyslope, WA', ECON).catch((e: unknown) => e);
 
     expect(err).toMatchObject({ data: { reason: 'no_match', attemptedTypes: ['economic place'] } });
-    expect(hintOf(err)).toContain('68785');
+    // #62: the place code is stated once, in the message.
+    expect((err as { message: string }).message).toContain('(place code 68785)');
+    expect(hintOf(err)).not.toContain('68785');
     expect(requestedUrls.some((u) => u.includes(CDPS_2022))).toBe(true);
     expect(requestedUrls.some((u) => u.includes(COUSUBS_2022))).toBe(false);
   });
@@ -2192,5 +2255,550 @@ describe('GeographyService.resolveGeography — economic places', () => {
       data: { reason: 'county_scope_unsupported' },
     });
     expect(requestedUrls).toHaveLength(0);
+  });
+});
+
+describe('GeographyService.resolveGeography — New York City boroughs', () => {
+  const INCORPORATED = 'Places_CouSub_ConCity_SubMCD/MapServer/4';
+  const COUNTIES = 'State_County/MapServer/1';
+
+  const hintOf = (err: unknown) =>
+    (err as { data: { recovery: { hint: string } } }).data.recovery.hint;
+
+  /** `UPPER(NAME) LIKE` clause the service sends for a term, scoped to a state FIPS. */
+  const like = (term: string, stateFips?: string) =>
+    `UPPER(NAME) LIKE '%${term}%'${stateFips ? ` AND STATE='${stateFips}'` : ''}`;
+
+  /** TIGERweb county rows, as the State_County layer returns them for New York State. */
+  const nyCounty = (basename: string, county: string) =>
+    feature({ NAME: `${basename} County`, BASENAME: basename, STATE: '36', COUNTY: county });
+  const nyPlace = (name: string, basename: string, place: string) =>
+    feature({ NAME: name, BASENAME: basename, STATE: '36', PLACE: place });
+
+  /**
+   * The rows TIGERweb holds for these terms in New York State: each borough's county by its legal
+   * name, and the places that only contain one of the names. No place row contains BROOKLYN,
+   * MANHATTAN, STATEN ISLAND, or QUEENS.
+   */
+  const serveNewYork = () => {
+    route(COUNTIES, like('KINGS', '36'), { features: [nyCounty('Kings', '047')] });
+    route(COUNTIES, like('NEW YORK', '36'), { features: [nyCounty('New York', '061')] });
+    route(COUNTIES, like('RICHMOND', '36'), { features: [nyCounty('Richmond', '085')] });
+    route(COUNTIES, like('BRONX', '36'), { features: [nyCounty('Bronx', '005')] });
+    route(COUNTIES, like('QUEENS', '36'), { features: [nyCounty('Queens', '081')] });
+    route(COUNTIES, like('KINGS COUNTY', '36'), { features: [nyCounty('Kings', '047')] });
+    route(INCORPORATED, like('NEW YORK', '36'), {
+      features: [
+        nyPlace('New York Mills village', 'New York Mills', '51011'),
+        nyPlace('New York city', 'New York', '51000'),
+      ],
+    });
+    route(INCORPORATED, like('BRONX', '36'), {
+      features: [nyPlace('Bronxville village', 'Bronxville', '08532')],
+    });
+    route(INCORPORATED, like('RICHMOND', '36'), {
+      features: [nyPlace('Richmondville village', 'Richmondville', '61588')],
+    });
+  };
+
+  /** The places the bare and out-of-state borough names match, as TIGERweb returns them. */
+  const serveOtherStates = () => {
+    const place = (name: string, basename: string, state: string, code: string) =>
+      feature({ NAME: name, BASENAME: basename, STATE: state, PLACE: code });
+    route(INCORPORATED, like('BROOKLYN'), {
+      features: [
+        place('Brooklyn village', 'Brooklyn', '17', '08667'),
+        place('Brooklyn town', 'Brooklyn', '18', '08038'),
+        place('Brooklyn village', 'Brooklyn', '26', '11000'),
+        place('Brooklyn village', 'Brooklyn', '55', '10075'),
+        place('Brooklyn city', 'Brooklyn', '19', '08695'),
+        place('Brooklyn city', 'Brooklyn', '39', '09246'),
+      ],
+    });
+    route(INCORPORATED, like('MANHATTAN'), {
+      features: [
+        place('Manhattan town', 'Manhattan', '30', '47575'),
+        place('Manhattan village', 'Manhattan', '17', '46357'),
+        place('Manhattan city', 'Manhattan', '20', '44250'),
+      ],
+    });
+    route(INCORPORATED, like('MANHATTAN', '20'), {
+      features: [place('Manhattan city', 'Manhattan', '20', '44250')],
+    });
+    route(INCORPORATED, like('BROOKLYN PARK', '27'), {
+      features: [place('Brooklyn Park city', 'Brooklyn Park', '27', '07966')],
+    });
+    route(INCORPORATED, like('BROOKLYN', '39'), {
+      features: [place('Brooklyn city', 'Brooklyn', '39', '09246')],
+    });
+  };
+
+  it.each([
+    ['Queens, NY', 'QUEENS', '081'],
+    ['Bronx, NY', 'BRONX', '005'],
+    ['Richmond, NY', 'RICHMOND', '085'],
+  ])(
+    'resolves "%s", already its county name, with the requests it always sent',
+    async (name, term, county) => {
+      serveNewYork();
+
+      const result = await resolve(name);
+
+      expect(result).toMatchObject({
+        geographyType: 'county',
+        stateFips: '36',
+        fipsSummary: county,
+      });
+      expect(result).not.toHaveProperty('borough');
+      expect(whereClauses()).toEqual([like(term, '36'), like(term, '36'), like(term, '36')]);
+      expect(requestedUrls[2]).toContain(COUNTIES);
+    },
+  );
+
+  it('resolves "Kings County, NY" on the county layer alone, with no borough', async () => {
+    serveNewYork();
+
+    const result = await resolve('Kings County, NY');
+
+    expect(result).toMatchObject({ name: 'Kings County', fipsSummary: '047' });
+    expect(result).not.toHaveProperty('borough');
+    expect(whereClauses()).toEqual([like('KINGS COUNTY', '36')]);
+  });
+
+  it('keeps "New York, NY" on New York city, never querying the county layer', async () => {
+    serveNewYork();
+
+    const result = await resolve('New York, NY');
+
+    expect(result).toMatchObject({ geographyType: 'place', placeFips: '51000' });
+    expect(result).not.toHaveProperty('borough');
+    expect(requestedUrls.some((u) => u.includes(COUNTIES))).toBe(false);
+  });
+
+  it.each([
+    ['Manhattan, KS', 'MANHATTAN', '20', '44250'],
+    ['Brooklyn Park, MN', 'BROOKLYN PARK', '27', '07966'],
+    ['Brooklyn, OH', 'BROOKLYN', '39', '09246'],
+  ])('leaves "%s" outside New York untouched', async (name, term, stateFips, place) => {
+    serveOtherStates();
+
+    const result = await resolve(name);
+
+    expect(result).toMatchObject({ geographyType: 'place', stateFips, placeFips: place });
+    expect(result).not.toHaveProperty('borough');
+    expect(whereClauses()).toEqual([like(term, stateFips), like(term, stateFips)]);
+  });
+
+  it.each([
+    ['Brooklyn', 6],
+    ['Manhattan', 3],
+  ])('keeps a bare "%s" ambiguous among places, with no county query', async (name, count) => {
+    serveOtherStates();
+
+    const err = await resolve(name).catch((e: unknown) => e);
+
+    expect(err).toMatchObject({ data: { reason: 'ambiguous_name' } });
+    expect((err as { data: { candidates: unknown[] } }).data.candidates).toHaveLength(count);
+    expect(whereClauses()).toEqual([like(name.toUpperCase()), like(name.toUpperCase())]);
+  });
+
+  it.each(['Brooklyn, NY', 'Manhattan, NY'])(
+    'never maps "%s" at the place level, so it never reaches New York city',
+    async (name) => {
+      serveNewYork();
+
+      const err = await resolve(name, 'place').catch((e: unknown) => e);
+
+      expect(err).toMatchObject({ data: { reason: 'no_match', attemptedTypes: ['place'] } });
+      expect(requestedUrls.every((u) => !u.includes(COUNTIES))).toBe(true);
+      expect(whereClauses().some((w) => w.includes('NEW YORK') || w.includes('KINGS'))).toBe(false);
+    },
+  );
+
+  it.each([
+    ['Brooklyn, NY', undefined],
+    ['Brooklyn, New York', undefined],
+    ['brooklyn, ny', undefined],
+    ['Brooklyn, NY', 'county'],
+    ['Brooklyn, New York', 'county'],
+    ['brooklyn, ny', 'county'],
+  ] as const)(
+    'resolves "%s" (geography_type %s) to Kings County through its own query term',
+    async (name, type) => {
+      serveNewYork();
+
+      const result = await resolve(name, type);
+
+      expect(result).toEqual({
+        name: 'Kings County',
+        geographyType: 'county',
+        stateFips: '36',
+        countyFips: '047',
+        fipsSummary: '047',
+        borough: 'Brooklyn',
+      });
+      // The county level asks for KINGS in place of BROOKLYN; no respelling retry runs.
+      const county = whereClauses().filter((_, i) => requestedUrls[i]?.includes(COUNTIES));
+      expect(county).toEqual([like('KINGS', '36')]);
+      expect(whereClauses().filter((w) => w.includes('_'))).toEqual([]);
+    },
+  );
+
+  it.each([
+    ['Manhattan, NY', 'NEW YORK', 'New York County', '061', 'Manhattan'],
+    ['Staten Island, NY', 'RICHMOND', 'Richmond County', '085', 'Staten Island'],
+    ['The Bronx, NY', 'BRONX', 'Bronx County', '005', 'The Bronx'],
+    ['Queens borough, NY', 'QUEENS', 'Queens County', '081', 'Queens'],
+    ['Staten Island borough, NY', 'RICHMOND', 'Richmond County', '085', 'Staten Island'],
+    ['Staten  Island, NY', 'RICHMOND', 'Richmond County', '085', 'Staten Island'],
+  ])('resolves "%s" to its county (%s)', async (name, term, countyName, county, borough) => {
+    serveNewYork();
+
+    const result = await resolve(name);
+
+    expect(result).toMatchObject({
+      name: countyName,
+      geographyType: 'county',
+      stateFips: '36',
+      fipsSummary: county,
+      borough,
+    });
+    expect(whereClauses().filter((_, i) => requestedUrls[i]?.includes(COUNTIES))).toEqual([
+      like(term, '36'),
+    ]);
+  });
+
+  it('answers "Queens borough, NY" from the county layer before the place layer is asked', async () => {
+    serveNewYork();
+
+    await resolve('Queens borough, NY');
+
+    expect(requestedUrls).toHaveLength(1);
+    expect(requestedUrls[0]).toContain(COUNTIES);
+  });
+
+  it('resolves "Manhattan, NY" to New York County, never the New York city place', async () => {
+    serveNewYork();
+
+    const result = await resolve('Manhattan, NY');
+
+    expect(result).toMatchObject({ geographyType: 'county', fipsSummary: '061' });
+    expect(result).not.toHaveProperty('placeFips');
+    const placeClauses = whereClauses().filter((_, i) => requestedUrls[i]?.includes('Places_'));
+    expect(placeClauses.some((w) => w.includes('NEW YORK'))).toBe(false);
+  });
+
+  it('keeps the county answer when a place row only contains the borough name', async () => {
+    serveNewYork();
+    route('Places_CouSub_ConCity_SubMCD/MapServer/5', like('BROOKLYN', '36'), {
+      features: [nyPlace('Brooklyn Heights CDP', 'Brooklyn Heights', '10044')],
+    });
+
+    const result = await resolve('Brooklyn, NY');
+
+    expect(result).toMatchObject({ name: 'Kings County', fipsSummary: '047', borough: 'Brooklyn' });
+  });
+
+  it('applies county_fips to the substituted term', async () => {
+    serveNewYork();
+    route(COUNTIES, `${like('KINGS', '36')} AND COUNTY='047'`, {
+      features: [nyCounty('Kings', '047')],
+    });
+
+    const result = await resolve('Brooklyn, NY', undefined, '47');
+
+    expect(result).toMatchObject({ fipsSummary: '047', borough: 'Brooklyn' });
+    expect(whereClauses()).toEqual([`${like('KINGS', '36')} AND COUNTY='047'`]);
+  });
+
+  it('names the county a borough is when a county scope rules it out, after the retries', async () => {
+    serveNewYork();
+
+    const err = await resolve('Brooklyn, NY', undefined, '061').catch((e: unknown) => e);
+
+    expect(err).toMatchObject({ data: { reason: 'no_match', attemptedTypes: ['county'] } });
+    // The substituted term first, then the respelling retry of the name as given.
+    expect(whereClauses()).toEqual([
+      `${like('KINGS', '36')} AND COUNTY='061'`,
+      `${like('BR__KLY_', '36')} AND COUNTY='061'`,
+    ]);
+    expect(hintOf(err)).toContain('Kings County (county 047)');
+    // #62: the miss is the message's; the hint opens on the borough and the step.
+    expect((err as { message: string }).message).toBe(
+      'No county named "Brooklyn" exists in county 061 of NY.',
+    );
+    expect(hintOf(err)).toBe(
+      'It is the New York City borough coextensive with Kings County (county 047), so drop county_fips or change it to 047.',
+    );
+  });
+
+  it.each([
+    ['Brooklyn, NY', 'Kings County (county 047)'],
+    ['Manhattan, NY', 'New York County (county 061)'],
+    ['Staten Island, NY', 'Richmond County (county 085)'],
+  ])('names the county in the place-level no_match hint for "%s"', async (name, county) => {
+    serveNewYork();
+
+    const err = await resolve(name, 'place').catch((e: unknown) => e);
+
+    expect(hintOf(err)).toContain(county);
+    expect(hintOf(err)).toContain('geography_type "county"');
+    expect(hintOf(err)).toMatch(/^It is the New York City borough coextensive with /);
+    expect((err as { message: string }).message).toBe(
+      `No place named "${name.replace(', NY', '')}" exists in NY.`,
+    );
+  });
+
+  it('keeps the place-level no_match hint unchanged outside New York', async () => {
+    const err = await resolve('Staten Island, VT', 'place').catch((e: unknown) => e);
+
+    expect(hintOf(err)).not.toContain('borough');
+    expect(hintOf(err)).not.toContain('Richmond');
+  });
+
+  it.each([
+    ['Bronx, NY', like('BRONX', '36')],
+    ['The Bronx, NY', like('THE BRONX', '36')],
+  ])(
+    'never settles "%s" at the place level on a place that only contains it',
+    async (name, primary) => {
+      serveNewYork();
+      // The respelling retry finds Bronxville too, so the rule has to hold past the first query.
+      route(INCORPORATED, like('BR__X', '36'), {
+        features: [nyPlace('Bronxville village', 'Bronxville', '08532')],
+      });
+
+      const err = await resolve(name, 'place').catch((e: unknown) => e);
+
+      expect(err).toMatchObject({ data: { reason: 'no_match', attemptedTypes: ['place'] } });
+      expect(hintOf(err)).toContain('Bronx County (county 005)');
+      expect(whereClauses()[0]).toBe(primary);
+      if (name === 'Bronx, NY') expect(whereClauses()).toContain(like('BR__X', '36'));
+    },
+  );
+
+  it('still answers a borough name at the place level from a place named exactly that', async () => {
+    serveNewYork();
+    route(INCORPORATED, like('BRONX', '36'), {
+      features: [
+        nyPlace('Bronxville village', 'Bronxville', '08532'),
+        nyPlace('Bronx village', 'Bronx', '08500'),
+      ],
+    });
+
+    const result = await resolve('Bronx, NY', 'place');
+
+    expect(result).toMatchObject({ name: 'Bronx village', placeFips: '08500' });
+  });
+
+  it('resolves "Bronxville, NY" at the place level to Bronxville village', async () => {
+    route(INCORPORATED, like('BRONXVILLE', '36'), {
+      features: [nyPlace('Bronxville village', 'Bronxville', '08532')],
+    });
+
+    const result = await resolve('Bronxville, NY', 'place');
+
+    expect(result).toMatchObject({ geographyType: 'place', placeFips: '08532' });
+  });
+
+  it('keeps a contains-only place answer for a New York name that is not a borough', async () => {
+    serveNewYork();
+
+    const result = await resolve('Richmond, NY', 'place');
+
+    expect(result).toMatchObject({ name: 'Richmondville village', placeFips: '61588' });
+    expect(whereClauses()).toEqual([like('RICHMOND', '36'), like('RICHMOND', '36')]);
+  });
+
+  it.each([
+    ['Queens, NY', 'QUEENS', 'Queens County (county 081)'],
+    ['Bronx, NY', 'BRONX', 'Bronx County (county 005)'],
+  ])(
+    'never settles "%s" at the economic place level on a place that only contains it',
+    async (name, term, county) => {
+      // Queensbury town (Warren County) and Bronxville village are 2022 economic places.
+      route('Econ/EconPlaces/MapServer/2', like(term, '36'), {
+        features: [
+          term === 'QUEENS'
+            ? feature({
+                NAME: 'Queensbury town',
+                BASENAME: 'Queensbury',
+                STATE: '36',
+                PLACE: '60356',
+              })
+            : feature({
+                NAME: 'Bronxville village',
+                BASENAME: 'Bronxville',
+                STATE: '36',
+                PLACE: '08532',
+              }),
+        ],
+      });
+      route('tigerWMS_ACS2022/MapServer/18', "STATE='36' AND COUSUB='60356'", {
+        features: [feature({ COUNTY: '113' })],
+      });
+
+      const err = await resolve(name, 'economic place').catch((e: unknown) => e);
+
+      expect(err).toMatchObject({
+        data: { reason: 'no_match', attemptedTypes: ['economic place'] },
+      });
+      expect(hintOf(err)).toContain(county);
+    },
+  );
+
+  it('points a place-level borough miss at New York city on the place level', async () => {
+    serveNewYork();
+
+    const err = await resolve('Brooklyn, NY', 'place').catch((e: unknown) => e);
+
+    expect(hintOf(err)).toBe(
+      'It is the New York City borough coextensive with Kings County (county 047): set geography_type "county", or omit it, to resolve the borough as its county; New York City as a whole is "New York, NY" at geography_type "place".',
+    );
+  });
+
+  it('points an economic-place borough miss at New York city on the economic place level', async () => {
+    // ecnbasic 2022 answers only at the economic place level, keyed by its 8-digit code, so the
+    // 5-digit code the place level returns for New York city matches no row there.
+    const err = await resolve('Brooklyn, NY', 'economic place').catch((e: unknown) => e);
+
+    expect(err).toMatchObject({ data: { reason: 'no_match', attemptedTypes: ['economic place'] } });
+    expect(hintOf(err)).toContain('Kings County (county 047)');
+    expect(hintOf(err)).toMatch(
+      /New York City as a whole is "New York, NY" at geography_type "economic place"\.$/,
+    );
+  });
+
+  it('sends a tract-level borough miss in its own county to the county level, keeping the scope', async () => {
+    const err = await resolve('Brooklyn, NY', 'tract', '047').catch((e: unknown) => e);
+
+    expect(err).toMatchObject({ data: { reason: 'no_match', attemptedTypes: ['tract'] } });
+    expect(hintOf(err)).toContain('set geography_type "county"');
+    expect(hintOf(err)).not.toContain('county_fips');
+  });
+
+  it('sends a tract-level borough miss in another county to the county level, rescoped', async () => {
+    const err = await resolve('Brooklyn, NY', 'tract', '061').catch((e: unknown) => e);
+
+    expect(hintOf(err)).toContain('set geography_type "county"');
+    expect(hintOf(err)).toContain('county_fips dropped or set to 047');
+  });
+});
+
+describe('census_resolve_geography over the real GeographyService', () => {
+  const COUNTIES = 'State_County/MapServer/1';
+
+  const textOf = (result: { content: Array<{ type: string; text?: string }> }) =>
+    result.content.map((c) => c.text ?? '').join('\n');
+
+  beforeEach(() => {
+    route(COUNTIES, "UPPER(NAME) LIKE '%KINGS%' AND STATE='36'", {
+      features: [feature({ NAME: 'Kings County', BASENAME: 'Kings', STATE: '36', COUNTY: '047' })],
+    });
+    route(COUNTIES, "UPPER(NAME) LIKE '%QUEENS%' AND STATE='36'", {
+      features: [
+        feature({ NAME: 'Queens County', BASENAME: 'Queens', STATE: '36', COUNTY: '081' }),
+      ],
+    });
+    route(COUNTIES, "UPPER(NAME) LIKE '%KINGS COUNTY%' AND STATE='36'", {
+      features: [feature({ NAME: 'Kings County', BASENAME: 'Kings', STATE: '36', COUNTY: '047' })],
+    });
+    route(
+      'Places_CouSub_ConCity_SubMCD/MapServer/4',
+      "UPPER(NAME) LIKE '%BROOKLYN%' AND STATE='39'",
+      {
+        features: [
+          feature({ NAME: 'Brooklyn city', BASENAME: 'Brooklyn', STATE: '39', PLACE: '09246' }),
+        ],
+      },
+    );
+  });
+
+  it('discloses the borough mapping as a notice on both surfaces', async () => {
+    const result = await runToolContract(censusResolveGeography, { name: 'Brooklyn, NY' });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toEqual({
+      name: 'Kings County',
+      geography_type: 'county',
+      state_fips: '36',
+      county_fips: '047',
+      fips_summary: '047',
+      notice: '"Brooklyn" is the New York City borough coextensive with Kings County.',
+    });
+    const text = textOf(result);
+    expect(text).toContain('## Resolved: Kings County');
+    expect(text).toContain(
+      '"Brooklyn" is the New York City borough coextensive with Kings County.',
+    );
+  });
+
+  it.each([
+    [{ name: 'Queens, NY' }, 'Queens County'],
+    [{ name: 'Kings County, NY' }, 'Kings County'],
+    [{ name: 'Brooklyn, OH' }, 'Brooklyn city'],
+  ])('carries no notice for %j', async (args, resolved) => {
+    const result = await runToolContract(censusResolveGeography, args);
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({ name: resolved });
+    expect(result.structuredContent).not.toHaveProperty('notice');
+    expect(textOf(result)).not.toContain('borough');
+  });
+
+  it('returns the place-level miss with the county named, as an error on both surfaces', async () => {
+    const result = await runToolContract(censusResolveGeography, {
+      name: 'Brooklyn, NY',
+      geography_type: 'place',
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: { code: JsonRpcErrorCode.NotFound, data: { reason: 'no_match' } },
+    });
+    expect(textOf(result)).toContain('Kings County (county 047)');
+  });
+
+  it('names the economic place level for New York city on an economic-place borough miss', async () => {
+    const result = await runToolContract(censusResolveGeography, {
+      name: 'Brooklyn, NY',
+      geography_type: 'economic place',
+    });
+
+    const hint = 'New York City as a whole is "New York, NY" at geography_type "economic place".';
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.NotFound,
+        data: { reason: 'no_match', recovery: { hint: expect.stringContaining(hint) } },
+      },
+    });
+    expect(textOf(result)).toContain(hint);
+    expect(textOf(result)).toContain('Kings County (county 047)');
+  });
+
+  it('misses "Bronx, NY" at the place level rather than answering with Bronxville', async () => {
+    route('Places_CouSub_ConCity_SubMCD/MapServer/4', "UPPER(NAME) LIKE '%BRONX%' AND STATE='36'", {
+      features: [
+        feature({
+          NAME: 'Bronxville village',
+          BASENAME: 'Bronxville',
+          STATE: '36',
+          PLACE: '08532',
+        }),
+      ],
+    });
+
+    const result = await runToolContract(censusResolveGeography, {
+      name: 'Bronx, NY',
+      geography_type: 'place',
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: { code: JsonRpcErrorCode.NotFound, data: { reason: 'no_match' } },
+    });
+    expect(textOf(result)).toContain('Bronx County (county 005)');
+    expect(textOf(result)).not.toContain('08532');
   });
 });

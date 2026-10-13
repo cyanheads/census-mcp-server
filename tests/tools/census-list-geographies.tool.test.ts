@@ -109,8 +109,11 @@ describe('censusListGeographies', () => {
     const ctx = createMockContext({ errors: censusListGeographies.errors });
     const input = censusListGeographies.input.parse({ dataset: 'profile' });
 
+    // #62: the codes to pass are the next step, so the hint names them and the message does not.
     await expect(censusListGeographies.handler(input, ctx)).rejects.toMatchObject({
-      message: expect.stringMatching(/acs\/acs5\/profile and acs\/acs1\/profile/),
+      message:
+        'Unknown dataset: "profile" is the last segment of a dataset code, not a dataset code of its own.',
+      data: { recovery: { hint: 'Pass the full code — acs/acs5/profile or acs/acs1/profile.' } },
     });
   });
 
@@ -123,6 +126,56 @@ describe('censusListGeographies', () => {
       code: JsonRpcErrorCode.ValidationError,
       data: { reason: 'year_not_available' },
     });
+  });
+
+  it('names the years the dataset serves, in the hint alone, for a year outside them', async () => {
+    mockFetchGeographyLevels.mockResolvedValue([]);
+
+    const ctx = createMockContext({ errors: censusListGeographies.errors });
+    const input = censusListGeographies.input.parse({ dataset: 'dec/pl', year: 2015 });
+    await expect(censusListGeographies.handler(input, ctx)).rejects.toMatchObject({
+      message: 'dec/pl cannot be queried for 2015.',
+      data: {
+        reason: 'year_not_available',
+        availableYears: [2000, 2010, 2020],
+        recovery: { hint: 'Retry with a year this dataset serves: 2000, 2010, 2020.' },
+      },
+    });
+  });
+
+  it('names no year list when a year the dataset serves has no geography list', async () => {
+    mockFetchGeographyLevels.mockResolvedValue([]);
+
+    const ctx = createMockContext({ errors: censusListGeographies.errors });
+    const input = censusListGeographies.input.parse({ dataset: 'acs/acs5', year: 2024 });
+    const error = await Promise.resolve(censusListGeographies.handler(input, ctx)).catch(
+      (e: unknown) => e,
+    );
+
+    expect(error).toMatchObject({
+      message: 'No geography data found for acs/acs5 (2024).',
+      data: { reason: 'year_not_available' },
+    });
+    expect((error as { data: Record<string, unknown> }).data).not.toHaveProperty('availableYears');
+  });
+
+  it('counts a level listed under several parent hierarchies once', async () => {
+    mockFetchGeographyLevels.mockResolvedValue([
+      { name: 'state', geoLevelDisplay: '040', requires: [] },
+      { name: 'county', geoLevelDisplay: '050', requires: ['state'] },
+      { name: 'county', geoLevelDisplay: '050', requires: ['combined statistical area'] },
+    ]);
+
+    const ctx = createMockContext({ errors: censusListGeographies.errors });
+    const input = censusListGeographies.input.parse({ dataset: 'acs/acs5' });
+    const result = await censusListGeographies.handler(input, ctx);
+
+    expect(result.geography_levels).toHaveLength(3);
+    expect(getEnrichment(ctx).totalLevels).toBe(2);
+    const text = (censusListGeographies.format!(result)[0] as { text: string }).text;
+    expect(text).toContain(
+      '**2 levels available** — 3 entries, since a level published under more than one parent hierarchy is listed once for each',
+    );
   });
 
   it('assigns example FIPS values for known level names', async () => {

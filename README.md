@@ -29,7 +29,7 @@
 
 ## Overview
 
-U.S. Census Bureau data — datasets, variables, and geography — via the Census Data API, TIGERweb, and the Census Geocoder. Discover datasets and variables, resolve place names or addresses to FIPS codes, and query or rank demographic, economic, and housing estimates across geographies from any MCP client. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
+US Census Bureau demographic, economic, and housing data. Find datasets and variables, resolve place names or addresses to FIPS codes, and query or rank estimates across any set of geographies.
 
 ### Tools
 
@@ -50,101 +50,72 @@ U.S. Census Bureau data — datasets, variables, and geography — via the Censu
 
 ### `census_list_datasets` <sub>tool</sub>
 
-- Returns dataset codes, names, descriptions, and available vintage years
-- Covers ACS5 with its Data Profiles, Subject Tables, and Comparison Profiles; ACS1 with its Data Profiles, Subject Tables, Comparison Profiles, and Selected Population Profiles (`acs/acs1/spp`); ACS 1-Year Supplemental Estimates (`acs/acsse`); Population Estimates; the 2020 Decennial files — Redistricting (P.L. 94-171), DHC (`dec/dhc`), Demographic Profile (`dec/dp`), Supplemental DHC (`dec/sdhc`), DDHC-A (`dec/ddhca`), and DDHC-B (`dec/ddhcb`); County Business Patterns (`cbp`); Economic Census (`ecnbasic`); and Nonemployer Statistics (`nonemp`)
-- Each description names the filter predicates the dataset requires and the geography levels it publishes — both vary by dataset
-- Accepts an optional keyword filter
-- Dataset codes (e.g., `acs/acs5`) are the values to pass to other tools. Every tool ignores their case and takes a two-part code by its last part alone (`acs5` is `acs/acs5`, `pl` is `dec/pl`), echoing the resolved code; three-part codes such as `acs/acs5/profile` must be given in full, and a bare `profile` fails naming the codes that end in it
-- `available_years` is exhaustive, not a sample: any other year fails with `year_not_available` before a request goes out, naming the years that do work. It is narrower than what the Census API hosts — `pep/charv` reaches its 2020-2022 estimates through the `YEAR` filter inside the 2023 vintage, the `cbp`/`nonemp` vintages left out reject the `NAME` column every query here sends, and the Census API answers `acs/acs1/spp` 2008 and 2010 with server errors
+- Returns dataset codes, names, descriptions, and available vintage years, with an optional keyword filter. Covers ACS5 and ACS1 (data profiles, subject tables, comparison profiles, and `acs/acs1/spp`), `acs/acsse`, Population Estimates, the 2020 Decennial files (Redistricting (P.L. 94-171), `dec/dhc`, `dec/dp`, `dec/sdhc`, `dec/ddhca`, `dec/ddhcb`), `cbp`, `ecnbasic`, and `nonemp`
+- Each description names the filter predicates the dataset requires and the geography levels it publishes
+- Dataset codes (e.g., `acs/acs5`) are what the other tools take. Case is ignored and a two-part code works by its last part alone (`acs5`, `pl`); three-part codes such as `acs/acs5/profile` must be given in full
+- `available_years` is exhaustive: any other year fails with `year_not_available`, naming the years that work
 
 ---
 
 ### `census_list_geographies` <sub>tool</sub>
 
-- Returns one row per geography level and parent hierarchy — `geography_level`, whether a parent is required, `required_parent_levels`, and an example FIPS value. A level published under several hierarchies gets a row for each; `totalLevels` counts it once, the same count the data tools give (`acs/acs5` 2024: 65 rows, 43 levels)
-- `geography_level` values are the exact inputs to `geography_level` in `census_query_data` and `census_compare_geographies`
-- `year` defaults to the dataset's latest available vintage
-- `dataset_not_found` when the dataset code is blank or unrecognized; `year_not_available` when it has no geography data for the requested year, naming the years it serves when the year is outside them
+- Returns one row per geography level and parent hierarchy: `geography_level`, whether a parent is required, `required_parent_levels`, and an example FIPS value. `totalLevels` counts each level once
+- `geography_level` values are the exact inputs to `census_query_data` and `census_compare_geographies`; `year` defaults to the latest vintage
+- Fails with `dataset_not_found` or `year_not_available` (naming the years served)
 
 ---
 
 ### `census_search_variables` <sub>tool</sub>
 
-- Whole-word search across label and concept: every query word must match (`rate` never matches "separated"), and when no variable contains them all, the variables with the most words come back with a notice saying so
-- A query that is one variable or table code, in any case, returns that variable — or every variable of the table, in code order — ahead of any keyword match: `B19013` returns `B19013_001E` then `B19013_001M`. A letter-only word such as `state` is read as a code when no keyword matched, and leads the keyword matches only when typed in the code's own uppercase: `STATE` on `dec/dhc` puts the STATE column first, while `state` returns the labels holding the word
-- A code the dataset does not publish gets a notice in place of keyword advice, or of keyword matches on fragments of the code: the sibling dataset confirmed to hold it (`S1701` searched in `acs/acs5` names `acs/acs5/subject`, `CP03_2024_062E` names `acs/acs5/cprofile`), or `census_get_variable` for an attribute column such as `B19013_001EA`
-- Keyword matches rank by where the query appears — the label's last `!!` segment or the whole concept equal to it first, then the phrase in label and concept, label only, concept only — then by fewer `!!` segments, shorter concept, and code, so a table total leads its breakdown rows and an estimate leads its margin of error
-- A column shared across tables, such as `GEO_ID`, is matched on its label only and returned without a concept
-- On ACS datasets, returns estimate (E suffix) and margin-of-error (M suffix) codes together so both can be requested in one query — the ACS comparison profiles and the other families publish no margins of error, and an E-final code there is an ordinary code. A margin's label is the one the Census publishes (`Margin of Error!!Median household income…`), and search matches a margin on its estimate's label, so the two rank side by side
-- Also surfaces the predicate codes a dataset filters on, by keyword (`naics`) or by the code itself (`NAICS2017` in `cbp`)
-- `limit` is an integer from 1 to 100 (default 20) — out-of-range values are rejected, not clamped; `totalMatches` says how many matched before the limit
-- Cache-backed: variables.json is fetched once per dataset+year with a configurable TTL (default 24h)
+- Whole-word search across label and concept: every query word must match, otherwise the closest matches come back with a notice. A variable or table code in any case returns that variable, or the whole table in code order, first (`B19013` returns `B19013_001E` then `B19013_001M`)
+- A code the dataset does not publish gets a notice naming the sibling dataset that holds it (`S1701` in `acs/acs5` points to `acs/acs5/subject`) or `census_get_variable` for an attribute column such as `B19013_001EA`
+- On ACS datasets, estimate (E suffix) and margin-of-error (M suffix) codes come back together; comparison profiles and the other families publish no margins of error. Also finds predicate codes by keyword (`naics`) or code (`NAICS2017` in `cbp`)
+- `limit` is an integer from 1 to 100 (default 20), rejected rather than clamped when out of range; `totalMatches` counts matches before the limit. variables.json is cached per dataset+year (default TTL 24h)
 
 ---
 
 ### `census_get_variable` <sub>tool</sub>
 
-- Accepts one or more variable codes (trimmed and matched regardless of case, then echoed in the dataset's own spelling) and returns metadata in the same order — label, concept, predicate type, and the table's universe when its `groups.json` entry publishes one. If `groups.json` cannot be fetched, the variables still come back, without universe, and a notice names the affected codes and says to retry
-- Resolves annotation and flag columns such as `B19013_001EA` and `EMP_F` from the Census per-variable endpoint, with `attribute_of` naming the column each belongs to and `attribute_type` its kind in upper-snake case (`ANNOTATION`, `FLAG`, `MARGIN_OF_ERROR`), whatever spelling the vintage publishes
-- A column shared across tables, such as `GEO_ID`, carries no concept — its published one joins every table's
-- On ACS datasets, returns `estimate_code`/`moe_code` sibling references, and a margin-of-error code carries its published label with `attribute_of` naming its estimate and `attribute_type` `MARGIN_OF_ERROR`; the comparison profiles and the other families publish no margins of error and carry none of these
-- Also resolves predicate/filter dimension codes (e.g., `NAICS2017`, `SEX`) to confirm a dimension exists in a dataset — `census_list_predicate_values` lists the values it accepts
-- `dataset` defaults to `acs/acs5`, `year` defaults to the dataset's latest available vintage
-- `variable_not_found` when a code isn't defined in the dataset and year; when a lookup confirms a sibling dataset publishes the code, its recovery names that dataset (`DP03_0062E` asked of `acs/acs5` points at `acs/acs5/profile`). The lookup is best effort: it probes at most five tables under one deadline, and some prefixes, such as the decennial `P1`, have no sibling to probe
+- Takes one or more variable codes (case-insensitive) and returns label, concept, predicate type, and the table's universe, in the order given. If `groups.json` can't be fetched, variables come back without universe and a notice says to retry
+- Resolves annotation and flag columns such as `B19013_001EA` and `EMP_F`, with `attribute_of` naming the column each belongs to and `attribute_type` its kind (`ANNOTATION`, `FLAG`, `MARGIN_OF_ERROR`). On ACS datasets it also returns `estimate_code`/`moe_code` sibling references
+- Confirms predicate dimension codes (`NAICS2017`, `SEX`) exist in a dataset; `census_list_predicate_values` lists their values. `dataset` defaults to `acs/acs5` and `year` to the latest vintage
+- `variable_not_found` when a code isn't defined, naming the sibling dataset that publishes it when one is found (`DP03_0062E` in `acs/acs5` points to `acs/acs5/profile`)
 
 ---
 
 ### `census_list_predicate_values` <sub>tool</sub>
 
-- Two routes, picked by where the answer lives: a dimension with a published value list is read from the dataset dictionary, one without is enumerated live by wildcarding it on the data endpoint. `NAICS*` and `POPGROUP` always publish one (thousands of codes — narrow them with `query`); on the current vintages `EMPSZES`, `LFO`, `RCPSZES`, `TAXSTAT`, and `TYPOP` publish none, so the live route is the only place their codes appear
-- A dictionary value list is a classification shared across Census products, not a record of what one dataset serves — `dec/ddhca` declares 5,543 `POPGROUP` codes and publishes 2,996, `cbp` declares 6,694 `NAICS2017` codes and publishes 2,003. The declared list is checked against the dataset's own published rows and the dead codes are dropped; `source` says whether that check ran and the notice says how many were withheld. The check costs one request per cache refresh, two on `dec/ddhcb`, where no single table publishes every group and the tenure tables `T04001` and `T04002` are unioned
-- Keyword `query` matches code and label; results are sorted by code and a truncated list is disclosed rather than passed off as complete (`limit` an integer from 1 to 500, default 50; `totalCount` says how many matched)
-- `ecnbasic` publishes `TAXSTAT` and `TYPOP` per industry, so `within_naics` scopes the enumeration — and the notice says the result is complete for that industry alone
-- Live enumerations are cached per dataset, year, dimension, industry scope, and probe measure
+- Lists the codes a filter dimension accepts, read from the dataset dictionary when it publishes a list and enumerated live otherwise. `NAICS*` and `POPGROUP` have long lists (thousands of codes; narrow with `query`); `EMPSZES`, `LFO`, `RCPSZES`, `TAXSTAT`, and `TYPOP` are live-only
+- Dictionary lists are checked against the rows the dataset actually publishes and unpublished codes are dropped; `source` says whether the check ran and the notice gives the number withheld
+- `query` matches code and label; results are sorted by code, and truncation is disclosed (`limit` an integer from 1 to 500, default 50; `totalCount` counts matches). On `ecnbasic`, `within_naics` scopes `TAXSTAT` and `TYPOP` to one industry
 
 ---
 
 ### `census_resolve_geography` <sub>tool</sub>
 
-- Named places (e.g., "King County, WA") resolve via TIGERweb; street addresses resolve to tract level via Census Geocoder, with the address's `block_group_fips` and incorporated `place_fips` alongside
-- The place level covers incorporated places and census-designated places together ("Bethesda, MD" → Bethesda CDP, flagged `census_designated_place`). A CDP answers a name only when no incorporated place or county has it exactly, so "Paradise, CA" is Paradise town and "Arlington, VA" Arlington County; a CDP's full name ("Arlington CDP, VA") or `geography_type: "place"` reaches it
-- A 5-digit ZIP (or ZIP+4) resolves to its ZIP Code Tabulation Area (`zip code tabulation area`) — the ACS's ZIP-shaped area, not `cbp`'s `zip code` level, which takes the ZIP itself with no resolution
-- The state after a comma can be an abbreviation in either case, a full name ("Chatham County, Georgia"), or a hyphenated list ("NE-IA", scoped by its first state)
-- Auto-detects `geography_type` for state, county, place, tract, and ZIP; metropolitan/micropolitan statistical areas, combined statistical areas, consolidated cities, and economic places are never auto-detected and need an explicit `geography_type`, since their names overlap city names
-- `economic place` returns the 8-digit code `ecnbasic` 2022 publishes a place under — its county, or `000` when it spans counties, then its place code (Seattle `03363000`, Auburn, WA `00003180`)
-- Optional `county_fips` scopes resolution to the county and tract levels only — required when a tract name matches more than one county; `county_scope_unsupported` when paired with any other level or a street address
-- Matching ignores case. A name no level matches is retried with Saint/St. respelled ("Saint Louis, MO") and with accents ignored ("Dona Ana County, NM"); a statistical area is also retried by its leading city, so a name from an earlier delineation ("Denver-Aurora-Lakewood, CO") still resolves
-- A New York City borough with a New York suffix resolves to the county it is coextensive with ("Brooklyn, NY" → Kings County `047`, "Manhattan, NY" → New York County `061`, "Staten Island, NY" → Richmond County `085`), and a `notice` says so; at any other `geography_type` it stays `no_match`, and at `place` and the other levels inside a state the hint names the county
-- Prefers an exactly-named match over a partial one (e.g., "Kansas City, MO" does not resolve to North Kansas City), across levels too ("King, WA" is King County, not Kingston CDP)
-- A name matching more than one geography returns `ambiguous_name`, with every candidate's FIPS code and the state that separates them
-- Returns `state_fips` (→ `parent_fips`) and `fips_summary` (→ `geography_fips`) ready to pass to other tools; a statistical area omits `state_fips` since it can span several states, and a ZCTA omits it because its source layer carries no state
+- Named places (e.g., "King County, WA") resolve via TIGERweb; street addresses resolve to tract level via Census Geocoder, with `block_group_fips` and `place_fips`. A 5-digit ZIP (or ZIP+4) resolves to its ZIP Code Tabulation Area (`zip code tabulation area`)
+- Auto-detects `geography_type` for state, county, place, tract, and ZIP. Metropolitan/micropolitan statistical areas, combined statistical areas, consolidated cities, and economic places need an explicit `geography_type`; `economic place` returns the 8-digit `ecnbasic` code (Seattle `03363000`)
+- The place level includes census-designated places, which answer a name only when no incorporated place or county matches exactly; use the full name ("Arlington CDP, VA") or `geography_type: "place"` to reach one. Optional `county_fips` scopes county and tract resolution (`county_scope_unsupported` for any other level or an address)
+- Matching ignores case, accepts a state abbreviation or full name, and tolerates Saint/St. and accent differences. New York City boroughs resolve to their counties ("Brooklyn, NY" → Kings County `047`) with a `notice`
+- A name matching several geographies returns `ambiguous_name` with every candidate's FIPS code and state. Results carry `state_fips` (→ `parent_fips`) and `fips_summary` (→ `geography_fips`) for the next tool; statistical areas and ZCTAs omit `state_fips`
 
 ---
 
 ### `census_query_data` <sub>tool</sub>
 
-- Requires FIPS codes (use `census_resolve_geography` for place names); `geography_fips: "*"` returns every geography at the level within the parent, and each row carries both `geography_fips` and the nationally-unique `geography_geoid`
-- A wildcard returns up to `limit` rows (default 50, max 500) in GEOID order, and `offset` pages through the rest; `totalCount` and `truncated` say how many rows matched, and the notice names the range returned and the next `offset`. Every row counts, including each `pep/charv` record and each category of a `"*"` predicate
-- Up to 49 variable codes per call, fewer on datasets where label or record columns are added: the Census API accepts 50 columns per request and every query also sends `NAME`. `too_many_variables` states the exact maximum before any request goes out. Codes are case-insensitive and sent in the dataset's own spelling, including the comparison profiles' mixed-case significance columns (`CP03_2024to2019_062SS`). An unknown one is `variable_not_found`; when a lookup confirms a sibling dataset publishes it, the recovery names that dataset (`S1701_C03_001E` asked of `acs/acs5` points at `acs/acs5/subject`)
-- Level and parent are checked against the dataset's own geography metadata before querying — `parent_required` and `parent_not_accepted` name what's missing or unaccepted rather than surfacing a raw Census 400
-- Optional `tract_fips` (exactly 6 digits, with a concrete `county_fips`) scopes a block-group or decennial block query to one tract, so the block group around an address is one call: `block group` `2` in `53`/`033`/`007101`
-- Optional `predicates` map filters the business/`pep`/`dec` datasets and `acs/acs1/spp` (e.g., `{"NAICS2017": "5112"}`); a dimension left unset applies a Census-chosen default — an all-categories total on some datasets, a single category on others — echoed per row in `applied_filters`. Keys are case-insensitive and a blank value counts as omitted; `"*"` returns one row per category, each labelled in `record`
-- A dataset that publishes more than one record per geography (`pep/charv`) returns multiple rows, each carrying a `record` field; pin one with `predicates` (e.g., `{"MONTH": "7"}`)
-- On `dec/ddhca` (`T02001`–`T02003`) and `dec/ddhcb` (`T03001`–`T03004`, `T04001`–`T04002`), each geography publishes a `POPGROUP` group in only one table of a family. A `no_data` hint, and the notice on any result spanning several geographies or tables or setting `POPGROUP` to `"*"`, names the sibling tables to look in, at no extra request
-- ACS sentinel values resolve to the Census's published meanings, a controlled estimate's margin of error reads as `0`, and a median in an open-ended interval is flagged `open_ended`. On `cbp`, `ecnbasic`, and `nonemp`, a value the Census withheld (stored as `0` beside a flag such as `D`) is reported as suppressed with the flag's meaning. A null `estimate` means the value is either suppressed, a text cell (returned under `value`), or genuinely empty
-- Requires `CENSUS_API_KEY`
+- Requires FIPS codes (use `census_resolve_geography` for place names). `geography_fips: "*"` returns every geography at the level within the parent; each row carries `geography_fips` and the nationally unique `geography_geoid`. Wildcards return up to `limit` rows (default 50, max 500) in GEOID order, with `offset` for paging and `totalCount` and `truncated` for the rest
+- Up to 49 variable codes per call, fewer on datasets that add label or record columns (`too_many_variables` states the maximum). Unknown codes fail with `variable_not_found`; level and parent problems fail with `parent_required` or `parent_not_accepted`. Optional `tract_fips` (6 digits, with a concrete `county_fips`) scopes a block-group or decennial block query to one tract
+- Optional `predicates` map filters the business, `pep`, and `dec` datasets and `acs/acs1/spp` (e.g., `{"NAICS2017": "5112"}`). Unset dimensions take a Census default, echoed per row in `applied_filters`; `"*"` returns one row per category, labelled in `record`. `pep/charv` returns several rows per geography, so pin one (e.g., `{"MONTH": "7"}`)
+- ACS sentinel values resolve to their published meanings, and a median in an open-ended interval is flagged `open_ended`. On `cbp`, `ecnbasic`, and `nonemp`, withheld values are reported as suppressed with the flag's meaning. A null `estimate` means suppressed, a text cell (returned under `value`), or empty
+- On `dec/ddhca` and `dec/ddhcb`, a geography's `POPGROUP` group sits in only one table of a family; a `no_data` hint or notice names the sibling tables. Requires `CENSUS_API_KEY`
 
 ---
 
 ### `census_compare_geographies` <sub>tool</sub>
 
-- Ranks all geographies at a level, or a named `geographies` list of GEOIDs/bare level codes, in one call; `within`/`within_county` scope to a state/county, omit for a national comparison
-- Ranks on one variable's value: `sort_by` (default the first code; it must be one of the requested codes, or the call fails with `sort_by_not_requested`), `sort_dir` (default `desc`), and `limit` (an integer from 1 to 500, default 50); `totalCount` reports how many geographies matched before the limit
-- A count ranks by size, not rate — rank a published percentage for a rate, e.g. `S1701_C03_001E` (percent below poverty, `acs/acs5/subject`) or `DP04_0047PE` (percent renter-occupied, `acs/acs5/profile`), both available down to tract
-- Same `predicates` map, variable limit, geography validation, and `applied_filters` default-echoing as `census_query_data`, applied to every geography in the ranking. On a `dec/ddhca` or `dec/ddhcb` table that splits the `POPGROUP` groups with sibling tables, a geography whose group sits in a sibling drops out of the ranking, and the notice names those tables
-- A dataset that publishes more than one record per geography (`pep/charv`), or a `"*"` predicate, fails with `ambiguous_rows` unless `predicates` pins one (e.g., `{"MONTH": "7"}`)
-- Suppressed values carry the same reasons as `census_query_data` and sort to the end in either direction, withheld business values included; a text value has no ordering, so sorting on it leaves rows tied, and the notice says the rows are not ranked
-- Requires `CENSUS_API_KEY`
+- Ranks all geographies at a level, or a named `geographies` list of GEOIDs/bare level codes; `within`/`within_county` scope to a state/county, omit for a national comparison
+- Ranks on one variable: `sort_by` (default the first code; must be a requested code, else `sort_by_not_requested`), `sort_dir` (default `desc`), and `limit` (1 to 500, default 50); `totalCount` counts geographies before the limit. A count ranks by size, not rate, so rank a published percentage for a rate (`S1701_C03_001E` in `acs/acs5/subject`, `DP04_0047PE` in `acs/acs5/profile`)
+- Takes the same `predicates`, variable limit, validation, and `applied_filters` as `census_query_data`; multi-record datasets (`pep/charv`) or a `"*"` predicate fail with `ambiguous_rows` unless `predicates` pins one. Suppressed values sort last with the same reasons, and text values can't be ranked (the notice says so). Requires `CENSUS_API_KEY`
 
 ---
 
@@ -294,7 +265,7 @@ cp .env.example .env
 | `CENSUS_DEFAULT_YEAR` | Default vintage year when no year is specified. | `2024` |
 | `CENSUS_VARIABLE_CACHE_TTL_HOURS` | Hours to cache variables.json per dataset+year in memory. | `24` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
-| `MCP_SESSION_MODE` | HTTP session mode: `stateful`, `stateless`, or `auto`. The server declares `stateless` in `src/index.ts`; set this only to override it. | `stateless` |
+| `MCP_SESSION_MODE` | HTTP session mode: `stateful`, `stateless`, or `auto`. | `stateless` |
 | `MCP_HTTP_PORT` | Port for HTTP server. | `3010` |
 | `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
 | `MCP_LOG_LEVEL` | Log level (`debug`, `info`, `notice`, `warning`, `error`). | `info` |

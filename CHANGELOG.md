@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.3](changelog/0.6.x/0.6.3.md) — 2026-10-25
+
+Framework response formatting and dependency updates.
+
 ## [0.6.2](changelog/0.6.x/0.6.2.md) — 2026-10-13
 
 Adds the dec/ddhcb 2020 dataset, sibling-table and sibling-dataset hints for codes and groups a table does not publish, variable and table code search, and NYC borough resolution; fixes mixed-case comparison-profile columns, Bronx and Queens place matches, and repeated error text.

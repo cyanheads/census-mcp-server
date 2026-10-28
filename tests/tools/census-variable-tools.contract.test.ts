@@ -1626,7 +1626,7 @@ describe('census_list_predicate_values checks dec/ddhcb POPGROUP against both te
     expect(out.notice).toContain('declares 5,545 POPGROUP codes and publishes rows for 2,996');
     const text = textOf(result);
     expect(text).toContain('**totalCount:** 2996');
-    expect(text).toContain('**source:** dataset_dictionary_verified');
+    expect(text).toContain('**source:** `dataset_dictionary_verified`');
     expect(text).toContain('publishes rows for 2,996');
   });
 
@@ -1758,7 +1758,7 @@ describe('census_list_predicate_values checks dec/ddhcb POPGROUP against both te
     const out = predicateValuesOut(result);
     expect(out.source).toBe('dataset_dictionary');
     expect(out.totalCount).toBe(5545);
-    expect(textOf(result)).toContain('**source:** dataset_dictionary');
+    expect(textOf(result)).toContain('**source:** `dataset_dictionary`');
     expect(textOf(result)).toContain('was not possible on this call');
   });
 });

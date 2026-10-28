@@ -1,0 +1,34 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "census-mcp-server",
+  "version": "0.6.3",
+  "description": "Query U.S. Census Bureau data, variables, and geography via MCP. STDIO or Streamable HTTP.",
+  "author": {
+    "name": "Casey Hand",
+    "email": "casey@caseyjhand.com",
+    "url": "https://caseyjhand.com"
+  },
+  "homepage": "https://github.com/cyanheads/census-mcp-server#readme",
+  "repository": "https://github.com/cyanheads/census-mcp-server",
+  "license": "Apache-2.0",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "typescript",
+    "ai",
+    "llm",
+    "bun",
+    "stdio",
+    "streamable-http",
+    "census",
+    "census-bureau",
+    "acs",
+    "american-community-survey",
+    "fips",
+    "geography",
+    "open-data",
+    "government-data",
+    "demographic-data"
+  ]
+}

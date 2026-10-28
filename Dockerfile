@@ -29,6 +29,11 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
 # Copy the rest of the source code
 COPY . .
 
+# The skills a server publishes (`createApp({ skills: 'skills' })`) are read at
+# runtime from the application root. Created when the project has none, so the
+# production stage's copy below holds with or without one.
+RUN mkdir -p skills
+
 # Build the application
 RUN bun run build
 
@@ -125,9 +130,9 @@ ENV NODE_ENV=production
 ARG APP_VERSION
 LABEL org.opencontainers.image.title="census-mcp-server"
 LABEL org.opencontainers.image.description="Query U.S. Census Bureau data, variables, and geography via MCP. STDIO or Streamable HTTP."
-LABEL org.opencontainers.image.source="https://github.com/cyanheads/census-mcp-server"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 LABEL org.opencontainers.image.version="${APP_VERSION}"
+LABEL org.opencontainers.image.source="https://github.com/cyanheads/census-mcp-server"
 
 # The manifest comes from the build context: the deps stage's copy was rewritten
 # by the OTel install, and the runtime reads only its name, version, and type.
@@ -136,12 +141,30 @@ COPY --from=deps /usr/src/app/node_modules ./node_modules
 
 # Copy the compiled application code from the build stage
 COPY --from=build /usr/src/app/dist ./dist
+COPY --from=build /usr/src/app/skills ./skills
+
+# Mirror CLI (MirrorService adopters only — Tier 3, opt-in):
+# Copy your mirror lifecycle scripts and emit a runtime tsconfig so Bun resolves
+# the @/ path alias against ./dist/ rather than ./src/.
+# See the api-mirror skill for the full recipe.
+#
+# COPY --from=build /usr/src/app/scripts/<your>-mirror-init.ts \
+#                   /usr/src/app/scripts/<your>-mirror-refresh.ts \
+#                   /usr/src/app/scripts/<your>-mirror-verify.ts \
+#                   /usr/src/app/scripts/_mirror-context.ts \
+#                   ./scripts/
+# RUN echo '{"compilerOptions":{"baseUrl":".","paths":{"@/*":["./dist/*"]}}}' > tsconfig.json
 
 # The 'oven/bun' image already provides a non-root user named 'bun'.
 # We will use this existing user for enhanced security.
 
 # Create and set permissions for the log directory, assigning ownership to the 'bun' user.
 RUN mkdir -p /var/log/census-mcp-server && chown -R bun:bun /var/log/census-mcp-server
+
+# Writable data dirs for on-disk SQLite stores (catalog index / observations
+# mirror), owned by the runtime user. Mount a volume over either in production.
+RUN mkdir -p /usr/src/app/.cache /usr/src/app/.mirror \
+  && chown -R bun:bun /usr/src/app/.cache /usr/src/app/.mirror
 
 # Switch to the non-root user
 USER bun

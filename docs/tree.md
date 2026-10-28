@@ -1,6 +1,6 @@
 # census-mcp-server - Directory Structure
 
-Generated on: 2026-10-13 15:44:21
+Generated on: 2026-10-28 12:39:32
 
 ```text
 census-mcp-server/
@@ -30,6 +30,7 @@ census-mcp-server/
 │   ├── 0.4.x/
 │   ├── 0.5.x/
 │   ├── 0.6.x/
+│   ├── 0.7.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -42,6 +43,8 @@ census-mcp-server/
 │   ├── add-resource/
 │   │   └── SKILL.md
 │   ├── add-service/
+│   │   └── SKILL.md
+│   ├── add-skill/
 │   │   └── SKILL.md
 │   ├── add-test/
 │   │   └── SKILL.md
@@ -139,6 +142,11 @@ census-mcp-server/
 │   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   └── tree.ts
+├── skills/
+│   └── census-guide/
+│       ├── references/
+│       │   └── derived-estimates.md
+│       └── SKILL.md
 ├── src/
 │   ├── config/
 │   │   └── server-config.ts
@@ -177,6 +185,8 @@ census-mcp-server/
 │   │   └── dec-ddhcb-2020-popgroup.json
 │   ├── prompts/
 │   ├── resources/
+│   ├── scripts/
+│   │   └── bundle-agent-docs.test.ts
 │   ├── services/
 │   │   ├── census-api/
 │   │   │   └── census-api-service.test.ts
@@ -212,7 +222,9 @@ census-mcp-server/
 ├── Dockerfile
 ├── LICENSE
 ├── manifest.json
+├── mcp.json
 ├── package.json
+├── plugin.json
 ├── README.md
 ├── server.json
 ├── tsconfig.build.json

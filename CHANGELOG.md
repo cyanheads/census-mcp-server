@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.7.0](changelog/0.7.x/0.7.0.md) — 2026-10-28
+
+Publishes the census-guide Agent Skill over MCP as skill:// resources and adopts mcp-ts-core 0.13.18: MCP SDK 2.4, hosted HTTP no longer leaks memory per request, enrichment trailer strings render as code spans, and the Agent Plugins root plugin.json and mcp.json join the package.
+
 ## [0.6.3](changelog/0.6.x/0.6.3.md) — 2026-10-25
 
 Framework response formatting and dependency updates.

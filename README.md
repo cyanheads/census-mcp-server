@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.6.3-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/census-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/census-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/census-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.6.3-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/census-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.4.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/census-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/census-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -140,142 +140,33 @@ Agent-friendly output:
 
 ## Getting started
 
-### Public Hosted Instance
-
-A public instance is available at `https://census.caseyjhand.com/mcp` — no installation required. It serves Streamable HTTP; each client takes its own configuration shape.
-
-For Claude Code:
+Connect to the hosted instance, no install:
 
 ```sh
 claude mcp add --transport http census-mcp-server https://census.caseyjhand.com/mcp
 ```
 
-For Cline (`cline_mcp_settings.json`):
+Or run it locally:
 
-```json
-{
-  "mcpServers": {
-    "census-mcp-server": {
-      "type": "streamableHttp",
-      "url": "https://census.caseyjhand.com/mcp"
-    }
-  }
-}
+```sh
+claude mcp add census-mcp-server -e CENSUS_API_KEY=your-key -- npx -y @cyanheads/census-mcp-server
 ```
 
-For Cursor (`mcp.json`):
+For other clients, add this to the MCP config file:
 
 ```json
 {
   "mcpServers": {
     "census-mcp-server": {
-      "url": "https://census.caseyjhand.com/mcp"
-    }
-  }
-}
-```
-
-Claude Desktop adds remote servers under Settings → Connectors.
-
-### Self-Hosted / Local
-
-> **API key:** Register a free key at [api.census.gov/data/key_signup.html](https://api.census.gov/data/key_signup.html). Variable search and geography resolution work without a key; data queries (`census_query_data`, `census_compare_geographies`) require one.
-
-Add the following to your MCP client configuration file:
-
-```json
-{
-  "mcpServers": {
-    "census-mcp-server": {
-      "type": "stdio",
-      "command": "bunx",
-      "args": ["@cyanheads/census-mcp-server@latest"],
-      "env": {
-        "MCP_TRANSPORT_TYPE": "stdio",
-        "MCP_LOG_LEVEL": "info",
-        "CENSUS_API_KEY": "your-census-api-key"
-      }
-    }
-  }
-}
-```
-
-Or with npx (no Bun required):
-
-```json
-{
-  "mcpServers": {
-    "census-mcp-server": {
-      "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@cyanheads/census-mcp-server@latest"],
-      "env": {
-        "MCP_TRANSPORT_TYPE": "stdio",
-        "MCP_LOG_LEVEL": "info",
-        "CENSUS_API_KEY": "your-census-api-key"
-      }
+      "args": ["-y", "@cyanheads/census-mcp-server"],
+      "env": { "CENSUS_API_KEY": "your-key" }
     }
   }
 }
 ```
 
-Or with Docker:
-
-```json
-{
-  "mcpServers": {
-    "census-mcp-server": {
-      "type": "stdio",
-      "command": "docker",
-      "args": [
-        "run", "-i", "--rm",
-        "-e", "MCP_TRANSPORT_TYPE=stdio",
-        "-e", "CENSUS_API_KEY=your-census-api-key",
-        "ghcr.io/cyanheads/census-mcp-server:latest"
-      ]
-    }
-  }
-}
-```
-
-For Streamable HTTP, set the transport and start the server:
-
-```sh
-MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 CENSUS_API_KEY=... bun run start:http
-# Server listens at http://localhost:3010/mcp
-```
-
-### Prerequisites
-
-- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
-- A Census API key — register free at [api.census.gov/data/key_signup.html](https://api.census.gov/data/key_signup.html). Required for `census_query_data` and `census_compare_geographies`; other tools work without it.
-
-### Installation
-
-1. **Clone the repository:**
-
-```sh
-git clone https://github.com/cyanheads/census-mcp-server.git
-```
-
-2. **Navigate into the directory:**
-
-```sh
-cd census-mcp-server
-```
-
-3. **Install dependencies:**
-
-```sh
-bun install
-```
-
-4. **Configure environment:**
-
-```sh
-cp .env.example .env
-# edit .env and set CENSUS_API_KEY
-```
+Register a free key at [api.census.gov/data/key_signup.html](https://api.census.gov/data/key_signup.html). Data queries (`census_query_data`, `census_compare_geographies`) require it; variable search and geography resolution work without one. For Docker or a source build, see [Running the server](#running-the-server).
 
 ---
 
@@ -302,32 +193,43 @@ See [`.env.example`](./.env.example) for the full list of optional overrides.
 
 ### Local development
 
-```sh
-# One-time build
-bun run rebuild
+Requires [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
 
-# Run the built server
-bun run start:stdio
-# or
-bun run start:http
-```
+- **Clone and install:**
 
-Run checks and tests:
+  ```sh
+  git clone https://github.com/cyanheads/census-mcp-server.git
+  cd census-mcp-server && bun install
+  cp .env.example .env   # set CENSUS_API_KEY
+  ```
 
-```sh
-bun run devcheck   # Lint, format, typecheck, security audit
-bun run test       # Vitest test suite
-bun run lint:mcp   # Validate MCP definitions against spec
-```
+- **Build and run:**
+
+  ```sh
+  # One-time build
+  bun run rebuild
+
+  # Run the built server
+  bun run start:stdio
+  # or
+  bun run start:http
+  ```
+
+- **Run checks and tests:**
+
+  ```sh
+  bun run devcheck   # Lint, format, typecheck, security audit
+  bun run test       # Vitest test suite
+  bun run lint:mcp   # Validate MCP definitions against spec
+  ```
 
 ### Docker
 
 ```sh
-docker build -t census-mcp-server .
-docker run --rm -e CENSUS_API_KEY=your-key -p 3010:3010 census-mcp-server
+docker run --rm -e CENSUS_API_KEY=your-key -p 3010:3010 ghcr.io/cyanheads/census-mcp-server:latest
 ```
 
-The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `/var/log/census-mcp-server`. OpenTelemetry peer dependencies are installed by default — build with `--build-arg OTEL_ENABLED=false` to omit them.
+The image defaults to HTTP transport, stateless session mode, and logs to `/var/log/census-mcp-server`. To run it over stdio from an MCP client, use `"command": "docker"` with `"args": ["run", "-i", "--rm", "-e", "MCP_TRANSPORT_TYPE=stdio", "-e", "CENSUS_API_KEY=your-key", "ghcr.io/cyanheads/census-mcp-server:latest"]`. To build locally, `docker build -t census-mcp-server .`; OpenTelemetry peer dependencies are installed by default — build with `--build-arg OTEL_ENABLED=false` to omit them.
 
 ---
 

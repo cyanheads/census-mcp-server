@@ -3,9 +3,10 @@
  * @module tests/tools/census-list-datasets.tool.test
  */
 
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { describe, expect, it } from 'vitest';
 import { censusListDatasets } from '@/mcp-server/tools/definitions/census-list-datasets.tool.js';
+import { readNotice } from '../helpers/markdown-readback.js';
 
 describe('censusListDatasets', () => {
   it('returns all datasets when no filter provided', async () => {
@@ -222,6 +223,14 @@ describe('censusListDatasets', () => {
     const input = censusListDatasets.input.parse({ filter: 'NONEXISTENT_XYZ' });
     await censusListDatasets.handler(input, ctx);
     expect(getEnrichment(ctx).notice).toContain('NONEXISTENT_XYZ');
+  });
+
+  it('quotes a Markdown-active filter literally in content[] and raw in structuredContent (#72)', async () => {
+    const result = await runToolContract(censusListDatasets, { filter: '*nope* [a](b) `c`' });
+
+    const notice = (result.structuredContent as { notice?: string }).notice as string;
+    expect(notice).toContain('No datasets matched "*nope* [a](b) `c`".');
+    expect(readNotice(result)).toBe(notice);
   });
 
   it('treats whitespace-only filter as no filter (empty trim = no results)', async () => {

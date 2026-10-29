@@ -7,6 +7,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getDiscoveryConfig } from '@/config/server-config.js';
+import { renderNotice } from '@/mcp-server/tools/notice-trailer.js';
 import {
   type CodeMiss,
   DATASET_LATEST_YEARS,
@@ -125,6 +126,8 @@ export const censusSearchVariables = tool('census_search_variables', {
         'Guidance when no variables matched, when no variable contained every query word and the results hold only some of them, or when results were truncated — suggests other keywords, a narrower query, or a higher limit. For a code the dataset does not publish, it names the sibling dataset confirmed to hold it, or census_get_variable for an attribute column (annotation, flag, label, or significance); for a table cut at the limit, the last code shown.',
       ),
   },
+  // The notice quotes the query.
+  enrichmentTrailer: { notice: { render: renderNotice } },
 
   errors: [
     {

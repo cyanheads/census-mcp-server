@@ -4,6 +4,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { renderNotice } from '@/mcp-server/tools/notice-trailer.js';
 import { DATASET_AVAILABLE_YEARS } from '@/services/variable-cache/variable-cache-service.js';
 
 /**
@@ -178,6 +179,8 @@ export const censusListDatasets = tool('census_list_datasets', {
       .describe('Filter keyword applied to the dataset list, when provided.'),
     notice: z.string().optional().describe('Guidance when no datasets matched the filter keyword.'),
   },
+  // The notice quotes the filter.
+  enrichmentTrailer: { notice: { render: renderNotice } },
 
   handler(input, ctx) {
     ctx.log.info('Listing Census datasets', { filter: input.filter });

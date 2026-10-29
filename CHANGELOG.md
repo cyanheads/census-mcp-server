@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.7.1](changelog/0.7.x/0.7.1.md) — 2026-10-29
+
+Geography checks read every hierarchy a level is listed under, wildcard parents a level cannot take are refused before the request, an unset or rejected CENSUS_API_KEY fails as missing_api_key on every keyed tool, data requests stop at 40 s, and notices quoting caller text render literally in content[].
+
 ## [0.7.0](changelog/0.7.x/0.7.0.md) — 2026-10-28
 
 Publishes the census-guide Agent Skill over MCP as skill:// resources and adopts mcp-ts-core 0.13.18: MCP SDK 2.4, hosted HTTP no longer leaks memory per request, enrichment trailer strings render as code spans, and the Agent Plugins root plugin.json and mcp.json join the package.

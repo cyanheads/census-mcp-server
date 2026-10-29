@@ -59,13 +59,17 @@ export interface CensusGeographyLevel {
 /** A parent level a caller can scope a data query by — the ones the `in=` clause expresses. */
 export type SuppliedParent = 'state' | 'county' | 'tract';
 
-/** Outcome of pre-validating a geography level + parent combination against a dataset. */
+/**
+ * Outcome of pre-validating a geography level + parent combination against a dataset. A level
+ * geography.json lists under several hierarchies is one entry per hierarchy; each outcome below
+ * describes one entry — the one that accepted the call, or else the one closest to it.
+ */
 export type GeographyCheck =
   | {
       status: 'ok';
       /**
-       * Every parent the level names, in hierarchy order — the scopes a caller could narrow by.
-       * Absent when the dataset publishes no geography metadata for the year.
+       * Every parent the accepting entry names, in hierarchy order — the scopes a caller could
+       * narrow by. Absent when the dataset publishes no geography metadata for the year.
        */
       acceptedParents?: string[];
     }
@@ -75,12 +79,14 @@ export type GeographyCheck =
       missingParents: string[];
       /** True when a `*` target would drop at least one of the missing parents. */
       wildcardRelaxes: boolean;
+      /** Supplied parents the entry does not name, to drop alongside the additions. */
+      unacceptedParents?: SuppliedParent[];
     }
   | {
       status: 'parent_not_accepted';
-      /** Supplied parents the level does not name. */
+      /** Supplied parents the entry does not name. */
       unacceptedParents: SuppliedParent[];
-      /** Every parent the level does name, in hierarchy order. Empty when it takes none. */
+      /** Every parent the entry does name, in hierarchy order. Empty when it takes none. */
       acceptedParents: string[];
     };
 

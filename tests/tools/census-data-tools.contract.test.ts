@@ -12,12 +12,14 @@ import { readFileSync } from 'node:fs';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { getServerConfig } from '@/config/server-config.js';
 import { censusCompareGeographies } from '@/mcp-server/tools/definitions/census-compare-geographies.tool.js';
 import { censusQueryData } from '@/mcp-server/tools/definitions/census-query-data.tool.js';
 import { allToolDefinitions } from '@/mcp-server/tools/definitions/index.js';
 import { initCensusApiService } from '@/services/census-api/census-api-service.js';
 import { initGeographyService } from '@/services/geography/geography-service.js';
 import { initVariableCacheService } from '@/services/variable-cache/variable-cache-service.js';
+import { readNotice, readParagraphs } from '../helpers/markdown-readback.js';
 
 vi.mock('@/config/server-config.js', () => ({
   getDiscoveryConfig: vi.fn(() => ({ defaultYear: 2024, variableCacheTtlHours: 24 })),
@@ -28,7 +30,10 @@ vi.mock('@/config/server-config.js', () => ({
   })),
 }));
 
-type Body = unknown[][] | Record<string, unknown> | Response;
+/** A request the upstream accepts and never answers; it settles only when its signal aborts. */
+const HANG = Symbol('hang');
+
+type Body = unknown[][] | Record<string, unknown> | Response | typeof HANG;
 
 interface Route {
   match: (url: URL) => boolean;
@@ -45,12 +50,19 @@ beforeEach(() => {
   initVariableCacheService();
   vi.stubGlobal(
     'fetch',
-    vi.fn((input: string | URL) => {
+    vi.fn((input: string | URL, init?: RequestInit) => {
       const url = new URL(String(input));
       calls.push(url);
       const route = routes.find((r) => r.match(url));
       if (!route) return Promise.reject(new Error(`unmocked fetch: ${url.pathname}`));
       const body = route.respond(url);
+      if (body === HANG) {
+        return new Promise<Response>((_, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), {
+            once: true,
+          });
+        });
+      }
       return Promise.resolve(
         body instanceof Response
           ? body
@@ -2217,6 +2229,24 @@ describe('census_query_data scopes block groups by tract_fips', () => {
     expect(textOf(result)).not.toContain('geography_fips to "*"');
   });
 
+  /** Adding the tract alone would leave `county:*` under it, which the Census API refuses. */
+  it('names the concrete county and the tract a single block group under a "*" county needs', async () => {
+    serveBlockGroups();
+
+    const result = await runToolContract(
+      censusQueryData,
+      kingBlockGroups({ county_fips: '*', tract_fips: '' }),
+    );
+
+    const error = errorOf(result);
+    expect(error.data.reason).toBe('parent_required');
+    expect(error.data.missingParents).toEqual(['county', 'tract']);
+    expect((error.data.recovery as { hint: string }).hint).toBe(
+      'To query this level, set county_fips to one 3-digit county FIPS instead of "*" (census_resolve_geography returns it as county_fips), and add tract_fips (census_resolve_geography returns it as tract_fips, and for a street address also returns the block group as block_group_fips).',
+    );
+    expect(dataCalls('acs/acs5', 2024)).toHaveLength(0);
+  });
+
   it('offers tract_fips as a narrowing scope when a county-wide list is truncated', async () => {
     serveBlockGroups();
 
@@ -2414,6 +2444,7 @@ const ddhcbModel: SplitModel = {
 const ddhcaModel: SplitModel = {
   publishes: {
     us: { T01001: ['1002', '1360'], T02002: ['1360'], T02003: ['1002'] },
+    '02': { T01001: ['1360'], T02002: ['1360'] },
     '06': { T01001: ['1002'], T02001: ['1002'] },
     '53': { T01001: ['1002'], T02001: ['1002'] },
   },
@@ -2421,6 +2452,7 @@ const ddhcaModel: SplitModel = {
     'T02002_001N|1360|us': '133311',
     'T01001_001N|1360|us': '133311',
     'T02003_001N|1002|us': '120113090',
+    'T02002_001N|1360|02': '102765',
   },
 };
 
@@ -2446,7 +2478,7 @@ const answerSplit =
         : level === 'state'
           ? fips === '*'
             ? Object.keys(model.publishes).filter((key) => /^\d{2}$/.test(key))
-            : [fips]
+            : fips.split(',').filter((one) => Object.hasOwn(model.publishes, one))
           : Object.keys(model.publishes).filter(
               (key) =>
                 key.startsWith(`${state}:`) &&
@@ -2648,7 +2680,8 @@ describe('dec/ddhcb results that can miss a group or geography carry the table g
     expect(out.notice).toContain('one row per category of POPGROUP');
     expect(out.notice).toContain('missing from T03004');
     expect(out.notice).toContain('T03001, T03002, or T03003');
-    expect(textOf(result)).toContain(out.notice as string);
+    // The notice quotes "*", which content[] carries escaped and reads back as written (#72).
+    expect(readNotice(result)).toBe(out.notice);
     expect(dataCalls('dec/ddhcb', 2020)).toHaveLength(1);
   });
 
@@ -2890,6 +2923,244 @@ describe('a comma-separated geography_fips gets the table guidance (#54)', () =>
 });
 
 // ---------------------------------------------------------------------------------------------
+// #74 — a comma-separated geography_fips names the members that matched no row
+// #72 — caller text quoted in a notice reads back literally from content[]
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * acs/acs5 2024 as api.census.gov answers a `for=` list (2026-10-29): each member trimmed, a code
+ * it does not publish (99, or the unpadded 6) dropped without an error, a repeat collapsed, rows in
+ * GEOID order whatever the list order, and HTTP 204 when no member matched.
+ */
+const LIST_STATES: Record<string, string> = {
+  '02': 'Alaska',
+  '06': 'California',
+  '16': 'Idaho',
+  '32': 'Nevada',
+  '41': 'Oregon',
+  '53': 'Washington',
+};
+const LIST_COUNTIES: Record<string, string> = {
+  '033': 'King County, Washington',
+  '061': 'Snohomish County, Washington',
+};
+
+const serveLists = () => {
+  serveMetadata('acs/acs5', 2024, acsVariables);
+  serveData('acs/acs5', 2024, (url) => {
+    const get = getList(url);
+    const [level, list] = (url.searchParams.get('for') ?? '').split(':') as [string, string];
+    const known = level === 'state' ? LIST_STATES : LIST_COUNTIES;
+    const codes =
+      list === '*'
+        ? Object.keys(known)
+        : [...new Set(list.split(',').map((m) => m.trim()))].filter((m) => Object.hasOwn(known, m));
+    if (codes.length === 0) return new Response(null, { status: 204 });
+    const geo = level === 'state' ? ['state'] : ['state', 'county'];
+    return [
+      [...get, ...geo],
+      ...codes
+        .sort()
+        .map((code) => [
+          ...get.map((c) => (c === 'NAME' ? (known[code] as string) : '100')),
+          ...(level === 'state' ? [code] : ['53', code]),
+        ]),
+    ];
+  });
+};
+
+const listQuery = (geography_fips: string, extra: Record<string, unknown> = {}) => ({
+  variables: ['B01003_001E'],
+  geography_level: 'state',
+  geography_fips,
+  ...extra,
+});
+
+describe('a comma-separated geography_fips names the members that matched no row (#74)', () => {
+  it.each([
+    ['06,53', ['06', '53']],
+    ['53,06', ['06', '53']],
+    ['06, 53', ['06', '53']],
+    ['06,06', ['06']],
+  ])('%j returns %j with no notice (characterization)', async (fips, expected) => {
+    serveLists();
+
+    const result = await runToolContract(censusQueryData, listQuery(fips));
+
+    expect(result.isError).toBeFalsy();
+    expect(structured(result).rows.map((r) => r.geography_geoid)).toEqual(expected);
+    expect(paged(result).totalCount).toBe(expected.length);
+    expect(structured(result)).not.toHaveProperty('notice');
+  });
+
+  it('returns two counties for "033,061" under parent_fips 53, with no notice (characterization)', async () => {
+    serveLists();
+
+    const result = await runToolContract(
+      censusQueryData,
+      listQuery('033,061', { geography_level: 'county', parent_fips: '53' }),
+    );
+
+    expect(structured(result).rows.map((r) => r.geography_geoid)).toEqual(['53033', '53061']);
+    expect(structured(result)).not.toHaveProperty('notice');
+  });
+
+  it.each(['06', '*'])('%j behaves as before, with no notice (characterization)', async (fips) => {
+    serveLists();
+
+    const result = await runToolContract(censusQueryData, listQuery(fips));
+
+    expect(result.isError).toBeFalsy();
+    expect(structured(result).rows.length).toBe(fips === '*' ? 6 : 1);
+    expect(structured(result)).not.toHaveProperty('notice');
+  });
+
+  it.each([
+    ['06,99', '99'],
+    ['06,6', '6'],
+    ['06,99,99', '99'],
+  ])('%j returns California and names %j on both surfaces', async (fips, missing) => {
+    serveLists();
+
+    const result = await runToolContract(censusQueryData, listQuery(fips));
+
+    expect(structured(result).rows.map((r) => r.geography_name)).toEqual(['California']);
+    expect(paged(result).totalCount).toBe(1);
+    const notice = structured(result).notice as string;
+    expect(notice).toContain(`No row came back for 1 of the 2 geography_fips codes: ${missing}.`);
+    expect(notice).toContain('the codes that did come back, such as "06".');
+    expect(readNotice(result)).toBe(notice);
+  });
+
+  /** The width a code needs is the level's, shown by a code that matched, not a fixed table. */
+  it('shows a code that matched at the level queried as the one to check against', async () => {
+    serveLists();
+
+    const result = await runToolContract(
+      censusQueryData,
+      listQuery('033,61', { geography_level: 'county', parent_fips: '53' }),
+    );
+
+    expect(structured(result).rows.map((r) => r.geography_geoid)).toEqual(['53033']);
+    const notice = structured(result).notice as string;
+    expect(notice).toContain('No row came back for 1 of the 2 geography_fips codes: 61.');
+    expect(notice).toContain('the codes that did come back, such as "033".');
+    expect(notice).not.toContain('a state is 2 digits');
+  });
+
+  /** The paging notice and the unmatched-code notice describe the same response; both survive. */
+  it('judges the members against every matched row, not the page', async () => {
+    serveLists();
+
+    const result = await runToolContract(
+      censusQueryData,
+      listQuery('53,06,41,16,99', { limit: 2 }),
+    );
+
+    expect(structured(result).rows.map((r) => r.geography_geoid)).toEqual(['06', '16']);
+    expect(paged(result).totalCount).toBe(4);
+    const notice = structured(result).notice as string;
+    expect(notice).toContain('No row came back for 1 of the 5 geography_fips codes: 99.');
+    expect(notice).toContain('Rows 1–2 of 4');
+    expect(readNotice(result)).toBe(notice);
+  });
+
+  it('pages a list with no unmatched member and adds no unmatched notice (characterization)', async () => {
+    serveLists();
+
+    const result = await runToolContract(
+      censusQueryData,
+      listQuery('53,06,41,16,32', { limit: 2, offset: 2 }),
+    );
+
+    expect(structured(result).rows.map((r) => r.geography_geoid)).toEqual(['32', '41']);
+    expect(paged(result).totalCount).toBe(5);
+    const notice = structured(result).notice as string;
+    expect(notice).toContain('Rows 3–4 of 5');
+    expect(notice).not.toContain('geography_fips codes');
+  });
+
+  /**
+   * A list member holding anything but a code never reaches a notice — api.census.gov answers
+   * `state:06,_9_` with HTTP 400 — so the read-back runs on the other quoted text the notice
+   * carries: the label of the default the API applied to an unset dimension, an upstream string.
+   */
+  it('quotes an applied-default label literally in content[] and raw in structuredContent (#72)', async () => {
+    const label = 'Total *for* `all` [sectors](x)';
+    serveMetadata('cbp', 2023, {
+      ESTAB: { label: 'Number of establishments', predicateType: 'int' },
+      NAICS2017: {
+        label: '2017 NAICS code',
+        required: 'default displayed',
+        predicateType: 'string',
+        attributes: 'NAICS2017_LABEL',
+      },
+    });
+    serveData('cbp', 2023, (url) => {
+      const get = getList(url);
+      return [
+        [...get, 'state'],
+        [...get.map((c) => (c === 'NAME' ? 'Washington' : c === 'ESTAB' ? '5' : label)), '53'],
+      ];
+    });
+
+    const result = await runToolContract(
+      censusQueryData,
+      listQuery('53', { dataset: 'cbp', variables: ['ESTAB'] }),
+    );
+
+    const notice = structured(result).notice as string;
+    expect(notice).toContain(`"${label}"`);
+    expect(readNotice(result)).toBe(notice);
+  });
+
+  /** WA publishes 1360 (Alaska Native alone) in no T02 sex-by-age table; Alaska does in T02002. */
+  it('names 53 for dec/ddhca T02002_001N under 1360 and keeps the table guidance', async () => {
+    serveDdhca();
+
+    const result = await runToolContract(censusQueryData, {
+      dataset: 'dec/ddhca',
+      variables: ['T02002_001N'],
+      geography_level: 'state',
+      geography_fips: '02,53',
+      predicates: { POPGROUP: '1360' },
+    });
+
+    const [row] = structured(result).rows;
+    expect(structured(result).rows).toHaveLength(1);
+    expect(row?.geography_geoid).toBe('02');
+    expect(row?.variables.T02002_001N?.estimate).toBe(102765);
+    const notice = structured(result).notice as string;
+    expect(notice).toContain('No row came back for 1 of the 2 geography_fips codes: 53.');
+    expect(notice).toMatch(SPLIT);
+    expect(notice).toContain('T02001 or T02003');
+    // The missing code first, then where its group may sit instead.
+    expect(notice.indexOf('geography_fips codes: 53.')).toBeLessThan(notice.search(SPLIT));
+    expect(readNotice(result)).toBe(notice);
+    expect(textOf(result)).toContain('102,765');
+  });
+});
+
+describe('census_compare_geographies quotes unmatched geographies literally (#72)', () => {
+  it('reads the unmatched entry back from content[] exactly as structuredContent holds it', async () => {
+    serveLists();
+
+    const result = await runToolContract(censusCompareGeographies, {
+      variables: ['B01003_001E'],
+      geography_level: 'county',
+      within: '53',
+      geographies: ['53033', '*x* `y` [z](w)'],
+      limit: 2,
+    });
+
+    expect(structured(result).rows.map((r) => r.geography_geoid)).toEqual(['53033']);
+    const notice = structured(result).notice as string;
+    expect(notice).toContain('requested geographies: *x* `y` [z](w).');
+    expect(readNotice(result)).toBe(notice);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
 // #32 — dataset-code case and shorthand
 // ---------------------------------------------------------------------------------------------
 
@@ -3082,6 +3353,413 @@ describe('census_list_geographies and the data tools give one level count per da
 });
 
 // ---------------------------------------------------------------------------------------------
+// #70 — a level geography.json lists under several hierarchies
+// ---------------------------------------------------------------------------------------------
+
+describe('a level listed under several hierarchies runs when any of them accepts the call (#70)', () => {
+  const NECTA = 'new england city and town area';
+  const NECTA_PART = 'new england city and town area (or part)';
+  const AIANNH_PART = 'american indian area/alaska native area/hawaiian home land (or part)';
+
+  /** The dec/dhc 2020 entries for these levels, in the order geography.json publishes them. */
+  const serveDhc = () => {
+    routes.push(
+      {
+        match: (u) => u.pathname === '/data/2020/dec/dhc/variables.json',
+        respond: () => ({
+          variables: {
+            P1_001N: { label: ' !!Total', concept: 'Total Population', predicateType: 'int' },
+          },
+        }),
+      },
+      {
+        match: (u) => u.pathname === '/data/2020/dec/dhc/geography.json',
+        respond: () => ({
+          fips: [
+            { name: 'state', geoLevelDisplay: '040' },
+            { name: AIANNH_PART, geoLevelDisplay: '144', requires: ['state', 'county', 'tract'] },
+            {
+              name: AIANNH_PART,
+              geoLevelDisplay: '154',
+              requires: ['state', 'county', 'tract', 'block group'],
+            },
+            { name: AIANNH_PART, geoLevelDisplay: '280', requires: ['state'] },
+            {
+              name: NECTA,
+              geoLevelDisplay: '337',
+              requires: ['combined new england city and town area'],
+            },
+            {
+              name: NECTA_PART,
+              geoLevelDisplay: '346',
+              requires: ['state', 'combined new england city and town area (or part)'],
+            },
+            { name: NECTA, geoLevelDisplay: '350' },
+            { name: NECTA_PART, geoLevelDisplay: '360', requires: ['state'] },
+          ],
+        }),
+      },
+    );
+    // Three geographies at whatever level was asked for, under whatever state scoped it.
+    serveData('dec/dhc', 2020, (url) => {
+      const level = (url.searchParams.get('for') ?? '').split(':')[0] as string;
+      const state = url.searchParams.get('in')?.match(/state:(\d+)/)?.[1];
+      const geo = state ? ['state', level] : [level];
+      return [
+        [...getList(url), ...geo],
+        ...['70450', '71650', '72400'].map((code, i) => [
+          `Area ${code}`,
+          String(5_064_479 - i * 1000),
+          ...(state ? [state] : []),
+          code,
+        ]),
+      ];
+    });
+  };
+
+  const dhc = { variables: ['P1_001N'], dataset: 'dec/dhc', year: 2020 };
+  const query = (input: Record<string, unknown>) =>
+    runToolContract(censusQueryData, { ...dhc, geography_fips: '*', ...input } as never);
+  const compare = (input: Record<string, unknown>) =>
+    runToolContract(censusCompareGeographies, { ...dhc, ...input } as never);
+  const hintOf = (result: { structuredContent?: unknown }) =>
+    (errorOf(result).data.recovery as { hint: string }).hint;
+
+  beforeEach(serveDhc);
+
+  it('census_query_data lists a NECTA nationally — the entry that names no parent', async () => {
+    const result = await query({ geography_level: NECTA });
+
+    expect(result.isError).toBeFalsy();
+    expect(structured(result).rows.map((row) => row.geography_geoid)).toEqual([
+      '70450',
+      '71650',
+      '72400',
+    ]);
+    expect(structured(result).rows[0]?.variables.P1_001N?.estimate).toBe(5_064_479);
+    expect(textOf(result)).toContain('Area 70450');
+    const [request] = dataCalls('dec/dhc', 2020);
+    expect(request?.searchParams.get('for')).toBe(`${NECTA}:*`);
+    expect(request?.searchParams.has('in')).toBe(false);
+  });
+
+  /**
+   * The scopes the paging notice offers come from the entry that accepted the call. The first
+   * AIANNH (or part) entry names county and tract as well; offering them would send the next call
+   * into a hierarchy this one never ran in.
+   */
+  it('census_query_data pages an AIANNH (or part) query with the accepting entry’s scopes', async () => {
+    const result = await query({ geography_level: AIANNH_PART, parent_fips: '04', limit: 1 });
+
+    expect(result.isError).toBeFalsy();
+    const out = structured(result);
+    expect(out.rows.map((row) => row.geography_geoid)).toEqual(['0470450']);
+    expect(out.notice).toContain('Rows 1–1 of 3');
+    expect(out.notice).not.toContain('narrow the scope');
+    expect(textOf(result)).toContain('Rows 1–1 of 3');
+    expect(dataCalls('dec/dhc', 2020)[0]?.searchParams.get('in')).toBe('state:04');
+  });
+
+  it('census_compare_geographies ranks NECTA (or part) within a state', async () => {
+    const result = await compare({ geography_level: NECTA_PART, within: '25' });
+
+    expect(result.isError).toBeFalsy();
+    expect(structured(result).rows.map((row) => [row.rank, row.geography_geoid])).toEqual([
+      [1, '2570450'],
+      [2, '2571650'],
+      [3, '2572400'],
+    ]);
+    expect(textOf(result)).toContain('Area 70450');
+  });
+
+  it('a state scope on a NECTA is the parent to drop, not a CNECTA to add', async () => {
+    const result = await query({ geography_level: NECTA, parent_fips: '25' });
+
+    const error = errorOf(result);
+    expect(error.data).toMatchObject({
+      reason: 'parent_not_accepted',
+      unacceptedParents: ['state'],
+      acceptedParents: [],
+    });
+    expect(hintOf(result)).toContain('Drop parent_fips');
+    expect(textOf(result)).toContain('Recovery: Drop parent_fips');
+    expect(dataCalls('dec/dhc', 2020)).toHaveLength(0);
+  });
+
+  it('a NECTA (or part) with no parent needs the state alone', async () => {
+    const result = await query({ geography_level: NECTA_PART });
+
+    const error = errorOf(result);
+    expect(error.data).toMatchObject({ reason: 'parent_required', missingParents: ['state'] });
+    expect(error.message).not.toContain('combined');
+    expect(hintOf(result)).toContain('add parent_fips');
+    expect(dataCalls('dec/dhc', 2020)).toHaveLength(0);
+  });
+
+  it('an AIANNH (or part) with no parent needs the state alone', async () => {
+    const result = await compare({ geography_level: AIANNH_PART });
+
+    expect(errorOf(result).data).toMatchObject({
+      reason: 'parent_required',
+      missingParents: ['state'],
+    });
+    expect(hintOf(result)).toContain('add within');
+  });
+
+  /**
+   * Reachability is per tool. Under a state and county, census_query_data can add the tract the
+   * first entry needs; census_compare_geographies has no tract input, so its one move is dropping
+   * the county to reach the state-only entry.
+   */
+  it('a state and county on AIANNH (or part) is a tract to add or a county to drop, by tool', async () => {
+    const queried = await query({
+      geography_level: AIANNH_PART,
+      parent_fips: '04',
+      county_fips: '001',
+    });
+    expect(errorOf(queried).data).toMatchObject({
+      reason: 'parent_required',
+      missingParents: ['tract'],
+    });
+    expect(hintOf(queried)).toContain('add tract_fips');
+
+    const compared = await compare({
+      geography_level: AIANNH_PART,
+      within: '04',
+      within_county: '001',
+    });
+    expect(errorOf(compared).data).toMatchObject({
+      reason: 'parent_not_accepted',
+      unacceptedParents: ['county'],
+      acceptedParents: ['state'],
+    });
+    expect(hintOf(compared)).toContain('Drop within_county');
+    expect(textOf(compared)).toContain('Recovery: Drop within_county');
+    // within stays, so the comparison keeps its state scope rather than running unscoped.
+    expect(hintOf(compared)).toContain(
+      'it sits within state only, so the comparison needs no other scope.',
+    );
+  });
+
+  /**
+   * The state-only NECTA (or part) entry needs a state added and does not take the county, so the
+   * one error names both changes, and making them is the whole fix.
+   */
+  it('census_query_data names the parent to add and the one to drop in one error', async () => {
+    const result = await query({ geography_level: NECTA_PART, county_fips: '009' });
+
+    const error = errorOf(result);
+    expect(error.data).toMatchObject({
+      reason: 'parent_required',
+      missingParents: ['state'],
+      unacceptedParents: ['county'],
+    });
+    expect(error.message).toBe(
+      `Geography level "${NECTA_PART}" in dec/dhc (2020) must be scoped by state, and does not accept county as a parent.`,
+    );
+    expect(hintOf(result)).toBe(
+      'To query this level, add parent_fips (census_resolve_geography returns it as state_fips), and drop county_fips.',
+    );
+    expect(readParagraphs(textOf(result))).toContain(`Recovery: ${hintOf(result)}`);
+    expect(dataCalls('dec/dhc', 2020)).toHaveLength(0);
+
+    const retried = await query({ geography_level: NECTA_PART, parent_fips: '25' });
+    expect(retried.isError).toBeFalsy();
+    expect(structured(retried).rows).toHaveLength(3);
+  });
+
+  it('census_compare_geographies names within to add and within_county to drop', async () => {
+    const result = await compare({ geography_level: NECTA_PART, within_county: '009' });
+
+    expect(errorOf(result).data).toMatchObject({
+      reason: 'parent_required',
+      missingParents: ['state'],
+      unacceptedParents: ['county'],
+    });
+    expect(hintOf(result)).toBe(
+      'To compare at this level, add within (census_resolve_geography returns it as state_fips), and drop within_county.',
+    );
+    expect(readParagraphs(textOf(result))).toContain(`Recovery: ${hintOf(result)}`);
+
+    const retried = await compare({ geography_level: NECTA_PART, within: '25' });
+    expect(retried.isError).toBeFalsy();
+  });
+});
+
+describe('a "*" parent the level does not wildcard is refused before the data request (#77)', () => {
+  const serveAcs = () => {
+    serveMetadata('acs/acs5', 2024, acsVariables);
+    routes.push({
+      match: (u) => u.pathname === '/data/2024/acs/acs5/groups.json',
+      respond: () => ({ groups: [] }),
+    });
+    serveData('acs/acs5', 2024, (url) => [
+      [...getList(url), 'state', 'county'],
+      ...['01', '02'].map((state) => [
+        ...getList(url).map((h) => (h === 'NAME' ? `County in ${state}` : '100')),
+        state,
+        '001',
+      ]),
+    ]);
+  };
+  const base = { variables: ['B01003_001E'], dataset: 'acs/acs5', year: 2024 };
+  const hintOf = (result: { structuredContent?: unknown }) =>
+    (errorOf(result).data.recovery as { hint: string }).hint;
+
+  beforeEach(serveAcs);
+
+  it('census_query_data names the state to send in place of "*" on a tract query', async () => {
+    const result = await runToolContract(censusQueryData, {
+      ...base,
+      geography_level: 'tract',
+      geography_fips: '*',
+      parent_fips: '*',
+      county_fips: '*',
+    } as never);
+
+    expect(result.isError).toBe(true);
+    const error = errorOf(result);
+    expect(error.data).toMatchObject({ reason: 'parent_required', missingParents: ['state'] });
+    expect(error.message).toBe(
+      'Geography level "tract" in acs/acs5 (2024) must be scoped by state; "*" does not stand in for state here.',
+    );
+    expect(hintOf(result)).toBe(
+      'To query this level, set parent_fips to one 2-digit state FIPS instead of "*" (census_resolve_geography returns it as state_fips).',
+    );
+    expect(readParagraphs(textOf(result))).toEqual(
+      expect.arrayContaining([`Error: ${error.message}`, `Recovery: ${hintOf(result)}`]),
+    );
+    expect(dataCalls('acs/acs5', 2024)).toHaveLength(0);
+  });
+
+  it('census_compare_geographies names the state to send in place of "*" on a tract comparison', async () => {
+    const result = await runToolContract(censusCompareGeographies, {
+      ...base,
+      geography_level: 'tract',
+      within: '*',
+    } as never);
+
+    expect(result.isError).toBe(true);
+    expect(errorOf(result).data).toMatchObject({
+      reason: 'parent_required',
+      missingParents: ['state'],
+    });
+    expect(hintOf(result)).toContain('set within to one 2-digit state FIPS instead of "*"');
+    expect(textOf(result)).toContain('Recovery: To compare at this level, set within to one');
+    expect(dataCalls('acs/acs5', 2024)).toHaveLength(0);
+  });
+
+  /** county lists state under `wildcard`, so `in=state:*` is a request the Census API answers. */
+  it.each([
+    [
+      'census_query_data',
+      () =>
+        runToolContract(censusQueryData, {
+          ...base,
+          geography_level: 'county',
+          geography_fips: '*',
+          parent_fips: '*',
+        } as never),
+    ],
+    [
+      'census_compare_geographies',
+      () =>
+        runToolContract(censusCompareGeographies, {
+          ...base,
+          geography_level: 'county',
+          within: '*',
+        } as never),
+    ],
+  ])('%s still sends a "*" state on a county query (characterization)', async (_tool, call) => {
+    const result = await call();
+
+    expect(result.isError).toBeFalsy();
+    expect(
+      structured(result)
+        .rows.map((row) => row.geography_geoid)
+        .sort(),
+    ).toEqual(['01001', '02001']);
+    expect(dataCalls('acs/acs5', 2024)[0]?.searchParams.get('in')).toBe('state:*');
+  });
+});
+
+describe('a hung data endpoint settles inside the client timeout (#78)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    serveMetadata('acs/acs5', 2024, acsVariables);
+    serveData('acs/acs5', 2024, () => HANG);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const atState = {
+    variables: ['B19013_001E'],
+    dataset: 'acs/acs5',
+    year: 2024,
+    geography_level: 'state',
+  };
+
+  /** The service seam tables the deadline itself; this pins that it reaches each data tool's wire. */
+  it.each([
+    ['census_query_data', censusQueryData, { ...atState, geography_fips: '53' }],
+    ['census_compare_geographies', censusCompareGeographies, atState],
+  ] as const)(
+    '%s reports it as a retryable upstream_error on both surfaces',
+    async (_n, definition, input) => {
+      let settled = false;
+      const pending = runToolContract(definition as never, input as never).finally(() => {
+        settled = true;
+      });
+      await vi.advanceTimersByTimeAsync(39_999);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      const result = await pending;
+
+      expect(result.isError).toBe(true);
+      const error = errorOf(result);
+      expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+      expect(error.data).toMatchObject({
+        reason: 'upstream_error',
+        retryable: true,
+        deadlineMs: 40_000,
+      });
+      const paragraphs = readParagraphs(textOf(result));
+      expect(paragraphs).toContain(`Error: ${error.message}`);
+      expect(paragraphs).toContain(
+        'Recovery: Retry the request once. If it fails the same way, request a narrower geography or fewer variables per call: a response too large to arrive within one attempt fails on every retry. Otherwise the Census API is temporarily unavailable for this dataset and year.',
+      );
+      expect(textOf(result)).toContain('(reason upstream_error · retryable');
+      expect(dataCalls('acs/acs5', 2024)).toHaveLength(3);
+    },
+  );
+
+  it('a caller cancelling the hung request gets a cancellation', async () => {
+    const controller = new AbortController();
+    const pending = runToolContract(
+      censusQueryData,
+      { ...atState, geography_fips: '53' } as never,
+      { context: { signal: controller.signal } },
+    );
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(dataCalls('acs/acs5', 2024)).toHaveLength(1);
+    controller.abort();
+    // Nothing waits on the clock past the abort; this only lets the settle path's timers run.
+    await vi.advanceTimersByTimeAsync(1);
+    const result = await pending;
+
+    expect(result.isError).toBe(true);
+    const error = errorOf(result);
+    expect(error.code).toBe(JsonRpcErrorCode.RequestCancelled);
+    expect(error.data.reason).toBeUndefined();
+    expect(error.message).toMatch(/was aborted\.$/);
+    expect(readParagraphs(textOf(result))).toEqual([`Error: ${error.message}`]);
+    expect(dataCalls('acs/acs5', 2024)).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
 // #62 — no error says the same thing twice
 // ---------------------------------------------------------------------------------------------
 
@@ -3251,6 +3929,15 @@ describe('no error repeats itself between its message and its recovery hint (#62
   beforeEach(() => {
     initGeographyService();
   });
+
+  afterEach(() => {
+    vi.mocked(getServerConfig).mockReset();
+  });
+
+  /** Configure the server with no key, as an unset, blank, or unsubstituted one parses. */
+  const unsetKey = () => {
+    vi.mocked(getServerConfig).mockReturnValue({ defaultYear: 2024, variableCacheTtlHours: 24 });
+  };
 
   interface Scenario {
     /** Drive retry backoffs with fake timers — the failure is one `withRetry` retries. */
@@ -3554,6 +4241,26 @@ describe('no error repeats itself between its message and its recovery hint (#62
     },
     {
       tool: tool('census_list_predicate_values'),
+      reason: 'missing_api_key',
+      label: 'a live-route dimension with CENSUS_API_KEY unset',
+      input: { dataset: 'cbp', predicate: 'EMPSZES' },
+      serve: () => {
+        serveCbp();
+        unsetKey();
+      },
+    },
+    {
+      tool: tool('census_list_predicate_values'),
+      reason: 'missing_api_key',
+      label: 'a live-route dimension with the Census API refusing the key',
+      input: { dataset: 'cbp', predicate: 'EMPSZES' },
+      serve: () => {
+        serveCbp();
+        serveData('cbp', 2023, () => htmlPage('Invalid Key — see key_signup'));
+      },
+    },
+    {
+      tool: tool('census_list_predicate_values'),
       reason: 'upstream_error',
       label: 'the enumeration rejected with a 400',
       input: { dataset: 'cbp', predicate: 'EMPSZES' },
@@ -3561,6 +4268,17 @@ describe('no error repeats itself between its message and its recovery hint (#62
         serveCbp();
         serveData('cbp', 2023, () => plain(400, "error: unknown predicate variable: 'X'"));
       },
+    },
+    {
+      tool: tool('census_list_predicate_values'),
+      reason: 'upstream_error',
+      label: 'an enumeration the data endpoint never answers',
+      input: { dataset: 'cbp', predicate: 'EMPSZES' },
+      serve: () => {
+        serveCbp();
+        serveData('cbp', 2023, () => HANG);
+      },
+      backoff: true,
     },
     {
       tool: tool('census_list_predicate_values'),
@@ -3681,6 +4399,16 @@ describe('no error repeats itself between its message and its recovery hint (#62
         },
         {
           tool: definition,
+          reason: 'missing_api_key',
+          label: 'CENSUS_API_KEY unset',
+          input: base,
+          serve: () => {
+            serveAcs();
+            unsetKey();
+          },
+        },
+        {
+          tool: definition,
           reason: 'variable_not_found',
           label: 'a code the Census API rejects as unknown',
           input: { ...base, variables: ['X99_001E'] },
@@ -3720,6 +4448,48 @@ describe('no error repeats itself between its message and its recovery hint (#62
           label: 'a county subdivision with no county',
           input: scoped,
           serve: serveSubdivisions,
+        },
+        {
+          tool: definition,
+          reason: 'parent_required',
+          label: 'a "*" state on a tract, which does not wildcard it',
+          input:
+            definition === query
+              ? { ...atLevel('tract'), parent_fips: '*' }
+              : { ...atLevel('tract'), within: '*' },
+          serve: serveAcs,
+        },
+        {
+          tool: definition,
+          reason: 'parent_required',
+          label: 'a county subdivision under a "*" state and a county it does take',
+          input:
+            definition === query
+              ? { ...atLevel('county subdivision'), parent_fips: '*', county_fips: '033' }
+              : { ...atLevel('county subdivision'), within: '*', within_county: '033' },
+          serve: serveSubdivisions,
+        },
+        {
+          tool: definition,
+          reason: 'parent_required',
+          label: 'a parent to add and one to drop',
+          input:
+            definition === query
+              ? { ...atLevel('state legislative district (upper chamber)'), county_fips: '033' }
+              : { ...atLevel('state legislative district (upper chamber)'), within_county: '033' },
+          serve: () => {
+            override('/data/2024/acs/acs5/geography.json', () => ({
+              fips: [
+                { name: 'state', geoLevelDisplay: '040' },
+                {
+                  name: 'state legislative district (upper chamber)',
+                  geoLevelDisplay: '610',
+                  requires: ['state'],
+                },
+              ],
+            }));
+            serveAcs();
+          },
         },
         {
           tool: definition,
@@ -3774,6 +4544,17 @@ describe('no error repeats itself between its message and its recovery hint (#62
           serve: () => {
             serveMetadata('acs/acs5', 2024, acsVariables);
             serveData('acs/acs5', 2024, () => htmlPage());
+          },
+          backoff: true,
+        },
+        {
+          tool: definition,
+          reason: 'upstream_error',
+          label: 'a data endpoint that never answers',
+          input: base,
+          serve: () => {
+            serveMetadata('acs/acs5', 2024, acsVariables);
+            serveData('acs/acs5', 2024, () => HANG);
           },
           backoff: true,
         },
@@ -4001,9 +4782,10 @@ describe('no error repeats itself between its message and its recovery hint (#62
         expect(declared.map((entry) => entry.reason)).toContain(scenario.reason);
       }
 
-      const text = textOf(result);
-      const message = text.match(/^Error: (.*)$/m)?.[1];
-      const hint = text.match(/^Recovery: (.*)$/m)?.[1];
+      // Read back as a client renders it: the text escapes Markdown punctuation such as "*".
+      const paragraphs = readParagraphs(textOf(result));
+      const message = paragraphs.find((p) => p.startsWith('Error: '))?.slice('Error: '.length);
+      const hint = paragraphs.find((p) => p.startsWith('Recovery: '))?.slice('Recovery: '.length);
       expect(message).toBe(error.message);
       expect(hint, 'every failure names a next step').toBeDefined();
       expect(repeatsBetween(message ?? '', hint ?? '')).toEqual([]);

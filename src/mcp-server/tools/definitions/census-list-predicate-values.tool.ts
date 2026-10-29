@@ -8,8 +8,9 @@
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getDiscoveryConfig } from '@/config/server-config.js';
+import { renderNotice } from '@/mcp-server/tools/notice-trailer.js';
 import { getCensusApiService } from '@/services/census-api/census-api-service.js';
 import type { CensusPredicateValue } from '@/services/census-api/types.js';
 import {
@@ -26,17 +27,18 @@ const NAICS_DIMENSION = /^NAICS\d{4}$/;
 const WITHHELD_SAMPLE_SIZE = 3;
 
 /**
- * Time each publication probe gets, every attempt and backoff included. The check is best-effort, so
- * a probe that never answers must not hold the call past the 60-second request timeout MCP SDK
- * clients default to — four 15-second attempts plus backoff came to 66 s. A failing probe's four
- * fast attempts and their 1/2/4 s backoff (at most 8.75 s with jitter) still fit; the probes run in
- * parallel, so two of them do not lengthen it.
+ * Time each publication probe gets, every attempt and backoff included — half the 40 s a data
+ * request gets by default. The check is best-effort and the value map answers without it, so a
+ * probe that never answers costs the call 20 s before the unchecked list goes out. A failing
+ * probe's four fast attempts and their 1/2/4 s backoff (at most 8.75 s with jitter) still fit; the
+ * probes run in parallel, so two of them do not lengthen it.
  */
 const PUBLICATION_CHECK_DEADLINE_MS = 20_000;
 
 /**
- * The codes a dimension's published value map declares that the dataset actually serves rows for,
- * or `undefined` when the check could not be made.
+ * The codes a dimension's published value map declares that the dataset actually serves rows for;
+ * `missing_api_key` when the check could not run for want of a working key; `undefined` when it
+ * could not be made for any other reason.
  *
  * A `values.item` map is a classification the Census shares across products — `dec/ddhca` declares
  * 5,543 `POPGROUP` codes and publishes 2,996 of them, `cbp` declares 6,694 `NAICS2017` codes and
@@ -45,34 +47,58 @@ const PUBLICATION_CHECK_DEADLINE_MS = 20_000;
  * `dec/ddhcb`, where no table publishes every group and the set is the union of two tables' calls.
  *
  * The check is best-effort by design: a failure downgrades the answer to the unchecked map with a
- * notice saying so, which is worse than a checked list but better than no list at all. A caller's
- * cancellation is not a failure of the check, so it propagates.
+ * notice saying so, which is worse than a checked list but better than no list at all. The value
+ * map itself needs no key, so a missing or rejected one costs only the check — the service refuses
+ * an unset key before any request and a rejected one on its first answer. A caller's cancellation
+ * is not a failure of the check, so it propagates.
  */
 async function fetchPublishedCodes(
   dataset: string,
   year: number,
   predicate: string,
   ctx: Context,
-): Promise<Set<string> | undefined> {
+): Promise<Set<string> | 'missing_api_key' | undefined> {
   try {
     const measures = await getVariableCacheService().findPublicationProbes(dataset, year, ctx);
     if (measures.length === 0) return;
 
+    // Every probe ends with the call: the first to fail aborts the rest, and each is awaited, so
+    // none is left retrying after the answer goes out. Failures are kept in the order they landed,
+    // so the one reported is the one that ended the check rather than a sibling it aborted.
+    const controller = new AbortController();
+    const failures: unknown[] = [];
     const answers = await Promise.all(
       measures.map((measure) =>
-        getCensusApiService().fetchPredicateValues(
-          { dataset, year, code: predicate, measure, deadlineMs: PUBLICATION_CHECK_DEADLINE_MS },
-          ctx,
-        ),
+        getCensusApiService()
+          .fetchPredicateValues(
+            {
+              dataset,
+              year,
+              code: predicate,
+              measure,
+              deadlineMs: PUBLICATION_CHECK_DEADLINE_MS,
+              signal: controller.signal,
+            },
+            ctx,
+          )
+          .catch((error: unknown) => {
+            failures.push(error);
+            controller.abort();
+          }),
       ),
     );
+    if (failures.length > 0) throw failures[0];
+    const published = answers.filter((answer) => answer !== undefined);
     // An empty answer is the probe saying nothing rather than the dimension having no codes —
     // withholding every code on the strength of it would hide the whole dimension, and a union
     // missing one table's groups would hide those.
-    if (answers.some((published) => published.length === 0)) return;
-    return new Set(answers.flatMap((published) => published.map((v) => v.code)));
+    if (published.some((values) => values.length === 0)) return;
+    return new Set(published.flatMap((values) => values.map((v) => v.code)));
   } catch (error) {
     if (ctx.signal.aborted) throw error;
+    if (error instanceof McpError && error.data?.reason === 'missing_api_key') {
+      return 'missing_api_key';
+    }
     ctx.log.warning('Publication check failed; falling back to the unchecked value map', {
       dataset,
       year,
@@ -86,7 +112,7 @@ async function fetchPublishedCodes(
 export const censusListPredicateValues = tool('census_list_predicate_values', {
   title: 'List Census Predicate Values',
   description:
-    "List the codes a Census filter dimension accepts, so a predicates map can be written without guessing. Answers the question left open when census_query_data or census_compare_geographies reports that a dimension was left unset. Which route a dimension takes depends on the vintage: NAICS and POPGROUP always publish a value list in the dataset dictionary, and on the current vintages EMPSZES, LFO, RCPSZES, TAXSTAT, and TYPOP publish none and are enumerated here against the live data endpoint instead. A dictionary value list is a classification shared across Census products rather than a list of what one dataset serves, and roughly half of its codes typically return no rows anywhere — those are checked against the dataset's own published rows and dropped, and the response source field says whether that check ran. The dictionary lists run to thousands of codes and are best narrowed with query. Pass the returned code as the dimension's value in predicates.",
+    "List the codes a Census filter dimension accepts, so a predicates map can be written without guessing. Answers the question left open when census_query_data or census_compare_geographies reports that a dimension was left unset. Which route a dimension takes depends on the vintage: NAICS and POPGROUP always publish a value list in the dataset dictionary, and on the current vintages EMPSZES, LFO, RCPSZES, TAXSTAT, and TYPOP publish none and are enumerated here against the live data endpoint instead, which needs the server's Census API key. A dictionary value list is a classification shared across Census products rather than a list of what one dataset serves, and roughly half of its codes typically return no rows anywhere — those are checked against the dataset's own published rows and dropped, a check that also reads the data endpoint and so needs the key; without a working key the dictionary list comes back unchecked, and the response source field says whether that check ran. The dictionary lists run to thousands of codes and are best narrowed with query. Pass the returned code as the dimension's value in predicates.",
   annotations: { readOnlyHint: true, openWorldHint: false },
   input: z.object({
     predicate: z
@@ -173,6 +199,8 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
         'Guidance when the list was truncated, when query matched no published code, when codes from the dataset dictionary could not be checked against its published rows, or when the codes returned are complete only for a named industry rather than for the dimension as a whole.',
       ),
   },
+  // The notice quotes the query and the labels of withheld codes.
+  enrichmentTrailer: { notice: { render: renderNotice } },
 
   errors: [
     {
@@ -181,6 +209,14 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
       when: 'Dataset code is missing or not recognized, even after case and shorthand resolution.',
       thrownBy: 'service',
       recovery: 'Call census_list_datasets to discover valid dataset codes like cbp or nonemp.',
+    },
+    {
+      reason: 'missing_api_key',
+      code: JsonRpcErrorCode.Unauthorized,
+      when: 'A dimension with no published value list is enumerated against the data endpoint, and CENSUS_API_KEY is not configured or the key is invalid.',
+      thrownBy: 'service',
+      recovery:
+        'Set the CENSUS_API_KEY environment variable and restart the server. Register a free key at api.census.gov/data/key_signup.html.',
     },
     {
       reason: 'year_not_available',
@@ -214,7 +250,7 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
     {
       reason: 'upstream_error',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Census API returned an error or was unreachable.',
+      when: 'Census API returned an error, was unreachable, or did not answer the enumeration within its 40-second limit across retries.',
       retryable: true,
       thrownBy: 'service',
       recovery:
@@ -272,7 +308,7 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
     /** Declared codes the dataset publishes no rows for — dropped from `all`, named in a notice. */
     let withheld: CensusPredicateValue[] = [];
     /** Why the declared codes were returned unchecked, when they were. */
-    let unchecked: 'per_industry' | 'check_unavailable' | undefined;
+    let unchecked: 'per_industry' | 'missing_api_key' | 'check_unavailable' | undefined;
 
     const dimensions = await variableCacheService.getFilterDimensions(dataset, year, ctx);
     /** The dataset's own industry dimension, when it has one. */
@@ -290,14 +326,14 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
         ? undefined
         : await fetchPublishedCodes(dataset, year, predicate, ctx);
 
-      if (published) {
+      if (published instanceof Set) {
         all = declared.filter((v) => published.has(v.code));
         withheld = declared.filter((v) => !published.has(v.code));
         source = 'dataset_dictionary_verified';
       } else {
         all = declared;
         source = 'dataset_dictionary';
-        unchecked = perIndustry ? 'per_industry' : 'check_unavailable';
+        unchecked = perIndustry ? 'per_industry' : (published ?? 'check_unavailable');
       }
     } else {
       const naicsValue = input.within_naics?.trim();
@@ -362,6 +398,10 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
     } else if (unchecked === 'per_industry') {
       notices.push(
         `${dataset} (${year}) publishes ${predicate} per industry, so which of these codes return rows depends on the ${naicsCode} value sent alongside them. These are the codes ${predicate} declares, not a list of what any one industry serves — confirm one with a census_query_data call that sets both.`,
+      );
+    } else if (unchecked === 'missing_api_key') {
+      notices.push(
+        `These are the codes ${predicate} declares in ${dataset} (${year}), unchecked against the rows the dataset publishes: that check reads the Census data API, which needs a CENSUS_API_KEY this server has not set or that the Census API rejected. The list itself needs no key. A declared code can return nothing at any geography, so confirm one with census_query_data once a valid key is configured.`,
       );
     } else if (unchecked === 'check_unavailable') {
       notices.push(

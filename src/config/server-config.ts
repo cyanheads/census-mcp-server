@@ -32,12 +32,16 @@ export function getDiscoveryConfig(): DiscoveryConfig {
 }
 
 /**
- * Full server config — requires CENSUS_API_KEY. Used only by tools that call the
- * Census Data API (census_query_data, census_compare_geographies).
+ * Full server config — adds CENSUS_API_KEY. Read only by the Census API service's two keyed
+ * methods: `queryData` (census_query_data, census_compare_geographies) and `fetchPredicateValues`
+ * (census_list_predicate_values, both its live route and its dictionary publication check). The
+ * key is optional here so an unset one reaches those paths as a typed `missing_api_key` rather
+ * than failing the parse; a malformed year or TTL still fails it.
  */
 const ServerConfigSchema = DiscoveryConfigSchema.extend({
   censusApiKey: z
     .string()
+    .optional()
     .describe('Census Bureau API key from api.census.gov/data/key_signup.html'),
 });
 

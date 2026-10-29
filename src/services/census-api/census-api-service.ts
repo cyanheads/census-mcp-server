@@ -14,7 +14,7 @@ import {
   getVariableCacheService,
   isAcsDataset,
 } from '@/services/variable-cache/variable-cache-service.js';
-import { censusHttpError, FIRST_UNKNOWN_ONLY } from './errors.js';
+import { censusDeadlineError, censusHttpError, FIRST_UNKNOWN_ONLY } from './errors.js';
 import type {
   CensusDataRow,
   CensusGeographyLevel,
@@ -35,6 +35,21 @@ const CENSUS_API_BASE = 'https://api.census.gov/data';
 
 /** The Census API rejects a request whose `get=` list names more than this many columns. */
 const GET_COLUMN_LIMIT = 50;
+
+/** Longest one data-endpoint attempt may run, response body included. */
+const DATA_ATTEMPT_TIMEOUT_MS = 15_000;
+
+/**
+ * Time a data-endpoint request gets, every attempt and backoff included. Without it a hung
+ * endpoint held the call through four 15-second attempts and their backoff, about 67 s — past the
+ * 60-second request timeout MCP SDK clients default to, so the caller saw a client timeout rather
+ * than this server's error. Every California block group on acs/acs5 2024 with 49 variables
+ * answered in 11–14 s end to end, so the first attempt keeps its full 15 s and a second full
+ * attempt still fits after a fast transient failure. A hung endpoint settles here, 20 s inside the
+ * client default once the metadata requests ahead of it are cached; those requests carry no
+ * deadline of their own.
+ */
+const DATA_REQUEST_DEADLINE_MS = 40_000;
 
 /**
  * Zero-pad a fixed-width parent FIPS code to the width the Census API matches on, returning
@@ -366,6 +381,138 @@ function applyFlag(
   };
 }
 
+/**
+ * Read a data-endpoint body into rows. Both keyed requests answer the same way, so both read it
+ * here, inside their retry loops.
+ *
+ * An HTML page in place of JSON is one of two things. api.census.gov redirects a request whose key
+ * it refuses to a page naming the key signup form, which no retry changes, so that page is
+ * `missing_api_key` and ends the loop on its first answer. Any other page is an outage page, worth
+ * retrying as `upstream_error`.
+ */
+function parseDataBody(status: number, text: string): CensusRawResponse {
+  // A well-formed query that matches nothing answers 204 with an empty body — the caller's
+  // problem is no data, not an unparseable upstream response worth retrying.
+  if (status === 204 || text.trim() === '') return [];
+
+  if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
+    if (text.includes('Invalid Key') || text.includes('key_signup')) {
+      throw unauthorized('The Census API rejected CENSUS_API_KEY as invalid.', {
+        reason: 'missing_api_key',
+      });
+    }
+    throw serviceUnavailable('Census API returned HTML instead of JSON.', {
+      reason: 'upstream_error',
+    });
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw serviceUnavailable('Census API returned unparseable response.', {
+      reason: 'upstream_error',
+    });
+  }
+
+  if (!Array.isArray(parsed)) {
+    throw serviceUnavailable('Census API response was not an array.', {
+      reason: 'upstream_error',
+    });
+  }
+
+  return parsed as CensusRawResponse;
+}
+
+/** What one geography.json entry makes of a call, and the changes that would satisfy it. */
+interface EntryVerdict {
+  check: Exclude<GeographyCheck, { status: 'level_not_supported' }>;
+  /** Parents the call would have to add, as it stands. */
+  missing: string[];
+  /** Parents it would have to add with a `*` target. */
+  missingUnderWildcard: string[];
+  /** Supplied parents it would have to drop. */
+  unaccepted: SuppliedParent[];
+}
+
+/** Judge a call against one entry for its level, by the entry's own `requires` list. */
+function judgeEntry(
+  level: CensusGeographyLevel,
+  call: {
+    geographyFips: string;
+    supplied: SuppliedParent[];
+    parentFips?: string;
+    countyFips?: string;
+    tractFips?: string;
+  },
+): EntryVerdict {
+  const required = level.requires ?? [];
+  // A `*` target lets the Census API infer the innermost optional parent and everything
+  // below it — `optionalWithWCFor` names where that cutoff starts. Without it, or with a
+  // concrete FIPS target, every required parent must be supplied.
+  const cutoff = level.optionalWithWCFor ? required.indexOf(level.optionalWithWCFor) : -1;
+  const underWildcard = cutoff >= 0 ? required.slice(0, cutoff) : required;
+  const effective = call.geographyFips === '*' ? underWildcard : required;
+
+  // A `*` parent stands in for every code only where the entry lists that parent under
+  // `wildcard`; the Census API answers any other with a 400 ("wildcard not allowed for 'state'
+  // in geography hierarchy"). Under a concrete tract it refuses `county:*` whatever the list says
+  // ("wildcard mismatch"), since a tract code is unique only inside its county — including the
+  // tract a single block group still has to add, so one retry names both. Either way the parent
+  // needs a concrete code, so it counts as one still to add.
+  const wildcards = level.wildcard ?? [];
+  const starRefused = (name: string, mandatory: string[]) =>
+    (name === 'state' && call.parentFips === '*' && !wildcards.includes('state')) ||
+    (name === 'county' &&
+      call.countyFips === '*' &&
+      (!wildcards.includes('county') ||
+        (required.includes('tract') &&
+          (call.tractFips !== undefined || mandatory.includes('tract')))));
+  const lacking = (mandatory: string[]) => (name: string) =>
+    starRefused(name, mandatory) ||
+    (mandatory.includes(name) && !call.supplied.some((parent) => parent === name));
+
+  const missing = required.filter(lacking(effective));
+  const missingUnderWildcard = required.filter(lacking(underWildcard));
+  // The mirror of the missing-parent case: a parent the level never names produces an
+  // `in=` clause the Census API answers with an opaque 400. Acceptance is a property of
+  // the level, so it is checked against the full `requires` list rather than `effective` —
+  // the `*` wildcard relaxes which parents are mandatory, never which ones are allowed.
+  const unaccepted = call.supplied.filter((name) => !required.includes(name));
+  const changes = { missing, missingUnderWildcard, unaccepted };
+
+  if (missing.length > 0) {
+    // A concrete target can demand parents (e.g. block group needs its tract) that a `*`
+    // target would not — worth telling the caller, since `*` is an input they control.
+    const wildcardRelaxes =
+      call.geographyFips !== '*' && missingUnderWildcard.length < missing.length;
+    // A parent to drop rides along, so one retry satisfies the entry rather than meeting
+    // `parent_not_accepted` once the additions are in.
+    return {
+      ...changes,
+      check: {
+        status: 'parent_required',
+        missingParents: missing,
+        wildcardRelaxes,
+        ...(unaccepted.length > 0 && { unacceptedParents: unaccepted }),
+      },
+    };
+  }
+
+  if (unaccepted.length > 0) {
+    return {
+      ...changes,
+      check: {
+        status: 'parent_not_accepted',
+        unacceptedParents: unaccepted,
+        acceptedParents: required,
+      },
+    };
+  }
+
+  return { ...changes, check: { status: 'ok', acceptedParents: required } };
+}
+
 interface GeographyLevelsCacheEntry {
   fetchedAt: number;
   levels: CensusGeographyLevel[];
@@ -382,6 +529,24 @@ export class CensusApiService {
 
   /** Wildcard group-by enumerations per dataset+year+dimension+NAICS scope. */
   private readonly predicateValuesCache = new Map<string, PredicateValuesCacheEntry>();
+
+  /**
+   * The configured Census API key, read by each method that sends one before it builds a request.
+   * The config parse leaves an unset, blank, or unsubstituted key undefined, so the keyless tools
+   * keep working; here it becomes the `missing_api_key` the keyed tools declare.
+   */
+  private requireApiKey(): string {
+    const { censusApiKey } = getServerConfig();
+    if (!censusApiKey) {
+      throw unauthorized(
+        'CENSUS_API_KEY is not set, so this call cannot reach the Census data API.',
+        {
+          reason: 'missing_api_key',
+        },
+      );
+    }
+    return censusApiKey;
+  }
 
   /**
    * Query a Census dataset for variables at a specific geography.
@@ -411,7 +576,7 @@ export class CensusApiService {
     },
     ctx: Context,
   ): Promise<CensusDataRow[]> {
-    const { censusApiKey } = getServerConfig();
+    const censusApiKey = this.requireApiKey();
 
     /**
      * Beyond the caller's codes, `get=` carries: the label attribute of each filter dimension the
@@ -450,12 +615,15 @@ export class CensusApiService {
     });
 
     const raw = await withRetry(
-      async () => {
+      async ({ signal, remainingMs }) => {
         let response: Response;
         try {
-          response = await fetchWithTimeout(url, 15_000, ctx as unknown as RequestContext, {
-            signal: ctx.signal,
-          });
+          response = await fetchWithTimeout(
+            url,
+            Math.min(DATA_ATTEMPT_TIMEOUT_MS, remainingMs),
+            ctx as unknown as RequestContext,
+            { signal },
+          );
         } catch (error) {
           throw censusHttpError(error, {
             dataset: params.dataset,
@@ -464,48 +632,17 @@ export class CensusApiService {
             requestedCodes: params.variables,
           });
         }
-        const text = await response.text();
-
-        // A well-formed query that matches nothing answers 204 with an empty body — the
-        // caller's problem is no_data, not an unparseable upstream response worth retrying.
-        if (response.status === 204 || text.trim() === '') return [] as CensusRawResponse;
-
-        if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
-          if (text.includes('Invalid Key') || text.includes('key_signup')) {
-            throw unauthorized('Census API key is invalid or missing.', {
-              reason: 'missing_api_key',
-            });
-          }
-          throw serviceUnavailable('Census API returned HTML instead of JSON.', {
-            reason: 'upstream_error',
-          });
-        }
-
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(text);
-        } catch {
-          throw serviceUnavailable('Census API returned unparseable response.', {
-            reason: 'upstream_error',
-          });
-        }
-
-        if (!Array.isArray(parsed)) {
-          throw serviceUnavailable('Census API response was not an array.', {
-            reason: 'upstream_error',
-          });
-        }
-
-        return parsed as CensusRawResponse;
+        return parseDataBody(response.status, await response.text());
       },
       {
         operation: 'CensusApiService.queryData',
         context: ctx as unknown as RequestContext,
         baseDelayMs: 1000,
         signal: ctx.signal,
+        deadlineMs: DATA_REQUEST_DEADLINE_MS,
       },
     ).catch(async (error: unknown) => {
-      throw await this.pointAtSibling(error, params, ctx);
+      throw await this.pointAtSibling(censusDeadlineError(error, params), params, ctx);
     });
 
     return this.parseResponse(raw, params, ctx);
@@ -539,6 +676,19 @@ export class CensusApiService {
    * Check a geography level and its supplied parents against the dataset's own
    * geography.json before spending a data query on a request the Census API will reject.
    *
+   * geography.json can list one level name under several hierarchies — `new england city and
+   * town area` sits both under a combined NECTA and on its own, and `state (or part)` ten ways on
+   * acs/acs5 2020 — each entry a hierarchy the level can be queried in. Every entry
+   * with the name is judged, and the call runs when any one accepts it, with that entry's parents
+   * as the scopes left to narrow by. No served dataset-year has two entries accepting one call.
+   *
+   * When none accepts, the outcome reported is that of the entry the caller can satisfy with the
+   * fewest changes to `scopeParents` — adding a parent ahead of dropping one, since a supplied
+   * parent is the caller's intent. Failing that, an entry a `*` target would put within reach, since
+   * `*` is also an input the caller has; only when neither exists is a parent out of reach named.
+   * A level listed once has one entry to report, whatever it says. A `parent_required` outcome
+   * also names the supplied parents that entry does not take, so one retry can satisfy it.
+   *
    * Returns `ok` when the dataset has no metadata for the year — the data call then
    * reports the real problem rather than this check guessing at one.
    */
@@ -549,6 +699,8 @@ export class CensusApiService {
       geographyLevel: string;
       /** The `for=` value — `*` relaxes the innermost required parent. */
       geographyFips: string;
+      /** The parents the calling tool has a scope input for. */
+      scopeParents: readonly SuppliedParent[];
       /** State FIPS, when supplied by the caller. */
       parentFips?: string;
       /** County FIPS, when supplied by the caller. */
@@ -562,56 +714,42 @@ export class CensusApiService {
     if (levels.length === 0) return { status: 'ok' };
 
     const target = params.geographyLevel.trim().toLowerCase();
-    const level = levels.find((l) => l.name.toLowerCase() === target);
-    if (!level) {
+    const entries = levels.filter((l) => l.name.toLowerCase() === target);
+    if (entries.length === 0) {
       return {
         status: 'level_not_supported',
         availableLevels: [...new Set(levels.map((l) => l.name))],
       };
     }
 
-    const required = level.requires ?? [];
-    // A `*` target lets the Census API infer the innermost optional parent and everything
-    // below it — `optionalWithWCFor` names where that cutoff starts. Without it, or with a
-    // concrete FIPS target, every required parent must be supplied.
-    const cutoff = level.optionalWithWCFor ? required.indexOf(level.optionalWithWCFor) : -1;
-    const underWildcard = cutoff >= 0 ? required.slice(0, cutoff) : required;
-    const effective = params.geographyFips === '*' ? underWildcard : required;
-
     // state, county, and tract are the only parents the `in=` clause can express.
     const supplied: SuppliedParent[] = [];
     if (params.parentFips) supplied.push('state');
     if (params.countyFips) supplied.push('county');
     if (params.tractFips) supplied.push('tract');
-    const unsupplied = (name: string) => !supplied.some((parent) => parent === name);
 
-    const missingParents = effective.filter(unsupplied);
-    if (missingParents.length > 0) {
-      // A concrete target can demand parents (e.g. block group needs its tract) that a `*`
-      // target would not — worth telling the caller, since `*` is an input they control.
-      const wildcardRelaxes =
-        params.geographyFips !== '*' &&
-        underWildcard.filter(unsupplied).length < missingParents.length;
+    const verdicts = entries.map((entry) => judgeEntry(entry, { ...params, supplied }));
+    const accepting = verdicts.find((verdict) => verdict.check.status === 'ok');
+    if (accepting) return accepting.check;
 
-      return { status: 'parent_required', missingParents, wildcardRelaxes };
-    }
-
-    // The mirror of the missing-parent case: a parent the level never names produces an
-    // `in=` clause the Census API answers with an opaque 400. Acceptance is a property of
-    // the level, so it is checked against the full `requires` list rather than `effective` —
-    // the `*` wildcard relaxes which parents are mandatory, never which ones are allowed.
-    const unacceptedParents = supplied.filter((name) => !required.includes(name));
-    if (unacceptedParents.length > 0) {
-      return { status: 'parent_not_accepted', unacceptedParents, acceptedParents: required };
-    }
-
-    // A tract code is unique only inside its county, and the Census API answers `county:*` under
-    // a concrete tract with a 400 ("wildcard mismatch"), so a `*` county counts as no county here.
-    if (params.tractFips && params.countyFips === '*') {
-      return { status: 'parent_required', missingParents: ['county'], wildcardRelaxes: false };
-    }
-
-    return { status: 'ok', acceptedParents: required };
+    const reachable = (parents: string[]) =>
+      parents.every((parent) => params.scopeParents.some((scope) => scope === parent));
+    const rank = (verdict: EntryVerdict) => [
+      reachable(verdict.missing)
+        ? 0
+        : params.geographyFips !== '*' && reachable(verdict.missingUnderWildcard)
+          ? 1
+          : 2,
+      verdict.missing.length + verdict.unaccepted.length,
+      verdict.unaccepted.length,
+    ];
+    const closer = (a: number[], b: number[]) => {
+      const at = a.findIndex((value, i) => value !== b[i]);
+      return at >= 0 && (a[at] as number) < (b[at] as number);
+    };
+    // Entry order breaks a tie, so a level listed once reports its only entry.
+    return verdicts.reduce((best, verdict) => (closer(rank(verdict), rank(best)) ? verdict : best))
+      .check;
   }
 
   /**
@@ -722,12 +860,17 @@ export class CensusApiService {
       measure?: string;
       /** NAICS dimension code and industry value to scope the enumeration by. */
       naicsScope?: { code: string; value: string };
-      /** Time every attempt and backoff get together, for a caller that can answer without this. */
+      /**
+       * Time every attempt and backoff get together — the data-request deadline unless a caller
+       * that can answer without this sets a shorter one.
+       */
       deadlineMs?: number;
+      /** Ends the request early alongside the caller's own signal — a sibling request failing. */
+      signal?: AbortSignal;
     },
     ctx: Context,
   ): Promise<CensusPredicateValue[]> {
-    const { censusApiKey } = getServerConfig();
+    const censusApiKey = this.requireApiKey();
     const ttlMs = getDiscoveryConfig().variableCacheTtlHours * 60 * 60 * 1000;
     const scopeKey = params.naicsScope
       ? `${params.naicsScope.code}=${params.naicsScope.value}`
@@ -757,7 +900,7 @@ export class CensusApiService {
         try {
           response = await fetchWithTimeout(
             url,
-            Math.min(15_000, remainingMs),
+            Math.min(DATA_ATTEMPT_TIMEOUT_MS, remainingMs),
             ctx as unknown as RequestContext,
             { signal },
           );
@@ -768,42 +911,19 @@ export class CensusApiService {
             availableYears: DATASET_AVAILABLE_YEARS[params.dataset],
           });
         }
-        const text = await response.text();
-
         // A dimension with nothing to enumerate under this scope answers 204 with no body.
-        if (response.status === 204 || text.trim() === '') return [] as CensusRawResponse;
-
-        if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
-          throw serviceUnavailable('Census API returned HTML instead of JSON.', {
-            reason: 'upstream_error',
-          });
-        }
-
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(text);
-        } catch {
-          throw serviceUnavailable('Census API returned unparseable response.', {
-            reason: 'upstream_error',
-          });
-        }
-
-        if (!Array.isArray(parsed)) {
-          throw serviceUnavailable('Census API response was not an array.', {
-            reason: 'upstream_error',
-          });
-        }
-
-        return parsed as CensusRawResponse;
+        return parseDataBody(response.status, await response.text());
       },
       {
         operation: 'CensusApiService.fetchPredicateValues',
         context: ctx as unknown as RequestContext,
         baseDelayMs: 1000,
-        signal: ctx.signal,
-        ...(params.deadlineMs !== undefined && { deadlineMs: params.deadlineMs }),
+        signal: params.signal ? AbortSignal.any([ctx.signal, params.signal]) : ctx.signal,
+        deadlineMs: params.deadlineMs ?? DATA_REQUEST_DEADLINE_MS,
       },
-    );
+    ).catch((error: unknown) => {
+      throw censusDeadlineError(error, params);
+    });
 
     const values: CensusPredicateValue[] = [];
     if (raw.length > 1) {

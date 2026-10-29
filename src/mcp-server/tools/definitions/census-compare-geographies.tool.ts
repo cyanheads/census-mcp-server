@@ -6,6 +6,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, validationError } from '@cyanheads/mcp-ts-core/errors';
 import { getDiscoveryConfig } from '@/config/server-config.js';
+import { renderNotice } from '@/mcp-server/tools/notice-trailer.js';
 import {
   renderVariable,
   toVariableEntry,
@@ -36,6 +37,9 @@ import {
   wildcardColumnsFor,
 } from '@/services/variable-cache/variable-cache-service.js';
 
+/** The input that supplies a parent this tool can scope by — it has none for a tract. */
+const scopeInput = (parent: string) => (parent === 'state' ? 'within' : 'within_county');
+
 export const censusCompareGeographies = tool('census_compare_geographies', {
   title: 'Compare Census Geographies',
   description:
@@ -62,7 +66,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
       ])
       .optional()
       .describe(
-        'State FIPS to constrain results (e.g., "53" to compare counties or tracts within WA only). Omit to compare all geographies at the level nationally. Use census_resolve_geography to get state_fips. Pass "*" to span every state. Blank is treated as omitted.',
+        'State FIPS to constrain results (e.g., "53" to compare counties or tracts within WA only). Omit to compare all geographies at the level nationally. Use census_resolve_geography to get state_fips. Pass "*" to span every state on the levels whose hierarchy lets "*" stand in for the state, such as county and place; tract, block group, and county subdivision need one state. Blank is treated as omitted.',
       ),
     within_county: z
       .union([
@@ -74,7 +78,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
       ])
       .optional()
       .describe(
-        'County FIPS to constrain tract or block-group comparisons to a single county within the state specified by within (e.g., "033" for King County). Required when geography_level is "tract" or "block group" and you want county-scoped results. census_resolve_geography returns this as county_fips. Pass "*" to span every county in the state, which is the only way a block-group comparison reaches a whole state. Blank is treated as omitted.',
+        'County FIPS to constrain tract or block-group comparisons to a single county within the state specified by within (e.g., "033" for King County). Required when geography_level is "tract" or "block group" and you want county-scoped results. census_resolve_geography returns this as county_fips. Pass "*" to span every county in the state, which is the only way a block-group comparison reaches a whole state; "*" works on the levels whose hierarchy lets it stand in for the county, such as tract and block group. Blank is treated as omitted.',
       ),
     geographies: z
       .array(z.string())
@@ -186,6 +190,8 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
         'Guidance when results were truncated, when the sort column holds no number on any row (so the rows are in the order the Census returned them rather than ranked), when geographies entries matched no row, when a bare level code matched more than one state, or when the dataset declares filter dimensions the comparison left unset — how to narrow scope, raise the limit, correct the FIPS codes, or add the predicates that pin what the ranking covers. For an unset dimension it also quotes the label of the default the Census API applied, which is what says whether the ranking is on a total or on one category. On dec/ddhca and dec/ddhcb tables that split the population groups between them, it names the sibling tables a geography left out of the ranking may sit in. Also names any variable codes whose flags could not be checked because the request had no room left under the Census 50-column limit — a withheld value there reads as 0 and ranks as one.',
       ),
   },
+  // The notice quotes unmatched geographies entries and the labels of applied defaults.
+  enrichmentTrailer: { notice: { render: renderNotice } },
 
   errors: [
     {
@@ -213,14 +219,14 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
     {
       reason: 'parent_required',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The geography level requires a parent FIPS but within, or within_county, was not provided.',
+      when: 'The geography level requires a parent FIPS but within, or within_county, was not provided, or within or within_county is "*" where the level\'s hierarchy does not let "*" stand in for that parent. For a level the dataset lists under several hierarchies, no hierarchy accepts the call and the error describes the one closest to accepting it, which can need a parent this tool has no input for. When that hierarchy also does not take a parent the call supplied, the error names that parent to drop as well.',
       recovery:
-        'Add the within parameter with the state FIPS from census_resolve_geography state_fips. For tract or block-group levels also add within_county from census_resolve_geography county_fips.',
+        'Add the within parameter with the state FIPS from census_resolve_geography state_fips. For tract or block-group levels also add within_county from census_resolve_geography county_fips. Replace a "*" the error names with one concrete code, and drop any parent it names as not accepted.',
     },
     {
       reason: 'parent_not_accepted',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'within or within_county names a parent the geography level does not sit within.',
+      when: 'within or within_county names a parent the geography level does not sit within — for a level listed under several hierarchies, one that dropping the parent reaches.',
       recovery:
         'Drop the parent this level does not name. Levels such as urban area, zip code tabulation area, and metropolitan statistical area/micropolitan statistical area are compared nationally with no scope at all; census_list_geographies shows the parents each level takes.',
     },
@@ -287,7 +293,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
     {
       reason: 'upstream_error',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Census API was unreachable or returned an error.',
+      when: 'Census API was unreachable, returned an error, or did not finish answering the data request within its 40-second limit across retries.',
       retryable: true,
       thrownBy: 'service',
       recovery:
@@ -356,6 +362,8 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
         year,
         geographyLevel: input.geography_level,
         geographyFips,
+        // No tract input: a hierarchy that needs one is out of this tool's reach.
+        scopeParents: ['state', 'county'],
         ...(parentFips !== undefined && { parentFips }),
         ...(countyFips !== undefined && { countyFips }),
       },
@@ -377,30 +385,47 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
 
     if (check.status === 'parent_required') {
       const missing = check.missingParents;
-      const steps = missing.map((parent) =>
-        parent === 'state'
-          ? 'add within (census_resolve_geography returns it as state_fips)'
-          : parent === 'county'
-            ? 'add within_county (census_resolve_geography returns it as county_fips)'
-            : `scope the comparison by ${parent}, which this tool has no input for — call census_list_geographies and pick a level whose only parents are state and county`,
+      // A parent sent as `*` is missing only because this level's hierarchy will not let `*`
+      // stand in for it, so the step is a concrete code in its place rather than a new input.
+      const starred = missing.filter(
+        (parent) =>
+          (parent === 'state' && parentFips === '*') || (parent === 'county' && countyFips === '*'),
       );
+      const steps = missing.map((parent) => {
+        if (parent === 'state') {
+          return starred.includes('state')
+            ? 'set within to one 2-digit state FIPS instead of "*" (census_resolve_geography returns it as state_fips)'
+            : 'add within (census_resolve_geography returns it as state_fips)';
+        }
+        if (parent === 'county') {
+          return starred.includes('county')
+            ? 'set within_county to one 3-digit county FIPS instead of "*" (census_resolve_geography returns it as county_fips)'
+            : 'add within_county (census_resolve_geography returns it as county_fips)';
+        }
+        return `scope the comparison by ${parent}, which this tool has no input for — call census_list_geographies and pick a level whose only parents are state and county`;
+      });
+      // The hierarchy that needs these parents can also refuse one the call sent; naming both
+      // changes lets one retry reach it.
+      const unaccepted = check.unacceptedParents ?? [];
+      if (unaccepted.length > 0) {
+        steps.push(`drop ${unaccepted.map(scopeInput).join(' and ')}`);
+      }
       throw ctx.fail(
         'parent_required',
-        `Geography level "${input.geography_level}" in ${dataset} (${year}) must be scoped by ${missing.join(' and ')}.`,
+        `Geography level "${input.geography_level}" in ${dataset} (${year}) must be scoped by ${missing.join(' and ')}${starred.length > 0 ? `; "*" does not stand in for ${starred.join(' or ')} here` : ''}${unaccepted.length > 0 ? `, and does not accept ${unaccepted.join(' or ')} as a parent` : ''}.`,
         {
           dataset,
           year,
           geographyLevel: input.geography_level,
           missingParents: missing,
+          ...(unaccepted.length > 0 && { unacceptedParents: unaccepted }),
           recovery: { hint: `To compare at this level, ${steps.join(', and ')}.` },
         },
       );
     }
 
     if (check.status === 'parent_not_accepted') {
-      const inputs = check.unacceptedParents.map((parent) =>
-        parent === 'state' ? 'within' : 'within_county',
-      );
+      const inputs = check.unacceptedParents.map(scopeInput);
       const scope =
         check.acceptedParents.length > 0
           ? `it sits within ${check.acceptedParents.join(' and ')} only`
@@ -415,7 +440,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
           unacceptedParents: check.unacceptedParents,
           acceptedParents: check.acceptedParents,
           recovery: {
-            hint: `Drop ${inputs.join(' and ')} — ${scope}, so the comparison runs unscoped. Call census_list_geographies to see the parents each level takes.`,
+            hint: `Drop ${inputs.join(' and ')} — ${scope}, so the comparison needs no other scope. Call census_list_geographies to see the parents each level takes.`,
           },
         },
       );

@@ -134,9 +134,9 @@ export function getDiscoveryConfig() {
   return _discoveryConfig;
 }
 
-// Full config — adds the key. Read only on the paths that call the Census Data API.
+// Full config — adds the key, optional so an unset one reaches the keyed paths as missing_api_key.
 const ServerConfigSchema = DiscoveryConfigSchema.extend({
-  censusApiKey: z.string().describe('Census Bureau API key'),
+  censusApiKey: z.string().optional().describe('Census Bureau API key'),
 });
 
 let _config: z.infer<typeof ServerConfigSchema> | undefined;
@@ -150,9 +150,9 @@ export function getServerConfig() {
 }
 ```
 
-Tool handlers read `getDiscoveryConfig()`; only the Census API service calls `getServerConfig()`, so keyless tools keep working without `CENSUS_API_KEY`.
+Tool handlers read `getDiscoveryConfig()`; only the Census API service calls `getServerConfig()`, through one helper (`requireApiKey`) that its two keyed methods — `queryData` and `fetchPredicateValues` — call before building a request. An unset key there throws `missing_api_key` (Unauthorized), so the keyless tools keep working without `CENSUS_API_KEY` and the keyed ones (`census_query_data`, `census_compare_geographies`, and `census_list_predicate_values`'s live route and publication check) fail with a typed reason rather than a config error. The "Invalid Key" page the Census API answers a rejected key with is the same reason, read once by the shared body parser, so it is never retried.
 
-`parseEnvConfig` maps Zod schema paths → env var names so errors name the variable (`CENSUS_API_KEY`) not the path (`censusApiKey`). Throws `ConfigurationError`, which the framework prints as a clean startup banner.
+`parseEnvConfig` maps Zod schema paths → env var names so errors name the variable (`CENSUS_DEFAULT_YEAR`) not the path (`defaultYear`), and reads a blank, whitespace-only, or unsubstituted `${…}` value as unset. Throws `ConfigurationError`, which the framework prints as a clean startup banner — a malformed year or TTL still does; the key no longer can.
 
 For env booleans use `z.stringbool()`, never `z.coerce.boolean()` — `Boolean("false")` is `true`, so a coerced flag can't be disabled through the environment. `z.stringbool()` parses `true/false/1/0/yes/no/on/off` and rejects anything else, so `=false` actually disables.
 
@@ -266,6 +266,7 @@ src/
       variable-search.ts                # Code and whole-word variable search, and its ranking rule
       types.ts                          # Variable types
   mcp-server/
+    tools/notice-trailer.ts             # Notice render that escapes quoted caller and upstream text in content[]
     tools/variable-entry.ts             # Per-variable output entry + rendering shared by both data tools
     tools/definitions/
       census-list-datasets.tool.ts

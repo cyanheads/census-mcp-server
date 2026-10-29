@@ -41,7 +41,7 @@ US Census Bureau demographic, economic, and housing data. Find datasets and vari
 | `census_get_variable` | Fetch full metadata for one or more variable codes — label, concept, predicate type, universe, MOE sibling — including the annotation and flag columns the data tools accept. |
 | `census_list_predicate_values` | List the codes a filter dimension accepts (`EMPSZES`, `LFO`, `POPGROUP`, `NAICS2017`…), from the dataset dictionary or a live wildcard enumeration. |
 | `census_resolve_geography` | Convert place names (e.g., "King County, WA"), ZIP codes, or street addresses to Census FIPS identifiers via TIGERweb and Census Geocoder. |
-| `census_query_data` | Query a Census dataset for variables at a specific geography. Returns estimates with MOE, Census sentinel values and withheld business values resolved to their published meanings, and predicate filtering for the business datasets. |
+| `census_query_data` | Query a Census dataset for variables at one geography, a comma-separated list of them, or every geography at a level. Returns estimates with MOE, Census sentinel values and withheld business values resolved to their published meanings, and predicate filtering for the business datasets. |
 | `census_compare_geographies` | Rank and compare variables across multiple geographies — all counties in a state, all states nationally, or a named set. Sorted table output, with the same predicate filtering. |
 
 ---
@@ -88,6 +88,7 @@ US Census Bureau demographic, economic, and housing data. Find datasets and vari
 - Lists the codes a filter dimension accepts, read from the dataset dictionary when it publishes a list and enumerated live otherwise. `NAICS*` and `POPGROUP` have long lists (thousands of codes; narrow with `query`); `EMPSZES`, `LFO`, `RCPSZES`, `TAXSTAT`, and `TYPOP` are live-only
 - Dictionary lists are checked against the rows the dataset actually publishes and unpublished codes are dropped; `source` says whether the check ran and the notice gives the number withheld
 - `query` matches code and label; results are sorted by code, and truncation is disclosed (`limit` an integer from 1 to 500, default 50; `totalCount` counts matches). On `ecnbasic`, `within_naics` scopes `TAXSTAT` and `TYPOP` to one industry
+- The live route and the dictionary check read the data endpoint, so they need `CENSUS_API_KEY`: without a working key a live-only dimension fails with `missing_api_key`, while a dictionary list still answers, unchecked, with a notice naming the key
 
 ---
 
@@ -104,6 +105,7 @@ US Census Bureau demographic, economic, and housing data. Find datasets and vari
 ### `census_query_data` <sub>tool</sub>
 
 - Requires FIPS codes (use `census_resolve_geography` for place names). `geography_fips: "*"` returns every geography at the level within the parent; each row carries `geography_fips` and the nationally unique `geography_geoid`. Wildcards return up to `limit` rows (default 50, max 500) in GEOID order, with `offset` for paging and `totalCount` and `truncated` for the rest
+- A comma-separated list (`"06,53"`, or `"033,061"` with `parent_fips: "53"`) returns one row per listed code at the same level, in GEOID order and paged the same way; codes take the level's width, no `"*"` member, and the parents a single code needs. The notice names each listed code no row came back for
 - Up to 49 variable codes per call, fewer on datasets that add label or record columns (`too_many_variables` states the maximum). Unknown codes fail with `variable_not_found`; level and parent problems fail with `parent_required` or `parent_not_accepted`. Optional `tract_fips` (6 digits, with a concrete `county_fips`) scopes a block-group or decennial block query to one tract
 - Optional `predicates` map filters the business, `pep`, and `dec` datasets and `acs/acs1/spp` (e.g., `{"NAICS2017": "5112"}`). Unset dimensions take a Census default, echoed per row in `applied_filters`; `"*"` returns one row per category, labelled in `record`. `pep/charv` returns several rows per geography, so pin one (e.g., `{"MONTH": "7"}`)
 - ACS sentinel values resolve to their published meanings, and a median in an open-ended interval is flagged `open_ended`. On `cbp`, `ecnbasic`, and `nonemp`, withheld values are reported as suppressed with the flag's meaning. A null `estimate` means suppressed, a text cell (returned under `value`), or empty
@@ -166,7 +168,7 @@ For other clients, add this to the MCP config file:
 }
 ```
 
-Register a free key at [api.census.gov/data/key_signup.html](https://api.census.gov/data/key_signup.html). Data queries (`census_query_data`, `census_compare_geographies`) require it; variable search and geography resolution work without one. For Docker or a source build, see [Running the server](#running-the-server).
+Register a free key at [api.census.gov/data/key_signup.html](https://api.census.gov/data/key_signup.html). Data queries (`census_query_data`, `census_compare_geographies`) require it, as does `census_list_predicate_values` for a dimension it enumerates live; variable search and geography resolution work without one. For Docker or a source build, see [Running the server](#running-the-server).
 
 ---
 
@@ -174,7 +176,7 @@ Register a free key at [api.census.gov/data/key_signup.html](https://api.census.
 
 | Variable | Description | Default |
 |:---------|:------------|:--------|
-| `CENSUS_API_KEY` | **Required for data queries.** Register free at api.census.gov/data/key_signup.html. | — |
+| `CENSUS_API_KEY` | **Required for data queries** (`census_query_data`, `census_compare_geographies`) and for `census_list_predicate_values` on a live-enumerated dimension; without it those fail with `missing_api_key`, and a dictionary list comes back unchecked. Register free at api.census.gov/data/key_signup.html. | — |
 | `CENSUS_DEFAULT_YEAR` | Default vintage year when no year is specified. | `2024` |
 | `CENSUS_VARIABLE_CACHE_TTL_HOURS` | Hours to cache variables.json per dataset+year in memory. | `24` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |

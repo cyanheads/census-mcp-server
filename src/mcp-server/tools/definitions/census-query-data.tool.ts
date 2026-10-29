@@ -1,11 +1,13 @@
 /**
- * @fileoverview Tool to query a Census dataset for variables at a specific geography.
+ * @fileoverview Tool to query a Census dataset for variables at one geography, a list of them, or
+ * every geography at a level.
  * @module mcp-server/tools/definitions/census-query-data
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, validationError } from '@cyanheads/mcp-ts-core/errors';
 import { getDiscoveryConfig } from '@/config/server-config.js';
+import { renderNotice } from '@/mcp-server/tools/notice-trailer.js';
 import {
   renderVariable,
   toVariableEntry,
@@ -111,10 +113,29 @@ function describePage(page: {
   return `${range} To see more, ${options}.`;
 }
 
+/**
+ * Name the codes of a comma-separated `geography_fips` that no row came back for. The Census API
+ * drops a code it publishes nothing for — a wrong width ("6" for "06"), an unknown code, or a group
+ * held in a sibling table — and answers with the rest, so without this the result reads as complete.
+ * Judged against every row the query matched, not the page, and each code trimmed as the API trims it.
+ * The example to check against is a code that did match, so its width and case are the queried
+ * level's — a block group's 1 digit or a voting district's "001AAA" as much as a county's "033".
+ * `rows` is never empty here: a list no member of which matched is `no_data`.
+ */
+function describeUnmatchedCodes(geographyFips: string, rows: CensusDataRow[]): string | undefined {
+  if (!geographyFips.includes(',')) return;
+  const codes = [...new Set(geographyFips.split(',').map((code) => code.trim()))];
+  const returned = new Set(rows.map((row) => row.geographyFips));
+  const unmatched = codes.filter((code) => !returned.has(code));
+  if (unmatched.length === 0) return;
+  const [example] = returned;
+  return `No row came back for ${unmatched.length} of the ${codes.length} geography_fips codes: ${unmatched.join(', ')}. The Census API matches each code literally, width and case included, and leaves out one it publishes nothing for in this query, so check each against the codes that did come back, such as "${example}".`;
+}
+
 export const censusQueryData = tool('census_query_data', {
   title: 'Query Census Data',
   description:
-    'Query a Census dataset for one or more variables at a specific geography. Accepts FIPS codes for the target geography — use census_resolve_geography to convert place names to FIPS when needed. On ACS datasets, labeled estimates and margin-of-error values are returned together (the comparison profiles publish no margins), and the negative sentinel values the Census writes for an estimate or margin of error it cannot publish are decoded into the meanings the Census gives them rather than passed through as raw numbers. A value cbp, ecnbasic, or nonemp withheld is stored as 0 beside a flag, and is reported as withheld, with the meaning of its flag, rather than as a zero. Pass geography_fips as "*" for every geography at the level within the parent: rows come back in GEOID order, up to limit per call (default 50, max 500), with totalCount giving how many matched and offset reaching the rest — the order is not a ranking, so use census_compare_geographies to rank. On the business datasets (cbp, ecnbasic, nonemp), pep/charv, dec/ddhca, dec/ddhcb, and acs/acs1/spp, use predicates to filter by industry, size class, or population group — a query that omits one is answered with a default the Census API picks, which is an all-categories total on some dimensions and a single category on others. Each row names the defaults that were applied in applied_filters, and census_list_predicate_values enumerates the codes a dimension accepts. Some dec/ddhca and dec/ddhcb tables split the population groups between them, publishing each group at a geography in only one table of the family, so where a result can be missing a group, a geography, or a value, the notice names the sibling tables to look in. One geography can also come back on more than one row: pep/charv publishes an April estimates base alongside its July estimate, and each row carries a record field saying which it is.',
+    'Query a Census dataset for one or more variables at one geography, a list of geographies at the same level, or every geography at a level. Accepts FIPS codes for the target geography — use census_resolve_geography to convert place names to FIPS when needed. On ACS datasets, labeled estimates and margin-of-error values are returned together (the comparison profiles publish no margins), and the negative sentinel values the Census writes for an estimate or margin of error it cannot publish are decoded into the meanings the Census gives them rather than passed through as raw numbers. A value cbp, ecnbasic, or nonemp withheld is stored as 0 beside a flag, and is reported as withheld, with the meaning of its flag, rather than as a zero. Pass geography_fips as "*" for every geography at the level within the parent, or as a comma-separated list of codes ("06,53") for several: rows come back in GEOID order, up to limit per call (default 50, max 500), with totalCount giving how many matched and offset reaching the rest — the order is not a ranking, so use census_compare_geographies to rank. The notice names any listed code that no row came back for. On the business datasets (cbp, ecnbasic, nonemp), pep/charv, dec/ddhca, dec/ddhcb, and acs/acs1/spp, use predicates to filter by industry, size class, or population group — a query that omits one is answered with a default the Census API picks, which is an all-categories total on some dimensions and a single category on others. Each row names the defaults that were applied in applied_filters, and census_list_predicate_values enumerates the codes a dimension accepts. Some dec/ddhca and dec/ddhcb tables split the population groups between them, publishing each group at a geography in only one table of the family, so where a result can be missing a group, a geography, or a value, the notice names the sibling tables to look in. One geography can also come back on more than one row: pep/charv publishes an April estimates base alongside its July estimate, and each row carries a record field saying which it is.',
   annotations: { readOnlyHint: true, openWorldHint: false },
   input: z.object({
     variables: z
@@ -130,7 +151,7 @@ export const censusQueryData = tool('census_query_data', {
     geography_fips: z
       .string()
       .describe(
-        'FIPS code for the target geography (e.g., "033" for a county, "*" for every geography at the level within the parent, returned up to limit rows per call and paged with offset). Use census_resolve_geography to obtain this value — it is returned as fips_summary. The Census API matches this literally and its width follows geography_level, so it is passed through unpadded: a county is 3 digits ("051", not "51") and a tract is 6. parent_fips and county_fips are zero-padded for you; this one is not.',
+        'FIPS code for the target geography (e.g., "033" for a county, "*" for every geography at the level within the parent, returned up to limit rows per call and paged with offset). Use census_resolve_geography to obtain this value — it is returned as fips_summary. The Census API matches this literally and its width follows geography_level, so it is passed through unpadded: a county is 3 digits ("051", not "51") and a tract is 6. parent_fips and county_fips are zero-padded for you; this one is not. Several codes at the same level can be joined with commas — "06,53" for two states, or "033,061" with parent_fips "53" for two counties — each at the level\'s width, none of them "*", and with the parents a single code needs. Spaces around a code are ignored and a repeated code returns one row. Rows come back in GEOID order, not list order, paged by limit and offset with totalCount, and the notice names each code no row came back for. On dec/ddhca and dec/ddhcb tables that split the population groups between them, a code whose group is published in a sibling table there has no row, and the notice names the tables to look in.',
       ),
     parent_fips: z
       .union([
@@ -142,7 +163,7 @@ export const censusQueryData = tool('census_query_data', {
       ])
       .optional()
       .describe(
-        'State FIPS code when querying sub-state levels (e.g., "53" for Washington). Required for county, tract, and block-group queries. census_resolve_geography returns this as state_fips. Pass "*" to span every state. Blank is treated as omitted.',
+        'State FIPS code when querying sub-state levels (e.g., "53" for Washington). Required for county, tract, and block-group queries. census_resolve_geography returns this as state_fips. Pass "*" to span every state on the levels whose hierarchy lets "*" stand in for the state, such as county and place; tract, block group, and county subdivision need one state. Blank is treated as omitted.',
       ),
     county_fips: z
       .union([
@@ -154,7 +175,7 @@ export const censusQueryData = tool('census_query_data', {
       ])
       .optional()
       .describe(
-        'County FIPS code when querying tracts or block groups within a specific county (e.g., "033" for King County within WA). Required for tract and block-group queries scoped to a county — use alongside parent_fips (state). census_resolve_geography returns this as county_fips. Pass "*" to span every county in the state, which is the only way a block-group query reaches a whole state. Blank is treated as omitted.',
+        'County FIPS code when querying tracts or block groups within a specific county (e.g., "033" for King County within WA). Required for tract and block-group queries scoped to a county — use alongside parent_fips (state). census_resolve_geography returns this as county_fips. Pass "*" to span every county in the state, which is the only way a block-group query reaches a whole state; "*" works on the levels whose hierarchy lets it stand in for the county, such as tract and block group, and never under a tract_fips. Blank is treated as omitted.',
       ),
     tract_fips: z
       .union([
@@ -191,7 +212,7 @@ export const censusQueryData = tool('census_query_data', {
       .max(500)
       .optional()
       .describe(
-        'Most rows to return (default: 50, max: 500). Rows come in GEOID order, a geography\'s records or categories in code order, and each one counts, so a geography returned as several records (pep/charv April and July) or as one row per category of a "*" predicate takes one row each. totalCount says how many rows matched.',
+        'Most rows to return (default: 50, max: 500). Rows come in GEOID order, whether geography_fips is "*" or a comma-separated list, a geography\'s records or categories in code order, and each one counts, so a geography returned as several records (pep/charv April and July) or as one row per category of a "*" predicate takes one row each. totalCount says how many rows matched.',
       ),
     offset: z
       .number()
@@ -244,7 +265,7 @@ export const censusQueryData = tool('census_query_data', {
           .describe('Data for one geography — name, FIPS, and variable values.'),
       )
       .describe(
-        'One row per geography, or per record or category where a geography has several. When geography_fips is "*", the rows from offset up to limit of every geography at the level within the parent, in GEOID order.',
+        'One row per geography, or per record or category where a geography has several. When geography_fips is "*", the rows from offset up to limit of every geography at the level within the parent, in GEOID order; when it is a comma-separated list, the rows of the listed geographies the Census returned, in the same order and paging.',
       ),
   }),
 
@@ -264,9 +285,11 @@ export const censusQueryData = tool('census_query_data', {
       .string()
       .optional()
       .describe(
-        'Warning that the dataset declares filter dimensions the query left unset, naming each one alongside the label of the default the Census API applied to it. That default is an all-categories total on some dimensions and one ordinary category on others, so the label is what says which. Also carries the warning that a geography came back on more than one row, naming the column that separates the records and the values it took; the range of rows returned when offset or limit left some out, with the offset of the next page; the sibling tables a missing group, geography, or value may sit in, on dec/ddhca and dec/ddhcb tables that split the population groups between them; and any variable codes whose flags could not be checked because the request had no room left under the Census 50-column limit — a withheld value there reads as 0.',
+        'Warning that the dataset declares filter dimensions the query left unset, naming each one alongside the label of the default the Census API applied to it. That default is an all-categories total on some dimensions and one ordinary category on others, so the label is what says which. Also carries the warning that a geography came back on more than one row, naming the column that separates the records and the values it took; the codes of a comma-separated geography_fips that no row came back for; the range of rows returned when offset or limit left some out, with the offset of the next page; the sibling tables a missing group, geography, or value may sit in, on dec/ddhca and dec/ddhcb tables that split the population groups between them; and any variable codes whose flags could not be checked because the request had no room left under the Census 50-column limit — a withheld value there reads as 0.',
       ),
   },
+  // The notice quotes geography_fips codes and the labels of applied defaults.
+  enrichmentTrailer: { notice: { render: renderNotice } },
 
   errors: [
     {
@@ -318,14 +341,14 @@ export const censusQueryData = tool('census_query_data', {
     {
       reason: 'parent_required',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The geography level requires a parent FIPS code but parent_fips was not provided, a tract/block-group level requires county_fips but it was omitted, a single block group requires tract_fips, or tract_fips was set without a concrete county_fips.',
+      when: 'The geography level requires a parent FIPS code but parent_fips was not provided, a tract/block-group level requires county_fips but it was omitted, a single block group requires tract_fips, tract_fips was set without a concrete county_fips, or parent_fips or county_fips is "*" where the level\'s hierarchy does not let "*" stand in for that parent. For a level the dataset lists under several hierarchies, no hierarchy accepts the call and the error describes the one closest to accepting it, which can need a "*" geography_fips or a parent this tool has no input for. When that hierarchy also does not take a parent the call supplied, the error names that parent to drop as well.',
       recovery:
-        'Add parent_fips (state FIPS) from census_resolve_geography state_fips. For tract or block-group levels also add county_fips from census_resolve_geography county_fips, and for a single block group add tract_fips.',
+        'Add parent_fips (state FIPS) from census_resolve_geography state_fips. For tract or block-group levels also add county_fips from census_resolve_geography county_fips, and for a single block group add tract_fips. Replace a "*" the error names with one concrete code, and drop any parent it names as not accepted.',
     },
     {
       reason: 'parent_not_accepted',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'parent_fips, county_fips, or tract_fips names a parent the geography level does not sit within.',
+      when: 'parent_fips, county_fips, or tract_fips names a parent the geography level does not sit within — for a level listed under several hierarchies, one that dropping the parent reaches.',
       recovery:
         'Drop the parent this level does not name. Levels such as zip code tabulation area, urban area, and metropolitan statistical area/micropolitan statistical area are queried with no parent at all; census_list_geographies shows the parents each level takes.',
     },
@@ -353,7 +376,7 @@ export const censusQueryData = tool('census_query_data', {
     {
       reason: 'upstream_error',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Census API returned an error or was unreachable.',
+      when: 'Census API returned an error, was unreachable, or did not finish answering the data request within its 40-second limit across retries.',
       retryable: true,
       thrownBy: 'service',
       recovery:
@@ -409,6 +432,7 @@ export const censusQueryData = tool('census_query_data', {
         year,
         geographyLevel: input.geography_level,
         geographyFips: input.geography_fips,
+        scopeParents: ['state', 'county', 'tract'],
         ...(parentFips !== undefined && { parentFips }),
         ...(countyFips !== undefined && { countyFips }),
         ...(tractFips !== undefined && { tractFips }),
@@ -431,18 +455,30 @@ export const censusQueryData = tool('census_query_data', {
 
     if (check.status === 'parent_required') {
       const missing = check.missingParents;
+      // A parent sent as `*` is missing only because this level's hierarchy will not let `*`
+      // stand in for it, so the step is a concrete code in its place rather than a new input.
+      const starred = missing.filter(
+        (parent) =>
+          (parent === 'state' && parentFips === '*') || (parent === 'county' && countyFips === '*'),
+      );
       const stepFor = (parent: string) => {
         if (parent === 'state') {
           // The resolver's ZCTA layer has no STATE, so it cannot supply this parent.
-          return input.geography_level === 'zip code tabulation area'
-            ? "add parent_fips set to the 2-digit FIPS of the ZCTA's state — census_resolve_geography returns no state_fips for a ZCTA, so resolve the state's name for it"
+          if (input.geography_level === 'zip code tabulation area') {
+            return "set parent_fips to the 2-digit FIPS of the ZCTA's state — census_resolve_geography returns no state_fips for a ZCTA, so resolve the state's name for it";
+          }
+          return starred.includes('state')
+            ? 'set parent_fips to one 2-digit state FIPS instead of "*" (census_resolve_geography returns it as state_fips)'
             : 'add parent_fips (census_resolve_geography returns it as state_fips)';
         }
         if (parent === 'county') {
+          if (!starred.includes('county')) {
+            return 'add county_fips (census_resolve_geography returns it as county_fips)';
+          }
           // A tract code repeats across counties, so a tract scope needs the one it sits in.
-          return countyFips === '*'
+          return tractFips
             ? 'set county_fips to the 3-digit county the tract sits in instead of "*" (census_resolve_geography returns it as county_fips)'
-            : 'add county_fips (census_resolve_geography returns it as county_fips)';
+            : 'set county_fips to one 3-digit county FIPS instead of "*" (census_resolve_geography returns it as county_fips)';
         }
         if (parent === 'tract') {
           return 'add tract_fips (census_resolve_geography returns it as tract_fips, and for a street address also returns the block group as block_group_fips)';
@@ -451,15 +487,22 @@ export const censusQueryData = tool('census_query_data', {
           ? `drop the ${parent} scope by setting geography_fips to "*", which returns every ${input.geography_level} under the parents you did supply`
           : `scope the query by ${parent}, which this tool has no input for — call census_list_geographies and pick a level whose only parents are state, county, and tract`;
       };
+      // The hierarchy that needs these parents can also refuse one the call sent; naming both
+      // changes lets one retry reach it.
+      const unaccepted = check.unacceptedParents ?? [];
       const steps = missing.map(stepFor);
+      if (unaccepted.length > 0) {
+        steps.push(`drop ${unaccepted.map((parent) => SCOPE_INPUTS[parent]).join(' and ')}`);
+      }
       throw ctx.fail(
         'parent_required',
-        `Geography level "${input.geography_level}" in ${dataset} (${year}) must be scoped by ${missing.join(' and ')}.`,
+        `Geography level "${input.geography_level}" in ${dataset} (${year}) must be scoped by ${missing.join(' and ')}${starred.length > 0 ? `; "*" does not stand in for ${starred.join(' or ')} here` : ''}${unaccepted.length > 0 ? `, and does not accept ${unaccepted.join(' or ')} as a parent` : ''}.`,
         {
           dataset,
           year,
           geographyLevel: input.geography_level,
           missingParents: missing,
+          ...(unaccepted.length > 0 && { unacceptedParents: unaccepted }),
           recovery: { hint: `To query this level, ${steps.join(', and ')}.` },
         },
       );
@@ -653,6 +696,10 @@ export const censusQueryData = tool('census_query_data', {
         ),
       );
     }
+    // A list code the Census publishes nothing for is dropped from the rows without an error. Named
+    // ahead of the table guidance, which says where such a code's group may sit instead.
+    const unmatchedCodes = describeUnmatchedCodes(input.geography_fips, rows);
+    if (unmatchedCodes) notices.push(unmatchedCodes);
     // On tables that split POPGROUP groups, a "*" level, a comma-separated list of geographies, or
     // a "*" group can come back short, and codes from several tables can read null, with nothing in
     // the rows to say so.

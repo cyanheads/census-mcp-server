@@ -4,7 +4,12 @@
  * @module services/census-api/errors
  */
 
-import { McpError, notFound, validationError } from '@cyanheads/mcp-ts-core/errors';
+import {
+  JsonRpcErrorCode,
+  McpError,
+  notFound,
+  validationError,
+} from '@cyanheads/mcp-ts-core/errors';
 
 /**
  * Render a year list with contiguous runs collapsed — `[2005…2019, 2021…2024]` reads as
@@ -100,6 +105,60 @@ export const FIRST_UNKNOWN_ONLY =
 
 /** Statuses `withRetry` treats as transient, so the hint can tell a retry from a rejection. */
 const RETRYABLE_STATUSES = new Set([408, 425, 429, 502, 503, 504]);
+
+/** The next step for a data-endpoint failure that a later call can get past. */
+const RETRY_LATER_HINT =
+  'Retry the request; if it persists, the Census API is temporarily unavailable for this dataset and year.';
+
+/**
+ * The next step for a data query that spent its deadline. Each attempt is capped, response body
+ * included, so a response too large to arrive inside one attempt is cut off on every retry: every
+ * Los Angeles County block on dec/dhc 2020 with 49 variables is 28.7 MB, its first byte arriving
+ * at about 10 s and its last at 42 s. Retrying cannot tell that apart from an outage; asking for
+ * less per call can, and fewer rows is what counts most: the same blocks with 5 variables still run
+ * out the deadline, while one tract's blocks with all 49 answer in about 5 s.
+ */
+const DATA_DEADLINE_HINT =
+  'Retry the request once. If it fails the same way, request a narrower geography or fewer variables per call: a response too large to arrive within one attempt fails on every retry. Otherwise the Census API is temporarily unavailable for this dataset and year.';
+
+/**
+ * The data request's spent deadline as the retryable `upstream_error` the keyed tools declare; any
+ * other error unchanged.
+ *
+ * `withRetry` rejects an expired `deadlineMs` with a `Timeout` carrying `reason:
+ * 'retry_deadline_exceeded'`, a reason no tool contract declares, so it would reach the caller with
+ * no recovery hint. A caller's own cancellation never takes this shape — `withRetry` passes it
+ * through ahead of the deadline — so it stays a cancellation. A data query (`scope.variables`
+ * present) is told to ask for less as well as to retry; an enumeration's response is small, so its
+ * spent deadline reads as an outage.
+ */
+export function censusDeadlineError(
+  error: unknown,
+  scope: { dataset: string; year: number; variables?: readonly string[] },
+): unknown {
+  if (!(error instanceof McpError) || error.data?.reason !== 'retry_deadline_exceeded')
+    return error;
+  const { deadlineMs, elapsedMs, retryAttempts } = error.data as {
+    deadlineMs: number;
+    elapsedMs: number;
+    retryAttempts: number;
+  };
+  return new McpError(
+    JsonRpcErrorCode.ServiceUnavailable,
+    `The Census API did not finish answering for ${scope.dataset} (${scope.year}) within ${deadlineMs / 1000} s, across ${retryAttempts} attempt${retryAttempts === 1 ? '' : 's'}.`,
+    {
+      reason: 'upstream_error',
+      retryable: true,
+      dataset: scope.dataset,
+      year: scope.year,
+      deadlineMs,
+      elapsedMs,
+      retryAttempts,
+      recovery: { hint: scope.variables ? DATA_DEADLINE_HINT : RETRY_LATER_HINT },
+    },
+    { cause: error },
+  );
+}
 
 /**
  * The Census API's rejection of a `get=` column it does not publish. Anchored on both ends so
@@ -202,7 +261,7 @@ export function censusHttpError(
       // The upstream line is the diagnosis, carried by the message; the hint is the next step.
       recovery: {
         hint: retryable
-          ? 'Retry the request; if it persists, the Census API is temporarily unavailable for this dataset and year.'
+          ? RETRY_LATER_HINT
           : 'Change the query — the Census API rejected it rather than failing transiently, so retrying it unchanged returns the same status.',
       },
     },

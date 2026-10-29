@@ -4,7 +4,7 @@
  * @module tests/tools/census-list-predicate-values.tool.test
  */
 
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, unauthorized } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { censusListPredicateValues } from '@/mcp-server/tools/definitions/census-list-predicate-values.tool.js';
@@ -360,6 +360,32 @@ describe('censusListPredicateValues — dimensions with a published value list',
     const enrichment = getEnrichment(ctx);
     expect(enrichment.source).toBe('dataset_dictionary');
     expect(enrichment.notice).toContain('was not possible on this call');
+    expect(enrichment.notice).not.toContain('CENSUS_API_KEY');
+  });
+
+  /**
+   * The check reads the data endpoint, so it needs the key the dictionary list does not. Without a
+   * working one the list still answers, and the notice says why it went unchecked — "not possible
+   * on this call" would invite a retry that fails the same way.
+   */
+  it('names CENSUS_API_KEY when the check failed for want of a working key', async () => {
+    mockFindVariable.mockResolvedValue(popgroup);
+    mockFindPublicationProbes.mockResolvedValue(['T01001_001N']);
+    mockFetchPredicateValues.mockRejectedValue(
+      unauthorized('CENSUS_API_KEY is not set.', { reason: 'missing_api_key' }),
+    );
+
+    const ctx = createMockContext({ errors: censusListPredicateValues.errors });
+    const result = await censusListPredicateValues.handler(
+      call({ predicate: 'POPGROUP', dataset: 'dec/ddhca' }),
+      ctx,
+    );
+
+    expect(result.values.map((v) => v.code)).toEqual(['001', '1002', '2670']);
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.source).toBe('dataset_dictionary');
+    expect(enrichment.notice).toContain('CENSUS_API_KEY');
+    expect(enrichment.notice).not.toContain('was not possible on this call');
   });
 
   /**

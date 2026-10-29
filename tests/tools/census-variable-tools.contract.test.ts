@@ -11,11 +11,13 @@ import { readFileSync } from 'node:fs';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { getServerConfig } from '@/config/server-config.js';
 import { censusGetVariable } from '@/mcp-server/tools/definitions/census-get-variable.tool.js';
 import { censusListPredicateValues } from '@/mcp-server/tools/definitions/census-list-predicate-values.tool.js';
 import { censusSearchVariables } from '@/mcp-server/tools/definitions/census-search-variables.tool.js';
 import { initCensusApiService } from '@/services/census-api/census-api-service.js';
 import { initVariableCacheService } from '@/services/variable-cache/variable-cache-service.js';
+import { readNotice } from '../helpers/markdown-readback.js';
 
 vi.mock('@/config/server-config.js', () => ({
   getDiscoveryConfig: vi.fn(() => ({ defaultYear: 2024, variableCacheTtlHours: 24 })),
@@ -295,6 +297,40 @@ describe('census_search_variables on both surfaces', () => {
 
     expect(structured(result).variables).toEqual([]);
     expect(structured(result).notice).toMatch(/no letters or digits/i);
+  });
+
+  /** The query is quoted in the notice; content[] must show it as typed, not as Markdown (#72). */
+  it('quotes a Markdown-active query literally in content[] and raw in structuredContent (#72)', async () => {
+    serveAcs();
+    const query = '[B19013_001E]* `x` ~ _ |';
+
+    const result = await runToolContract(censusSearchVariables, { query, limit: 1 });
+
+    const notice = structured(result).notice as string;
+    expect(notice).toBe(
+      `No variables matched "${query}". Try broader keywords or a different dataset.`,
+    );
+    expect(readNotice(result)).toBe(notice);
+    const line = textOf(result)
+      .split('\n')
+      .find((l) => l.includes('No variables matched'));
+    expect(line?.startsWith('> ')).toBe(true);
+    expect(line).toContain('"\\[B19013_001E\\]\\* \\`x\\` \\~ \\_ \\|"');
+  });
+
+  /** The truncation guidance is written by ctx.enrich.truncated, a second writer of the notice. */
+  it('quotes the query literally in the partial-match truncation guidance (#72)', async () => {
+    serveAcs();
+
+    const result = await runToolContract(censusSearchVariables, {
+      query: 'median **zzqqx** income',
+      limit: 1,
+    });
+
+    const out = structured(result);
+    expect(out.truncated).toBe(true);
+    expect(out.notice).toContain('"median **zzqqx** income"');
+    expect(readNotice(result)).toBe(out.notice);
   });
 });
 
@@ -1514,6 +1550,20 @@ describe('census_list_predicate_values code normalization (#50)', () => {
 
     expect(structured(result).error?.data).toMatchObject({ reason: 'predicate_not_supported' });
   });
+
+  it('quotes a Markdown-active query literally in the zero-match notice (#72)', async () => {
+    serveCbp();
+
+    const result = await runToolContract(censusListPredicateValues, {
+      predicate: 'EMPSZES',
+      dataset: 'cbp',
+      query: '*zz* `q`',
+    });
+
+    const notice = structured(result).notice as string;
+    expect(notice).toContain('No EMPSZES code matched "*zz* `q`".');
+    expect(readNotice(result)).toBe(notice);
+  });
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -1558,6 +1608,13 @@ const predicateValuesOut = (result: { structuredContent?: unknown }) =>
 
 /** The data requests a call sent — metadata requests left out. */
 const dataRequests = (path: string) => calls.filter((u) => u.pathname === path);
+
+/** The page api.census.gov redirects a request whose key it refuses to. */
+const invalidKeyPage = () =>
+  new Response(
+    '<!DOCTYPE html><html><body><p>Invalid Key</p><a href="key_signup.html">Request a key</a></body></html>',
+    { status: 200, headers: { 'content-type': 'text/html' } },
+  );
 
 describe('census_list_predicate_values checks dec/ddhcb POPGROUP against both tenure tables (#54)', () => {
   const DATA = '/data/2020/dec/ddhcb';
@@ -1733,6 +1790,21 @@ describe('census_list_predicate_values checks dec/ddhcb POPGROUP against both te
     expect(tenureRequests('T04002_001N')).toHaveLength(4);
   });
 
+  /** A refused key refuses every attempt alike, so each tenure table is asked once, not four times. */
+  it('asks each tenure table once when the Census API rejects the key', async () => {
+    serveDdhcb(() => invalidKeyPage());
+
+    const { result } = await runTimed(0);
+
+    expect(result.isError).toBeFalsy();
+    const out = predicateValuesOut(result);
+    expect(out.source).toBe('dataset_dictionary');
+    expect(out.totalCount).toBe(5545);
+    expect(out.notice).toContain('CENSUS_API_KEY');
+    expect(tenureRequests('T04001_001N')).toHaveLength(1);
+    expect(tenureRequests('T04002_001N')).toHaveLength(1);
+  });
+
   /**
    * The check is best-effort, so a tenure table that never answers must not hold the call past the
    * 60-second request timeout MCP SDK clients default to — four 15-second attempts and their
@@ -1760,6 +1832,70 @@ describe('census_list_predicate_values checks dec/ddhcb POPGROUP against both te
     expect(out.totalCount).toBe(5545);
     expect(textOf(result)).toContain('**source:** `dataset_dictionary`');
     expect(textOf(result)).toContain('was not possible on this call');
+  });
+
+  /**
+   * One tenure table answers at once and the other hangs. Every probe ends with the call: the
+   * hung one is aborted when its sibling fails, and nothing is left retrying after the answer.
+   */
+  describe('when one tenure probe fails while the other is in flight', () => {
+    const run = async (failing: string, answer: () => Response) => {
+      serveDdhcb(published);
+      const signals = new Map<string, AbortSignal | undefined>();
+      routes[DATA] = ((init) => {
+        const measure = currentCall().searchParams.get('get') ?? '';
+        if (measure === failing) return Promise.resolve(answer());
+        signals.set(measure, init?.signal ?? undefined);
+        return new Promise((_resolve, reject) => {
+          const signal = init?.signal;
+          if (signal?.aborted) return reject(signal.reason);
+          signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+        });
+      }) satisfies RouteFn;
+
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        const result = await runToolContract(censusListPredicateValues, {
+          predicate: 'POPGROUP',
+          dataset: 'dec/ddhcb',
+          limit: 1,
+        });
+        return { result, signals, timersLeft: vi.getTimerCount() };
+      } finally {
+        vi.useRealTimers();
+      }
+    };
+
+    it('aborts the hung probe and leaves nothing running once the call answers', async () => {
+      const { result, signals, timersLeft } = await run(
+        'T04002_001N',
+        () => new Response("error: unknown variable 'T04002_001N'", { status: 400 }),
+      );
+
+      const out = predicateValuesOut(result);
+      expect(out.source).toBe('dataset_dictionary');
+      expect(out.notice).toContain('was not possible on this call');
+      expect([...signals.keys()]).toEqual(['T04001_001N']);
+      expect(signals.get('T04001_001N')?.aborted).toBe(true);
+      expect(timersLeft).toBe(0);
+      expect(tenureRequests('T04001_001N')).toHaveLength(1);
+      expect(tenureRequests('T04002_001N')).toHaveLength(1);
+    });
+
+    /**
+     * The aborted sibling also rejects, and it is listed first. The failure that ended the check
+     * is the one reported, so a refused key still reads as the key rather than as a failed check.
+     */
+    it('reports the failure that ended the check, not the sibling it aborted', async () => {
+      const { result, signals, timersLeft } = await run('T04002_001N', invalidKeyPage);
+
+      const out = predicateValuesOut(result);
+      expect(out.source).toBe('dataset_dictionary');
+      expect(out.notice).toContain('CENSUS_API_KEY');
+      expect(out.notice).not.toContain('was not possible on this call');
+      expect(signals.get('T04001_001N')?.aborted).toBe(true);
+      expect(timersLeft).toBe(0);
+    });
   });
 });
 
@@ -1890,6 +2026,60 @@ describe('census_list_predicate_values publication check under cancellation and 
     expect(out.source).toBe('dataset_dictionary');
     expect(out.values?.map((v) => v.code)).toEqual(['001', '1002']);
     expect(out.notice).toContain('was not possible on this call');
+    expect(out.notice).not.toContain('CENSUS_API_KEY');
+  });
+
+  /**
+   * The dictionary list needs no key, so it still answers; only the check does. The notice names
+   * the key as the reason, on both surfaces, instead of a "not possible on this call" that reads
+   * as transient.
+   */
+  describe('without a working key', () => {
+    afterEach(() => {
+      vi.mocked(getServerConfig).mockReset();
+    });
+
+    const expectUncheckedForKey = (result: Awaited<ReturnType<typeof runToolContract>>) => {
+      expect(result.isError).toBeFalsy();
+      const out = predicateValuesOut(result);
+      expect(out.source).toBe('dataset_dictionary');
+      expect(out.values?.map((v) => v.code)).toEqual(['001', '1002']);
+      expect(out.notice).toContain('CENSUS_API_KEY');
+      expect(out.notice).not.toContain('was not possible on this call');
+      expect(textOf(result)).toContain('CENSUS_API_KEY');
+      expect(textOf(result)).toContain('**source:** `dataset_dictionary`');
+    };
+
+    it('sends no probe when the key is unset', async () => {
+      serveDdhca();
+      vi.mocked(getServerConfig).mockReturnValue({ defaultYear: 2024, variableCacheTtlHours: 24 });
+
+      const result = await runToolContract(censusListPredicateValues, {
+        predicate: 'POPGROUP',
+        dataset: 'dec/ddhca',
+      });
+
+      expectUncheckedForKey(result);
+      expect(dataRequests('/data/2020/dec/ddhca')).toHaveLength(0);
+    });
+
+    it('sends the probe once when the Census API rejects the key', async () => {
+      serveDdhca();
+      routes['/data/2020/dec/ddhca'] = (() => Promise.resolve(invalidKeyPage())) satisfies RouteFn;
+
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        const pending = runToolContract(censusListPredicateValues, {
+          predicate: 'POPGROUP',
+          dataset: 'dec/ddhca',
+        });
+        await vi.advanceTimersByTimeAsync(300_000);
+        expectUncheckedForKey(await pending);
+      } finally {
+        vi.useRealTimers();
+      }
+      expect(dataRequests('/data/2020/dec/ddhca')).toHaveLength(1);
+    });
   });
 });
 

@@ -17,7 +17,7 @@ await createApp({
   tools: allToolDefinitions,
   skills: 'skills',
   instructions:
-    'US Census Bureau data server. Recommended workflow:\n1. census_list_datasets — discover available datasets and their years\n2. census_search_variables — find variable codes from human-readable concepts\n3. census_resolve_geography — convert place names to FIPS codes\n4. census_query_data — retrieve estimates for one geography\n5. census_compare_geographies — rank and compare across many geographies\nCENSUS_API_KEY is required for all data queries (census_query_data, census_compare_geographies). Variable search and geography resolution work without a key.',
+    'US Census Bureau data server. Recommended workflow:\n1. census_list_datasets — discover available datasets and their years\n2. census_search_variables — find variable codes from human-readable concepts\n3. census_resolve_geography — convert place names to FIPS codes\n4. census_query_data — retrieve estimates for one geography, a comma-separated list of them, or every one at a level\n5. census_compare_geographies — rank and compare across many geographies\nCENSUS_API_KEY is required for all data queries (census_query_data, census_compare_geographies) and for census_list_predicate_values on a dimension it enumerates against the data endpoint; a dimension it answers from the dataset dictionary (NAICS, POPGROUP) lists without a key, unchecked against the published rows. Dataset discovery, variable search and lookup, geography resolution, and geography listing work without a key.',
   sessionMode: 'stateless',
   landing: { requireAuth: false },
   setup() {

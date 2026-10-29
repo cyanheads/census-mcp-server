@@ -4,9 +4,10 @@
  * @module tests/services/census-api/census-api-service.test
  */
 
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { getServerConfig } from '@/config/server-config.js';
 import {
   CensusApiService,
   describeColumnBudget,
@@ -20,6 +21,7 @@ import {
   padFips,
   planQueryColumns,
 } from '@/services/census-api/census-api-service.js';
+import type { SuppliedParent } from '@/services/census-api/types.js';
 import { initVariableCacheService } from '@/services/variable-cache/variable-cache-service.js';
 
 vi.mock('@/config/server-config.js', () => ({
@@ -684,6 +686,8 @@ const check = (
     parentFips?: string;
     countyFips?: string;
     tractFips?: string;
+    /** The parents the calling tool has inputs for; census_query_data's three by default. */
+    scopeParents?: readonly SuppliedParent[];
   } = {},
 ) =>
   service.checkGeography(
@@ -692,12 +696,77 @@ const check = (
       year: 2023,
       geographyLevel,
       geographyFips: params.geographyFips ?? '*',
+      scopeParents: params.scopeParents ?? ['state', 'county', 'tract'],
       ...(params.parentFips !== undefined && { parentFips: params.parentFips }),
       ...(params.countyFips !== undefined && { countyFips: params.countyFips }),
       ...(params.tractFips !== undefined && { tractFips: params.tractFips }),
     },
     createMockContext(),
   );
+
+/**
+ * Levels geography.json lists under several hierarchies, each entry as the Census publishes it:
+ * the NECTA and AIANNH entries from dec/dhc 2020 and the `state (or part)` entries from acs/acs5
+ * 2020, in their published order.
+ */
+const repeatedLevelsJson = {
+  fips: [
+    { name: 'state', geoLevelDisplay: '040' },
+    {
+      name: 'american indian area/alaska native area/hawaiian home land (or part)',
+      geoLevelDisplay: '144',
+      requires: ['state', 'county', 'tract'],
+    },
+    {
+      name: 'american indian area/alaska native area/hawaiian home land (or part)',
+      geoLevelDisplay: '154',
+      requires: ['state', 'county', 'tract', 'block group'],
+    },
+    {
+      name: 'state (or part)',
+      geoLevelDisplay: '260',
+      requires: ['american indian area/alaska native area/hawaiian home land'],
+    },
+    {
+      name: 'american indian area/alaska native area/hawaiian home land (or part)',
+      geoLevelDisplay: '280',
+      requires: ['state'],
+    },
+    {
+      name: 'state (or part)',
+      geoLevelDisplay: '311',
+      requires: ['metropolitan statistical area/micropolitan statistical area'],
+    },
+    {
+      name: 'state (or part)',
+      geoLevelDisplay: '336',
+      requires: ['combined new england city and town area'],
+      wildcard: ['combined new england city and town area'],
+      optionalWithWCFor: 'combined new england city and town area',
+    },
+    {
+      name: 'new england city and town area',
+      geoLevelDisplay: '337',
+      requires: ['combined new england city and town area'],
+    },
+    {
+      name: 'new england city and town area (or part)',
+      geoLevelDisplay: '346',
+      requires: ['state', 'combined new england city and town area (or part)'],
+    },
+    { name: 'new england city and town area', geoLevelDisplay: '350' },
+    {
+      name: 'new england city and town area (or part)',
+      geoLevelDisplay: '360',
+      requires: ['state'],
+    },
+    {
+      name: 'american indian area/alaska native area/hawaiian home land (or part)',
+      geoLevelDisplay: '550',
+      requires: ['state', 'congressional district'],
+    },
+  ],
+};
 
 describe('CensusApiService.checkGeography', () => {
   beforeEach(() => {
@@ -778,6 +847,55 @@ describe('CensusApiService.checkGeography', () => {
     await expect(check('County')).resolves.toEqual({ status: 'ok', acceptedParents: ['state'] });
   });
 
+  describe('a "*" parent', () => {
+    /** The shapes the Census API answers: each `*` sits on a parent the entry lists under `wildcard`. */
+    it.each([
+      ['county', { parentFips: '*' }, ['state']],
+      ['county', { geographyFips: '033', parentFips: '*' }, ['state']],
+      ['tract', { parentFips: '53', countyFips: '*' }, ['state', 'county']],
+      ['block group', { parentFips: '53', countyFips: '*' }, ['state', 'county', 'tract']],
+    ] as const)(
+      'is accepted where the entry wildcards it (%s, %j)',
+      async (level, scope, accepted) => {
+        await expect(check(level, scope)).resolves.toEqual({
+          status: 'ok',
+          acceptedParents: accepted,
+        });
+      },
+    );
+
+    /**
+     * `wildcard` names the parents `*` may stand in for; the Census API answers any other with
+     * HTTP 400 "wildcard not allowed for 'state' in geography hierarchy", so the parent still
+     * needs a concrete code.
+     */
+    it.each([
+      ['tract', { parentFips: '*' }, ['state']],
+      ['tract', { parentFips: '*', countyFips: '*' }, ['state']],
+      ['block group', { parentFips: '*', countyFips: '*' }, ['state']],
+      ['block group', { parentFips: '*', countyFips: '033' }, ['state']],
+      ['state legislative district (upper chamber)', { parentFips: '*' }, ['state']],
+    ] as const)(
+      'needs a concrete code where the entry does not wildcard it (%s, %j)',
+      async (level, scope, missing) => {
+        await expect(check(level, scope)).resolves.toEqual({
+          status: 'parent_required',
+          missingParents: missing,
+          wildcardRelaxes: false,
+        });
+      },
+    );
+
+    /** A `*` on a parent the level never names is the parent to drop, as any value there is. */
+    it('on a parent the level does not take is the parent to drop', async () => {
+      await expect(check('zip code tabulation area', { parentFips: '*' })).resolves.toEqual({
+        status: 'parent_not_accepted',
+        unacceptedParents: ['state'],
+        acceptedParents: [],
+      });
+    });
+  });
+
   /**
    * The mirror of the missing-parent case. `zip code tabulation area` names no parent at all,
    * so the `in=state:53` clause built from a supplied state is a hierarchy the Census API
@@ -828,16 +946,18 @@ describe('CensusApiService.checkGeography', () => {
   });
 
   /**
-   * A level can be under-scoped and over-scoped at once. The missing parent is the actionable
-   * half — reporting the unaccepted one first sends the caller to drop an input and hit
-   * `parent_required` on the retry.
+   * A level can be under-scoped and over-scoped at once. Both halves ride one outcome, so the
+   * caller fixes the call in one step instead of adding the parent and then meeting
+   * `parent_not_accepted` on the retry.
    */
-  it('reports a missing required parent ahead of an unaccepted one', async () => {
+  it('reports a missing required parent together with an unaccepted one', async () => {
     await expect(
       check('state legislative district (upper chamber)', { countyFips: '033' }),
-    ).resolves.toMatchObject({
+    ).resolves.toEqual({
       status: 'parent_required',
       missingParents: ['state'],
+      wildcardRelaxes: false,
+      unacceptedParents: ['county'],
     });
   });
 
@@ -865,6 +985,21 @@ describe('CensusApiService.checkGeography', () => {
         status: 'parent_required',
         missingParents: ['county'],
         wildcardRelaxes: false,
+      });
+    });
+
+    /**
+     * A single block group needs its tract, and a tract needs a concrete county, so a `*` county is
+     * named alongside the missing tract — adding the tract alone would meet the "wildcard mismatch"
+     * refusal below on the retry.
+     */
+    it('asks for a concrete county alongside the tract a single block group needs', async () => {
+      await expect(
+        check('block group', { parentFips: '53', countyFips: '*', geographyFips: '2' }),
+      ).resolves.toEqual({
+        status: 'parent_required',
+        missingParents: ['county', 'tract'],
+        wildcardRelaxes: true,
       });
     });
 
@@ -903,6 +1038,143 @@ describe('CensusApiService.checkGeography', () => {
     );
     // With no metadata there is no list of parents to report either.
     await expect(check('tract')).resolves.toEqual({ status: 'ok' });
+  });
+});
+
+describe('CensusApiService.checkGeography — a level listed under several hierarchies', () => {
+  const NECTA = 'new england city and town area';
+  const NECTA_PART = 'new england city and town area (or part)';
+  const AIANNH_PART = 'american indian area/alaska native area/hawaiian home land (or part)';
+  const STATE_PART = 'state (or part)';
+  const CNECTA = 'combined new england city and town area';
+
+  beforeEach(() => {
+    queue(repeatedLevelsJson);
+  });
+
+  /**
+   * Every entry with the name is a hierarchy the level can be queried in, so a call any one of
+   * them accepts runs — and the scopes the call could still narrow by are that entry's parents.
+   */
+  it.each([
+    ['NECTA, "*", no parent (second entry)', NECTA, {}, []],
+    ['NECTA, a concrete code, no parent', NECTA, { geographyFips: '70450' }, []],
+    ['NECTA (or part) under a state', NECTA_PART, { parentFips: '25' }, ['state']],
+    [
+      'AIANNH (or part) under a state (its third entry)',
+      AIANNH_PART,
+      { parentFips: '04' },
+      ['state'],
+    ],
+    [
+      'state (or part), "*", no parent (the CNECTA entry the wildcard relaxes)',
+      STATE_PART,
+      {},
+      [CNECTA],
+    ],
+  ] as const)('accepts %s', async (_label, level, scope, accepted) => {
+    await expect(check(level, scope)).resolves.toEqual({
+      status: 'ok',
+      acceptedParents: accepted,
+    });
+  });
+
+  /** A supplied parent is intent (#21): an entry reached by adding one beats one reached by dropping one. */
+  it('reports the parent to add, not the one to drop, when one change of each would work', async () => {
+    await expect(check(AIANNH_PART, { parentFips: '04', countyFips: '001' })).resolves.toEqual({
+      status: 'parent_required',
+      missingParents: ['tract'],
+      wildcardRelaxes: false,
+    });
+  });
+
+  it.each([
+    [
+      'NECTA under a state: drop it (the entry needing CNECTA is out of reach)',
+      NECTA,
+      { parentFips: '25' },
+      { status: 'parent_not_accepted', unacceptedParents: ['state'], acceptedParents: [] },
+    ],
+    [
+      'NECTA (or part) with no parent: add the state, not the unreachable CNECTA (or part)',
+      NECTA_PART,
+      {},
+      { status: 'parent_required', missingParents: ['state'], wildcardRelaxes: false },
+    ],
+    [
+      'AIANNH (or part) with no parent: one parent to add beats three',
+      AIANNH_PART,
+      {},
+      { status: 'parent_required', missingParents: ['state'], wildcardRelaxes: false },
+    ],
+    [
+      'AIANNH (or part) under a state and county, from a tool with no tract input: drop the county',
+      AIANNH_PART,
+      { parentFips: '04', countyFips: '001', scopeParents: ['state', 'county'] },
+      { status: 'parent_not_accepted', unacceptedParents: ['county'], acceptedParents: ['state'] },
+    ],
+  ] as const)(
+    'reports the entry closest to the call — %s',
+    async (_label, level, scope, expected) => {
+      await expect(check(level, scope)).resolves.toEqual(expected);
+    },
+  );
+
+  /**
+   * No entry is reachable through the scope inputs, so an out-of-reach parent has to be named —
+   * and the one a `*` target drops is the one worth naming, since `*` is an input the caller has.
+   */
+  it('names the parent a "*" target relaxes when no entry can be satisfied', async () => {
+    await expect(check(STATE_PART, { geographyFips: '25' })).resolves.toEqual({
+      status: 'parent_required',
+      missingParents: [CNECTA],
+      wildcardRelaxes: true,
+    });
+  });
+
+  /**
+   * The closest entry can need a parent added and a supplied one dropped at once; the outcome
+   * names both, so one retry reaches it.
+   */
+  it.each([
+    [
+      'NECTA (or part) under a county alone: add the state, drop the county',
+      NECTA_PART,
+      { countyFips: '009' },
+      { missingParents: ['state'], wildcardRelaxes: false, unacceptedParents: ['county'] },
+    ],
+    [
+      'state (or part), a concrete code under a state: "*" for the CNECTA, drop the state',
+      STATE_PART,
+      { geographyFips: '25', parentFips: '25' },
+      { missingParents: [CNECTA], wildcardRelaxes: true, unacceptedParents: ['state'] },
+    ],
+  ] as const)('reports both changes — %s', async (_label, level, scope, expected) => {
+    await expect(check(level, scope)).resolves.toEqual({ status: 'parent_required', ...expected });
+  });
+
+  /**
+   * A `"*"` state no entry wildcards satisfies none of them, so the state-only entry is the one
+   * a concrete state reaches — the same entry that accepts `parent_fips: "04"` above.
+   */
+  it.each([AIANNH_PART, NECTA_PART])(
+    'reports a "*" state on %s as a state to name',
+    async (level) => {
+      await expect(check(level, { parentFips: '*' })).resolves.toEqual({
+        status: 'parent_required',
+        missingParents: ['state'],
+        wildcardRelaxes: false,
+      });
+    },
+  );
+
+  /** The CNECTA entry takes `*` with no parent, so under a state the one change is dropping it. */
+  it('reports a state scope on "state (or part)", "*" as the parent to drop', async () => {
+    await expect(check(STATE_PART, { parentFips: '25' })).resolves.toEqual({
+      status: 'parent_not_accepted',
+      unacceptedParents: ['state'],
+      acceptedParents: [CNECTA],
+    });
   });
 });
 
@@ -1089,6 +1361,280 @@ describe('CensusApiService.fetchPredicateValues', () => {
 
     await enumerate({ naicsScope: { code: 'NAICS2017', value: '62' } });
     expect(requestedUrls).toHaveLength(2);
+  });
+});
+
+describe('CensusApiService — the API key', () => {
+  /** The two methods that send the key, each with a request shape that otherwise succeeds. */
+  const keyed = [
+    [
+      'queryData',
+      () => query('state', { geographyFips: '53' }),
+      [
+        ['NAME', 'B19013_001E', 'state'],
+        ['Washington', '94952', '53'],
+      ],
+    ],
+    [
+      'fetchPredicateValues',
+      () =>
+        service.fetchPredicateValues(
+          { dataset: 'cbp', year: 2023, code: 'EMPSZES', labelAttribute: 'EMPSZES_LABEL' },
+          createMockContext(),
+        ),
+      [
+        ['EMPSZES_LABEL', 'EMPSZES', 'us'],
+        ['All establishments', '001', '1'],
+      ],
+    ],
+  ] as const;
+
+  /** The page api.census.gov redirects a request with a bad key to. */
+  const invalidKeyPage = () =>
+    new Response(
+      '<!DOCTYPE html><html><body><p>Invalid Key</p><a href="key_signup.html">Request a key</a></body></html>',
+      { status: 200, headers: { 'content-type': 'text/html' } },
+    );
+
+  /**
+   * The rejection a call settles with, under fake timers so a retried failure runs its backoff
+   * without waiting it out — a regression that retried would otherwise time the test out.
+   */
+  const rejectionOf = async (call: () => Promise<unknown>) => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const settled = call().then(
+        () => undefined,
+        (err: { code: number; message: string; data?: Record<string, unknown> }) => err,
+      );
+      await vi.advanceTimersByTimeAsync(300_000);
+      return await settled;
+    } finally {
+      vi.useRealTimers();
+    }
+  };
+
+  /** Serve every request with `respond`, recording it. */
+  const serveEvery = (respond: () => Response) => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url: string | URL) => {
+        requestedUrls.push(String(url));
+        return Promise.resolve(respond());
+      }),
+    );
+  };
+
+  afterEach(() => {
+    vi.mocked(getServerConfig).mockReset();
+  });
+
+  it.each(keyed)(
+    '%s fails missing_api_key before any request when no key is set',
+    async (_m, call) => {
+      vi.mocked(getServerConfig).mockReturnValue({ defaultYear: 2024, variableCacheTtlHours: 24 });
+
+      const error = await rejectionOf(call);
+
+      expect(error?.code).toBe(JsonRpcErrorCode.Unauthorized);
+      expect(error?.data?.reason).toBe('missing_api_key');
+      expect(error?.message).toContain('CENSUS_API_KEY is not set');
+      expect(requestedUrls).toEqual([]);
+    },
+  );
+
+  it.each(keyed)('%s sends the configured key (characterization)', async (_m, call, body) => {
+    queue(body);
+
+    await call();
+
+    expect(new URL(requestedUrls[0] ?? '').searchParams.get('key')).toBe('test-key');
+  });
+
+  /**
+   * A rejected key is a configuration fault, not a transient one: retrying sends the same key to
+   * the same refusal three more times and then reports an outage.
+   */
+  it.each(keyed)(
+    '%s reports a rejected key as missing_api_key after one request',
+    async (_m, call) => {
+      serveEvery(invalidKeyPage);
+
+      const error = await rejectionOf(call);
+
+      expect(error?.code).toBe(JsonRpcErrorCode.Unauthorized);
+      expect(error?.data?.reason).toBe('missing_api_key');
+      expect(error?.data?.retryable).not.toBe(true);
+      expect(requestedUrls).toHaveLength(1);
+    },
+  );
+
+  it.each(keyed)(
+    '%s still retries any other HTML page as upstream_error (characterization)',
+    async (_m, call) => {
+      serveEvery(
+        () =>
+          new Response('<!DOCTYPE html><html><body>Maintenance</body></html>', {
+            status: 200,
+            headers: { 'content-type': 'text/html' },
+          }),
+      );
+
+      const error = await rejectionOf(call);
+
+      expect(error?.data?.reason).toBe('upstream_error');
+      expect(requestedUrls).toHaveLength(4);
+    },
+  );
+});
+
+describe('CensusApiService — one deadline across the data request’s attempts (#78)', () => {
+  /** api.census.gov accepting the connection and never answering: each request waits on its signal. */
+  const hang = () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url: string | URL, init?: RequestInit) => {
+        requestedUrls.push(String(url));
+        return new Promise<Response>((_, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), {
+            once: true,
+          });
+        });
+      }),
+    );
+  };
+
+  type Call = (ctx: ReturnType<typeof createMockContext>) => Promise<unknown>;
+  const queryState: Call = (ctx) =>
+    service.queryData(
+      {
+        variables: ['B19013_001E'],
+        geographyLevel: 'state',
+        geographyFips: '53',
+        dataset: 'acs/acs5',
+        year: 2023,
+      },
+      ctx,
+    );
+  const enumerate =
+    (deadlineMs?: number): Call =>
+    (ctx) =>
+      service.fetchPredicateValues(
+        {
+          dataset: 'cbp',
+          year: 2023,
+          code: 'EMPSZES',
+          labelAttribute: 'EMPSZES_LABEL',
+          ...(deadlineMs !== undefined && { deadlineMs }),
+        },
+        ctx,
+      );
+
+  /** A call's settlement, observable without awaiting it. */
+  const track = (promise: Promise<unknown>) => {
+    const state: { done: boolean; error?: unknown } = { done: false };
+    const settled = promise.then(
+      () => {
+        state.done = true;
+      },
+      (error: unknown) => {
+        state.done = true;
+        state.error = error;
+      },
+    );
+    return { state, settled };
+  };
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    hang();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /**
+   * Each attempt gets 15 s, or what is left of the budget when less: two full attempts and their
+   * backoff fit in 40 s, and the third is cut off at the deadline rather than running its own 15 s.
+   */
+  const RETRY_HINT =
+    'Retry the request; if it persists, the Census API is temporarily unavailable for this dataset and year.';
+  /**
+   * A data request whose response is too large to arrive within one attempt fails the same way on
+   * every retry — every Los Angeles County block on dec/dhc 2020 with 49 variables is 28.7 MB that
+   * takes 42 s to arrive — so its hint names the narrowing that gets it through, geography first.
+   */
+  const NARROW_HINT =
+    'Retry the request once. If it fails the same way, request a narrower geography or fewer variables per call: a response too large to arrive within one attempt fails on every retry. Otherwise the Census API is temporarily unavailable for this dataset and year.';
+
+  it.each([
+    ['queryData', queryState, 'acs/acs5 (2023)', 40_000, 3, NARROW_HINT],
+    ['fetchPredicateValues', enumerate(), 'cbp (2023)', 40_000, 3, RETRY_HINT],
+    [
+      'fetchPredicateValues with a caller-set deadline',
+      enumerate(20_000),
+      'cbp (2023)',
+      20_000,
+      2,
+      RETRY_HINT,
+    ],
+  ] as const)(
+    '%s settles a hung endpoint at its deadline as a retryable upstream_error',
+    async (_m, call, scope, deadlineMs, attempts, hint) => {
+      const { state, settled } = track(call(createMockContext()));
+
+      await vi.advanceTimersByTimeAsync(deadlineMs - 1);
+      expect(state.done).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await settled;
+
+      expect(state.error).toBeInstanceOf(McpError);
+      const error = state.error as McpError;
+      expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+      expect(error.message).toBe(
+        `The Census API did not finish answering for ${scope} within ${deadlineMs / 1000} s, across ${attempts} attempts.`,
+      );
+      expect(error.data).toMatchObject({
+        reason: 'upstream_error',
+        retryable: true,
+        deadlineMs,
+        retryAttempts: attempts,
+        recovery: { hint },
+      });
+      expect(requestedUrls).toHaveLength(attempts);
+      // Nothing is left running once the call has settled.
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
+
+  it('a caller cancelling mid-attempt gets the cancellation, not the deadline', async () => {
+    const controller = new AbortController();
+    const { state, settled } = track(queryState(createMockContext({ signal: controller.signal })));
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    controller.abort();
+    await settled;
+
+    expect(state.error).toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
+    expect((state.error as McpError).data?.reason).toBeUndefined();
+    expect(requestedUrls).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('a caller cancelling during a backoff gets its own abort reason', async () => {
+    const controller = new AbortController();
+    const { state, settled } = track(queryState(createMockContext({ signal: controller.signal })));
+
+    // The first attempt times out at 15 s; the backoff before the second is under way.
+    await vi.advanceTimersByTimeAsync(15_100);
+    expect(requestedUrls).toHaveLength(1);
+    controller.abort();
+    await settled;
+
+    expect(state.error).toBe(controller.signal.reason);
+    expect(requestedUrls).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
 

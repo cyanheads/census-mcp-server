@@ -23,7 +23,7 @@
       "environmentVariables": [
         {
           "name": "CENSUS_API_KEY",
-          "description": "Census Bureau API key from api.census.gov/data/key_signup.html. Required for census_query_data and census_compare_geographies; variable search and geography resolution work without it.",
+          "description": "Census Bureau API key from api.census.gov/data/key_signup.html. Required for census_query_data and census_compare_geographies, and for census_list_predicate_values on a dimension it enumerates live; variable search and geography resolution work without it.",
           "format": "string",
           "isRequired": false
         },
@@ -54,7 +54,7 @@
         },
         {
           "name": "CENSUS_API_KEY",
-          "description": "Census Bureau API key from api.census.gov/data/key_signup.html. Required for census_query_data and census_compare_geographies; variable search and geography resolution work without it.",
+          "description": "Census Bureau API key from api.census.gov/data/key_signup.html. Required for census_query_data and census_compare_geographies, and for census_list_predicate_values on a dimension it enumerates live; variable search and geography resolution work without it.",
           "format": "string",
           "isRequired": false
         },

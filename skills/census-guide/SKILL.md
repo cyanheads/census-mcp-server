@@ -11,7 +11,7 @@ metadata:
 
 The census_* tools read the Census Bureau Data API: the American Community Survey (ACS) 1-year and 5-year families, the Population Estimates Program's 2023 vintage, the 2000, 2010, and 2020 decennial files, and the business datasets (County Business Patterns, Economic Census, Nonemployer Statistics). Census microdata (PUMS) and the Island Areas files are not served.
 
-Dataset discovery, variable search and lookup, geography resolution, and geography listing need no key. census_query_data and census_compare_geographies read the data API, which needs a CENSUS_API_KEY configured on the server. So does census_list_predicate_values for a dimension it enumerates against the data endpoint; one answered from the dataset dictionary (NAICS, POPGROUP) needs no key. A key error is fixed in the server's configuration, not by retrying the call.
+Dataset discovery, variable search and lookup, geography resolution, and geography listing need no key. census_query_data and census_compare_geographies read the data API, which needs a CENSUS_API_KEY configured on the server. So does census_list_predicate_values for a dimension it enumerates against the data endpoint; one answered from the dataset dictionary (NAICS, POPGROUP) needs no key, though without one its codes come back unchecked against the rows the dataset publishes, and the notice says so. A key error is fixed in the server's configuration, not by retrying the call.
 
 ## Identifiers
 

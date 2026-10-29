@@ -25,7 +25,7 @@
     "CENSUS_API_KEY": {
       "type": "string",
       "title": "Census API key",
-      "description": "Required for data queries (census_query_data, census_compare_geographies); variable search and geography resolution work without it. Free at api.census.gov/data/key_signup.html.",
+      "description": "Required for data queries (census_query_data, census_compare_geographies) and for census_list_predicate_values on a dimension it enumerates live; variable search and geography resolution work without it. Free at api.census.gov/data/key_signup.html.",
       "sensitive": true,
       "default": ""
     }

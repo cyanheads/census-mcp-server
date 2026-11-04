@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.7.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/census-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.4.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/census-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/census-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.7.2-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/census-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.4.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/census-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/census-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -70,7 +70,7 @@ US Census Bureau demographic, economic, and housing data. Find datasets and vari
 - Whole-word search across label and concept: every query word must match, otherwise the closest matches come back with a notice. A variable or table code in any case returns that variable, or the whole table in code order, first (`B19013` returns `B19013_001E` then `B19013_001M`)
 - A code the dataset does not publish gets a notice naming the sibling dataset that holds it (`S1701` in `acs/acs5` points to `acs/acs5/subject`) or `census_get_variable` for an attribute column such as `B19013_001EA`
 - On ACS datasets, estimate (E suffix) and margin-of-error (M suffix) codes come back together; comparison profiles and the other families publish no margins of error. Also finds predicate codes by keyword (`naics`) or code (`NAICS2017` in `cbp`)
-- `limit` is an integer from 1 to 100 (default 20), rejected rather than clamped when out of range; `totalMatches` counts matches before the limit. variables.json is cached per dataset+year (default TTL 24h)
+- `limit` is an integer from 1 to 100 (default 20), rejected rather than clamped when out of range. `offset` pages the complete match ordering; `totalMatches` counts matches before paging, `truncated` means another page exists, and `nextOffset` names it. variables.json is cached per dataset+year (default TTL 24h)
 
 ---
 
@@ -86,8 +86,9 @@ US Census Bureau demographic, economic, and housing data. Find datasets and vari
 ### `census_list_predicate_values` <sub>tool</sub>
 
 - Lists the codes a filter dimension accepts, read from the dataset dictionary when it publishes a list and enumerated live otherwise. `NAICS*` and `POPGROUP` have long lists (thousands of codes; narrow with `query`); `EMPSZES`, `LFO`, `RCPSZES`, `TAXSTAT`, and `TYPOP` are live-only
-- Dictionary lists are checked against the rows the dataset actually publishes and unpublished codes are dropped; `source` says whether the check ran and the notice gives the number withheld
-- `query` matches code and label; results are sorted by code, and truncation is disclosed (`limit` an integer from 1 to 500, default 50; `totalCount` counts matches). On `ecnbasic`, `within_naics` scopes `TAXSTAT` and `TYPOP` to one industry
+- Dictionary lists are checked against the rows the dataset actually publishes and unpublished codes are dropped; `source` says whether the check ran and the notice gives the number withheld. A dictionary list does not validate publication at a supplied geography level
+- Live enumeration takes `geography_level` (default `us`) and echoes that scope. Codes vary by level; only levels whose dataset metadata permits an unparented wildcard are accepted
+- `query` matches code and label; results are sorted by code before `offset`/`limit` paging (`limit` 1 to 500, default 50). `totalCount` counts all matches; `truncated` means another page exists, with `nextOffset` only then. On `ecnbasic`, `within_naics` scopes `TAXSTAT` and `TYPOP` to one industry
 - The live route and the dictionary check read the data endpoint, so they need `CENSUS_API_KEY`: without a working key a live-only dimension fails with `missing_api_key`, while a dictionary list still answers, unchecked, with a notice naming the key
 
 ---
@@ -104,19 +105,21 @@ US Census Bureau demographic, economic, and housing data. Find datasets and vari
 
 ### `census_query_data` <sub>tool</sub>
 
-- Requires FIPS codes (use `census_resolve_geography` for place names). `geography_fips: "*"` returns every geography at the level within the parent; each row carries `geography_fips` and the nationally unique `geography_geoid`. Wildcards return up to `limit` rows (default 50, max 500) in GEOID order, with `offset` for paging and `totalCount` and `truncated` for the rest
+- Requires FIPS codes (use `census_resolve_geography` for place names). `geography_fips: "*"` returns every geography at the level within the parent; each row carries `geography_fips` and the nationally unique `geography_geoid`. Wildcards return up to `limit` rows (default 50, max 500) in GEOID order, with `offset` for paging and `totalCount` for all matches. `truncated` is true only when another page exists; `nextOffset` names that page
 - A comma-separated list (`"06,53"`, or `"033,061"` with `parent_fips: "53"`) returns one row per listed code at the same level, in GEOID order and paged the same way; codes take the level's width, no `"*"` member, and the parents a single code needs. The notice names each listed code no row came back for
 - Up to 49 variable codes per call, fewer on datasets that add label or record columns (`too_many_variables` states the maximum). Unknown codes fail with `variable_not_found`; level and parent problems fail with `parent_required` or `parent_not_accepted`. Optional `tract_fips` (6 digits, with a concrete `county_fips`) scopes a block-group or decennial block query to one tract
 - Optional `predicates` map filters the business, `pep`, and `dec` datasets and `acs/acs1/spp` (e.g., `{"NAICS2017": "5112"}`). Unset dimensions take a Census default, echoed per row in `applied_filters`; `"*"` returns one row per category, labelled in `record`. `pep/charv` returns several rows per geography, so pin one (e.g., `{"MONTH": "7"}`)
 - ACS sentinel values resolve to their published meanings, and a median in an open-ended interval is flagged `open_ended`. On `cbp`, `ecnbasic`, and `nonemp`, withheld values are reported as suppressed with the flag's meaning. A null `estimate` means suppressed, a text cell (returned under `value`), or empty
 - On `dec/ddhca` and `dec/ddhcb`, a geography's `POPGROUP` group sits in only one table of a family; a `no_data` hint or notice names the sibling tables. Requires `CENSUS_API_KEY`
+- Missing-geography guidance names applicable ACS publication thresholds as possible causes alongside code checks, and pairs broader-coverage datasets with variable rediscovery
 
 ---
 
 ### `census_compare_geographies` <sub>tool</sub>
 
 - Ranks all geographies at a level, or a named `geographies` list of GEOIDs/bare level codes; `within`/`within_county` scope to a state/county, omit for a national comparison
-- Ranks on one variable: `sort_by` (default the first code; must be a requested code, else `sort_by_not_requested`), `sort_dir` (default `desc`), and `limit` (1 to 500, default 50); `totalCount` counts geographies before the limit. A count ranks by size, not rate, so rank a published percentage for a rate (`S1701_C03_001E` in `acs/acs5/subject`, `DP04_0047PE` in `acs/acs5/profile`)
+- Ranks on one variable: `sort_by` (default the first code; must be a requested code, else `sort_by_not_requested`), `sort_dir` (default `desc`), and `limit` (1 to 500, default 50). Equal numeric values share competition ranks (`1, 2, 2, 4`) and are ordered by GEOID; a notice identifies a page boundary inside a tie. A count ranks by size, not rate, so rank a published percentage for a rate (`S1701_C03_001E` in `acs/acs5/subject`, `DP04_0047PE` in `acs/acs5/profile`)
+- `offset` counts rows in the sorted matched set; ranks are assigned before paging. `totalCount` counts that set, `truncated` means another page exists, and `nextOffset` appears only then. A nonempty `geographies` filter also returns `scope_rank` against all fetched geographies and `scopeCount` for that denominator
 - Takes the same `predicates`, variable limit, validation, and `applied_filters` as `census_query_data`; multi-record datasets (`pep/charv`) or a `"*"` predicate fail with `ambiguous_rows` unless `predicates` pins one. Suppressed values sort last with the same reasons, and text values can't be ranked (the notice says so). Requires `CENSUS_API_KEY`
 
 ---
@@ -130,6 +133,7 @@ Census-specific:
 - In-process variable cache with configurable TTL — variables.json fetched once per dataset+year, searched client-side
 - Three-API backend: Census Data API for data queries, TIGERweb for named-place resolution, Census Geocoder for address-to-tract
 - Automatic retry with backoff on all external API calls
+- Keyed tool calls share a 50-second upstream budget across metadata, data, retries, and optional probes; data requests retain a 40-second ceiling within the remaining budget
 - FIPS formatting helpers — zero-padded state, county, and tract codes ready to pass between tools
 
 Agent-friendly output:

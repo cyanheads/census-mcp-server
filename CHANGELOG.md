@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.7.2](changelog/0.7.x/0.7.2.md) — 2026-11-03
+
+Census result pagination, geography-scoped predicate discovery, and shared upstream request budgets.
+
 ## [0.7.1](changelog/0.7.x/0.7.1.md) — 2026-10-29
 
 Geography checks read every hierarchy a level is listed under, wildcard parents a level cannot take are refused before the request, an unset or rejected CENSUS_API_KEY fails as missing_api_key on every keyed tool, data requests stop at 40 s, and notices quoting caller text render literally in content[].

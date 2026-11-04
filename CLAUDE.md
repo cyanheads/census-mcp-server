@@ -1,7 +1,7 @@
 # Developer Protocol
 
 **Server:** census-mcp-server
-**Version:** 0.7.1
+**Version:** 0.7.2
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.18`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.4.0
@@ -50,7 +50,7 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getDiscoveryConfig } from '@/config/server-config.js';
-import { DATASET_LATEST_YEARS, getVariableCacheService } from '@/services/variable-cache/variable-cache-service.js';
+import { DATASET_LATEST_YEARS, getVariableCacheService, resolveDataset } from '@/services/variable-cache/variable-cache-service.js';
 
 export const censusSearchVariables = tool('census_search_variables', {
   description: 'Search Census variables by keyword across labels and concepts.',
@@ -60,17 +60,22 @@ export const censusSearchVariables = tool('census_search_variables', {
     dataset: z.string().optional().describe('Dataset to search (default: "acs/acs5")'),
     year: z.number().optional().describe('Vintage year (default: latest for dataset)'),
     limit: z.number().int().min(1).max(100).optional().describe('Max results (default: 20, max: 100)'),
+    offset: z.number().int().min(0).optional().describe('Matching variables to skip (default: 0)'),
   }),
   output: z.object({
     variables: z.array(z.object({
       variable_code: z.string().describe('Variable code (e.g., "B19013_001E")'),
       label: z.string().describe('Human-readable label'),
-      concept: z.string().describe('Concept group'),
+      concept: z.string().optional().describe('Concept group, absent for shared columns'),
     })).describe('Matching variables sorted by relevance'),
-    total_matches: z.number().describe('Total variables matched before the limit'),
+  }),
+  enrichment: {
+    totalMatches: z.number().describe('Total variables matched before offset and limit'),
+    truncated: z.boolean().describe('More matching variables remain after this page'),
+    nextOffset: z.number().optional().describe('Next page offset, only when truncated is true'),
     dataset: z.string().describe('Dataset searched'),
     year: z.number().describe('Vintage year searched'),
-  }),
+  },
 
   errors: [
     {
@@ -82,26 +87,27 @@ export const censusSearchVariables = tool('census_search_variables', {
   ],
 
   async handler(input, ctx) {
-    const dataset = input.dataset?.trim() || 'acs/acs5';
+    const dataset = resolveDataset(input.dataset, 'acs/acs5');
     const { defaultYear } = getDiscoveryConfig();
     const year = input.year ?? DATASET_LATEST_YEARS[dataset] ?? defaultYear;
     const limit = input.limit ?? 20;
+    const offset = input.offset ?? 0;
 
     const service = getVariableCacheService();
     const { variables, totalMatches } = await service.searchVariables(
-      { query: input.query, dataset, year, limit },
+      { query: input.query, dataset, year, limit, offset },
       ctx,
     );
+    const nextOffset = offset + variables.length;
+    const truncated = nextOffset < totalMatches;
+    ctx.enrich({ totalMatches, truncated, ...(truncated && { nextOffset }), dataset, year });
 
     return {
       variables: variables.map((v) => ({
         variable_code: v.code,
         label: v.label,
-        concept: v.concept,
+        ...(v.concept !== undefined && { concept: v.concept }),
       })),
-      total_matches: totalMatches,
-      dataset,
-      year,
     };
   },
 
@@ -155,6 +161,16 @@ Tool handlers read `getDiscoveryConfig()`; only the Census API service calls `ge
 `parseEnvConfig` maps Zod schema paths → env var names so errors name the variable (`CENSUS_DEFAULT_YEAR`) not the path (`defaultYear`), and reads a blank, whitespace-only, or unsubstituted `${…}` value as unset. Throws `ConfigurationError`, which the framework prints as a clean startup banner — a malformed year or TTL still does; the key no longer can.
 
 For env booleans use `z.stringbool()`, never `z.coerce.boolean()` — `Boolean("false")` is `true`, so a coerced flag can't be disabled through the environment. `z.stringbool()` parses `true/false/1/0/yes/no/on/off` and rejects anything else, so `=false` actually disables.
+
+### Census call contracts
+
+The three keyed handlers construct `censusCallContext(ctx)` once and pass that scoped context to every service call. `census-request.ts` preserves the original caller signal and Context property descriptors while carrying one absolute 50-second upstream budget through metadata, data, retries, body reads, backoff, and error-enrichment probes. `withCensusRetry` also retains the data request's 40-second ceiling within the time left. Exhausted transport failures carry `upstream_error` or `variables_unavailable` and recovery; caller cancellation and deterministic input/HTTP errors retain their meaning. Optional publication/universe work can degrade within its shorter budget, but total-call expiry cannot become successful unchecked data. Sibling-hint expiry preserves an established `variable_not_found` error.
+
+`census_query_data`, `census_compare_geographies`, `census_search_variables`, and `census_list_predicate_values` page the complete ordered match set with `offset` and `limit`. `truncated` means rows remain after this page; `nextOffset` is present only then. Totals precede slicing. Final and past-end pages have no continuation, and an empty slice of existing matches is not a no-match error.
+
+Comparison numeric ties use competition ranks (`1, 2, 2, 4`), ordered by GEOID within each tie and assigned before paging. Nonnumeric rows follow numbers with sequential ordinals; an entirely nonnumeric comparison preserves upstream order and says it is unranked. With a nonempty `geographies` filter, `rank` is within the matched subset and `scope_rank` is within the fetched scope, whose size is `scopeCount`.
+
+Live predicate discovery takes `geography_level` (default `us`); an explicit level must permit an unparented wildcard in the dataset/year metadata. Its effective level is echoed and included in the cache identity. Dictionary lists do not validate publication at a supplied level. `acs-coverage.ts` supplies dataset-specific publication guidance as a possible cause of missing data, never a population diagnosis; fallback datasets require rediscovering their variable codes.
 
 ### Server identity and instructions
 
@@ -256,6 +272,7 @@ src/
   services/
     census-api/
       census-api-service.ts             # Census Data API client — queries, suppression mapping
+      census-request.ts                 # Shared keyed-call budget, retry and body-read boundary
       errors.ts                         # Upstream HTTP failure classification (year_not_available, variable_not_found)
       types.ts                          # Census data types
     geography/
@@ -266,6 +283,7 @@ src/
       variable-search.ts                # Code and whole-word variable search, and its ranking rule
       types.ts                          # Variable types
   mcp-server/
+    tools/acs-coverage.ts               # ACS publication guidance for missing geographies
     tools/notice-trailer.ts             # Notice render that escapes quoted caller and upstream text in content[]
     tools/variable-entry.ts             # Per-variable output entry + rendering shared by both data tools
     tools/definitions/
@@ -305,6 +323,8 @@ Two skill trees live at the project root, written for different readers:
 Development skills are modular instructions. Read them directly when a task matches — e.g., `framework-skills/add-tool/SKILL.md` when adding a tool. `bun run list-skills` prints the full registry. Their directory is deliberately not `skills/`: Claude Code and Codex auto-load a plugin's root `skills/`, so a server that ships `.claude-plugin/` or `.codex-plugin/` would hand them to every agent that installs it.
 
 A published skill in root `skills/` reaches plugin installs and the `.mcpb` bundle as-is, ships in the npm package and the Docker image, and reaches MCP clients when the server opts in with `createApp({ skills: 'skills' })`. `lint:packaging` validates the tree.
+
+This server enables that option for `skills/census-guide/`, served over the MCP SDK's SEP-2640 Skills extension. It registers no Census data resources or prompts.
 
 **Agent skill directory:** Copy `framework-skills/` into the directory your agent discovers (Claude Code: `.claude/skills/`, others: equivalent). Skills then load as context without referencing `framework-skills/` paths. After framework updates, run the `maintenance` skill — Phase B re-syncs the agent directory.
 

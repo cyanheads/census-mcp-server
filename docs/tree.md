@@ -1,6 +1,6 @@
 # census-mcp-server - Directory Structure
 
-Generated on: 2026-10-29 09:00:46
+Generated on: 2026-11-04 00:18:23
 
 ```text
 census-mcp-server/
@@ -166,11 +166,13 @@ census-mcp-server/
 │   │       │   ├── census-resolve-geography.tool.ts
 │   │       │   ├── census-search-variables.tool.ts
 │   │       │   └── index.ts
+│   │       ├── acs-coverage.ts
 │   │       ├── notice-trailer.ts
 │   │       └── variable-entry.ts
 │   ├── services/
 │   │   ├── census-api/
 │   │   │   ├── census-api-service.ts
+│   │   │   ├── census-request.ts
 │   │   │   ├── errors.ts
 │   │   │   └── types.ts
 │   │   ├── geography/

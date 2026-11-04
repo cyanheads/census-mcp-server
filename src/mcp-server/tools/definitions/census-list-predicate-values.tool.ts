@@ -6,12 +6,17 @@
  * @module mcp-server/tools/definitions/census-list-predicate-values
  */
 
-import type { Context } from '@cyanheads/mcp-ts-core';
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getDiscoveryConfig } from '@/config/server-config.js';
 import { renderNotice } from '@/mcp-server/tools/notice-trailer.js';
 import { getCensusApiService } from '@/services/census-api/census-api-service.js';
+import {
+  type CensusRequestContext as Context,
+  censusCallContext,
+  isCensusCallDeadline,
+} from '@/services/census-api/census-request.js';
+import { levelNotSupportedMessage } from '@/services/census-api/errors.js';
 import type { CensusPredicateValue } from '@/services/census-api/types.js';
 import {
   DATASET_LATEST_YEARS,
@@ -95,7 +100,7 @@ async function fetchPublishedCodes(
     if (published.some((values) => values.length === 0)) return;
     return new Set(published.flatMap((values) => values.map((v) => v.code)));
   } catch (error) {
-    if (ctx.signal.aborted) throw error;
+    if (ctx.signal.aborted || isCensusCallDeadline(error)) throw error;
     if (error instanceof McpError && error.data?.reason === 'missing_api_key') {
       return 'missing_api_key';
     }
@@ -129,6 +134,20 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
       .number()
       .optional()
       .describe('Vintage year (default: latest available for the dataset).'),
+    geography_level: z
+      .string()
+      .optional()
+      .describe(
+        'Geography level for live enumeration (default: "us"). Codes can differ by level. Only levels whose dataset/year geography metadata permits a wildcard without concrete parents are supported, such as "county" on cbp. Dictionary lists remain dataset-wide and do not validate publication at this level.',
+      ),
+    offset: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .describe(
+        'Matching codes to skip in code order (default: 0). Follow nextOffset with the same predicate, dataset, year, query, geography_level and within_naics.',
+      ),
     query: z
       .string()
       .optional()
@@ -154,7 +173,7 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
       .max(500)
       .optional()
       .describe(
-        'Maximum codes to return (default: 50, max: 500). totalCount says how many matched.',
+        'Maximum codes per page (default: 50, max: 500). totalCount counts matches before offset and limit; nextOffset continues the list.',
       ),
   }),
   output: z.object({
@@ -186,7 +205,17 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
 
   enrichment: {
     totalCount: z.number().describe('Codes matched before the limit was applied.'),
-    truncated: z.boolean().describe('True when totalCount exceeds the limit and the list was cut.'),
+    truncated: z.boolean().describe('True when matching codes remain after the current page.'),
+    nextOffset: z
+      .number()
+      .optional()
+      .describe('Offset for the next page; absent when no matching codes remain after this page.'),
+    geography_level: z
+      .string()
+      .optional()
+      .describe(
+        'Effective live enumeration level. Absent for a dictionary list, which does not validate geography-specific publication.',
+      ),
     source: z
       .string()
       .describe(
@@ -203,6 +232,20 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
   enrichmentTrailer: { notice: { render: renderNotice } },
 
   errors: [
+    {
+      reason: 'geography_not_supported',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'An explicit live geography level is not listed by this dataset and year.',
+      recovery:
+        'Call census_list_geographies for this dataset and year and choose a supported level.',
+    },
+    {
+      reason: 'parent_required',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'An explicit live geography level needs concrete parents even with a wildcard target.',
+      recovery:
+        'Call census_list_geographies and choose a level enumerable without concrete parents; this tool accepts no parent scope.',
+    },
     {
       reason: 'dataset_not_found',
       code: JsonRpcErrorCode.NotFound,
@@ -250,7 +293,7 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
     {
       reason: 'upstream_error',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Census API returned an error, was unreachable, or did not answer the enumeration within its 40-second limit across retries.',
+      when: 'Census API returned an error, was unreachable, explicit geography metadata was unavailable, or upstream work exceeded the shared 50-second call budget or the enumeration local 40-second ceiling across retries.',
       retryable: true,
       thrownBy: 'service',
       recovery:
@@ -268,17 +311,20 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
   ],
 
   async handler(input, ctx) {
+    const upstream = censusCallContext(ctx);
     const dataset = resolveDataset(input.dataset);
     const { defaultYear } = getDiscoveryConfig();
     const year = input.year ?? DATASET_LATEST_YEARS[dataset] ?? defaultYear;
     const limit = input.limit ?? 50;
+    const offset = input.offset ?? 0;
+    const geographyLevel = input.geography_level?.trim().toLowerCase() || 'us';
     // Every supported dataset names its dimensions in uppercase.
     const predicate = input.predicate.trim().toUpperCase();
 
     ctx.log.info('Listing predicate values', { predicate, dataset, year });
 
     const variableCacheService = getVariableCacheService();
-    const variable = await variableCacheService.findVariable(predicate, dataset, year, ctx);
+    const variable = await variableCacheService.findVariable(predicate, dataset, year, upstream);
 
     if (!variable) {
       throw ctx.fail(
@@ -310,7 +356,7 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
     /** Why the declared codes were returned unchecked, when they were. */
     let unchecked: 'per_industry' | 'missing_api_key' | 'check_unavailable' | undefined;
 
-    const dimensions = await variableCacheService.getFilterDimensions(dataset, year, ctx);
+    const dimensions = await variableCacheService.getFilterDimensions(dataset, year, upstream);
     /** The dataset's own industry dimension, when it has one. */
     const naicsCode = dimensions.find((d) => NAICS_DIMENSION.test(d.code))?.code;
 
@@ -324,7 +370,7 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
       const perIndustry = naicsCode !== undefined && naicsCode !== predicate;
       const published = perIndustry
         ? undefined
-        : await fetchPublishedCodes(dataset, year, predicate, ctx);
+        : await fetchPublishedCodes(dataset, year, predicate, upstream);
 
       if (published instanceof Set) {
         all = declared.filter((v) => published.has(v.code));
@@ -336,6 +382,46 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
         unchecked = perIndustry ? 'per_industry' : (published ?? 'check_unavailable');
       }
     } else {
+      // The established national default needs no new metadata round trip; an explicit level
+      // must be proven enumerable without parents before the wildcard request is sent.
+      if (input.geography_level?.trim()) {
+        const check = await getCensusApiService().checkGeography(
+          {
+            dataset,
+            year,
+            geographyLevel,
+            geographyFips: geographyLevel === 'us' ? '1' : '*',
+            scopeParents: [],
+          },
+          upstream,
+        );
+        if (check.status === 'level_not_supported') {
+          throw ctx.fail(
+            'geography_not_supported',
+            levelNotSupportedMessage(geographyLevel, dataset, year, check.availableLevels),
+            { geographyLevel, availableLevels: check.availableLevels },
+          );
+        }
+        if (check.status !== 'ok') {
+          throw ctx.fail(
+            'parent_required',
+            `Geography level "${geographyLevel}" cannot be enumerated without concrete parents in ${dataset} (${year}).`,
+            {
+              geographyLevel,
+              recovery: {
+                hint: 'Call census_list_geographies and choose a level enumerable without concrete parents; this tool accepts no parent scope.',
+              },
+            },
+          );
+        }
+        if (check.acceptedParents === undefined) {
+          throw ctx.fail(
+            'upstream_error',
+            `Geography metadata is unavailable for ${dataset} (${year}), so geography_level "${geographyLevel}" could not be validated.`,
+            { geographyLevel },
+          );
+        }
+      }
       const naicsValue = input.within_naics?.trim();
       const naicsScope =
         naicsCode && naicsValue ? { code: naicsCode, value: naicsValue } : undefined;
@@ -346,10 +432,11 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
           dataset,
           year,
           code: predicate,
+          geographyLevel,
           ...(variable.labelAttribute && { labelAttribute: variable.labelAttribute }),
           ...(naicsScope && { naicsScope }),
         },
-        ctx,
+        upstream,
       );
       source = 'live_query';
     }
@@ -376,12 +463,28 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
         )
       : all;
 
-    const values = matched.slice(0, limit);
-    const truncated = matched.length > limit;
+    const values = matched.slice(offset, offset + limit);
+    const nextOffset = offset + values.length;
+    const truncated = nextOffset < matched.length;
 
-    ctx.enrich({ totalCount: matched.length, truncated, source });
+    ctx.enrich({
+      totalCount: matched.length,
+      truncated,
+      source,
+      ...(truncated && { nextOffset }),
+      ...(source === 'live_query' && { geography_level: geographyLevel }),
+    });
 
     const notices: string[] = [];
+    if (source === 'live_query') {
+      notices.push(
+        `These codes cover geography level "${geographyLevel}"; codes can vary by geography level, industry and individual geography. Keep geography_level unchanged when following nextOffset.`,
+      );
+    } else if (input.geography_level?.trim()) {
+      notices.push(
+        `This dictionary list does not validate publication at geography_level "${input.geography_level.trim()}"; its classification and any publication check remain dataset-wide. Confirm a code with census_query_data at the geography you need.`,
+      );
+    }
     if (naicsScopeApplied) {
       notices.push(
         `These codes are the ones ${predicate} takes under ${naicsScopeApplied}, and are complete for that industry only — a different industry can publish a different set. Send the same ${naicsScopeApplied.split('=')[0]} value alongside ${predicate} in predicates.`,
@@ -410,7 +513,15 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
     }
     if (truncated) {
       notices.push(
-        `Showing ${values.length} of ${matched.length.toLocaleString('en-US')} codes. Narrow with query${limit < 500 ? ', or raise limit (max 500)' : ' to reach the rest'}.`,
+        `Showing ${values.length} of ${matched.length.toLocaleString('en-US')} codes. Call again with offset: ${nextOffset}, keeping predicate, dataset, year, query, geography_level and within_naics unchanged, for the next page. Narrow with query${limit < 500 ? ', or raise limit (max 500)' : ' for fewer matches'}.`,
+      );
+    } else if (matched.length > 0 && values.length === 0) {
+      notices.push(
+        `offset ${offset} is past the last of the ${matched.length} matching codes. Pass an offset below ${matched.length}, or offset: 0 to start again.`,
+      );
+    } else if (matched.length > 0 && offset > 0) {
+      notices.push(
+        `This is the last page of ${matched.length} matching codes; offset: 0 starts again.`,
       );
     } else if (matched.length === 0) {
       // A keyword that matches only withheld codes is the sharpest version of this dimension's

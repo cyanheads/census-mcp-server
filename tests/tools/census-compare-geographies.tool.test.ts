@@ -4,7 +4,7 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { censusCompareGeographies } from '@/mcp-server/tools/definitions/census-compare-geographies.tool.js';
 import { yearNotAvailable } from '@/services/census-api/errors.js';
@@ -45,6 +45,245 @@ const mockCheckPredicates = vi.fn();
 const mockGetRecordDimensions = vi.fn();
 const mockValidateYear = vi.fn();
 const mockResolveSpellings = vi.fn();
+
+describe('comparison ranking and paging contract', () => {
+  const base = { variables: ['B19013_001E'], geography_level: 'county' };
+  const fixture = () =>
+    (
+      [
+        ['53005', 20],
+        ['53009', null],
+        ['53001', 30],
+        ['53003', 20],
+        ['53007', 10],
+      ] as const
+    ).map(([geoid, estimate]) => ({
+      geographyName: `County ${geoid}`,
+      geographyFips: String(geoid).slice(2),
+      geographyGeoid: String(geoid),
+      variables: { B19013_001E: { estimate, label: 'Income', suppressed: estimate === null } },
+    }));
+
+  it.each([
+    ['desc', ['53001', '53003', '53005', '53007', '53009']],
+    ['asc', ['53007', '53003', '53005', '53001', '53009']],
+  ] as const)(
+    'shares numeric competition ranks in %s order with nulls last',
+    async (sort_dir, ids) => {
+      mockQueryData.mockResolvedValue(fixture());
+      const result = await runToolContract(censusCompareGeographies, { ...base, sort_dir });
+      expect(result.isError).toBeFalsy();
+      const data = result.structuredContent as {
+        rows: Array<{ geography_geoid: string; rank: number }>;
+        nextOffset?: number;
+        scopeCount?: number;
+        truncated: boolean;
+      };
+      expect(data.rows.map((row) => row.geography_geoid)).toEqual(ids);
+      expect(data.rows.map((row) => row.rank)).toEqual([1, 2, 2, 4, 5]);
+      expect(data.truncated).toBe(false);
+      expect(data).not.toHaveProperty('nextOffset');
+      expect(data).not.toHaveProperty('scopeCount');
+      const text = result.content
+        .map((block) => (block.type === 'text' ? block.text : ''))
+        .join('\n');
+      expect(text).toContain(`### 2. County ${ids[1]}`);
+      expect(text).toContain(`### 2. County ${ids[2]}`);
+    },
+  );
+
+  it('pages through a numeric tie without overlap and retains ranks and terminal notices', async () => {
+    mockQueryData.mockResolvedValue(fixture());
+    const pages = [];
+    for (const offset of [0, 2, 4, 5, 9]) {
+      const result = await runToolContract(censusCompareGeographies, {
+        ...base,
+        limit: 2,
+        offset,
+      });
+      expect(result.isError).toBeFalsy();
+      const data = result.structuredContent as {
+        rows: Array<{ geography_geoid: string; rank: number }>;
+        totalCount: number;
+        truncated: boolean;
+        nextOffset?: number;
+        notice?: string;
+      };
+      const text = result.content
+        .map((block) => (block.type === 'text' ? block.text : ''))
+        .join('\n');
+      expect(data.totalCount).toBe(5);
+      expect(data.truncated).toBe(offset < 4);
+      if (offset < 4) {
+        expect(data.nextOffset).toBe(offset + 2);
+        expect(text).toContain('nextOffset');
+      } else expect(data).not.toHaveProperty('nextOffset');
+      if (offset === 0 || offset === 2) {
+        expect(data.notice).toContain('tie');
+        expect(text).toContain('tie');
+      }
+      if (offset === 4) {
+        expect(data.notice).toContain('last page');
+        expect(text).toContain('last page');
+      }
+      if (offset >= 5) {
+        expect(data.rows).toEqual([]);
+        expect(data.notice).toContain('past');
+        expect(text).toContain('past');
+      }
+      pages.push(data.rows);
+    }
+    expect(
+      pages
+        .slice(0, 3)
+        .flat()
+        .map((row) => [row.geography_geoid, row.rank]),
+    ).toEqual([
+      ['53001', 1],
+      ['53003', 2],
+      ['53005', 2],
+      ['53007', 4],
+      ['53009', 5],
+    ]);
+  });
+
+  it.each(['asc', 'desc'] as const)(
+    'keeps subset and scope competition ranks distinct in %s order',
+    async (sort_dir) => {
+      mockQueryData.mockResolvedValue(fixture());
+      const result = await runToolContract(censusCompareGeographies, {
+        ...base,
+        sort_dir,
+        within: '53',
+        geographies: ['53005', '53003'],
+      });
+      expect(result.isError).toBeFalsy();
+      const data = result.structuredContent as {
+        rows: Array<{ rank: number; scope_rank?: number }>;
+        scopeCount: number;
+        totalCount: number;
+      };
+      expect(data.rows.map((row) => [row.rank, row.scope_rank])).toEqual([
+        [1, 2],
+        [1, 2],
+      ]);
+      expect(data.scopeCount).toBe(5);
+      expect(data.totalCount).toBe(2);
+      const text = result.content
+        .map((block) => (block.type === 'text' ? block.text : ''))
+        .join('\n');
+      expect(text).toContain('Scope rank');
+      expect(text).toContain('scopeCount');
+    },
+  );
+
+  it('keeps scope ranks before filtering and subset ranks before paging', async () => {
+    mockQueryData.mockResolvedValue(fixture());
+    const result = await runToolContract(censusCompareGeographies, {
+      ...base,
+      geographies: ['53003', '53005', '53007'],
+      offset: 1,
+      limit: 1,
+    });
+    expect(result.isError).toBeFalsy();
+    const data = result.structuredContent as {
+      rows: Array<{ geography_geoid: string; rank: number; scope_rank?: number }>;
+      scopeCount: number;
+      totalCount: number;
+      nextOffset?: number;
+    };
+    expect(data.rows.map((row) => [row.geography_geoid, row.rank, row.scope_rank])).toEqual([
+      ['53005', 1, 2],
+    ]);
+    expect(data).toMatchObject({ scopeCount: 5, totalCount: 3, nextOffset: 2 });
+  });
+
+  it('ties open-ended boundaries and warns when the cap cuts through them', async () => {
+    mockQueryData.mockResolvedValue(
+      fixture()
+        .slice(0, 3)
+        .map((row) => ({
+          ...row,
+          variables: {
+            B19013_001E: { estimate: 250001, openEnded: true, label: 'Income', suppressed: false },
+          },
+        })),
+    );
+    const result = await runToolContract(censusCompareGeographies, { ...base, limit: 2 });
+    expect(result.isError).toBeFalsy();
+    const data = result.structuredContent as {
+      rows: Array<{ rank: number; variables: Record<string, { open_ended?: boolean }> }>;
+      notice: string;
+    };
+    expect(data.rows.map((row) => row.rank)).toEqual([1, 1]);
+    expect(data.rows.map((row) => row.variables.B19013_001E?.open_ended)).toEqual([true, true]);
+    expect(data.notice).toContain('tie');
+    expect(
+      result.content.map((block) => (block.type === 'text' ? block.text : '')).join('\n'),
+    ).toContain('open-ended');
+  });
+
+  it('retains no_data and its recovery on both surfaces for an unmatched subset', async () => {
+    mockQueryData.mockResolvedValue(fixture());
+    const result = await runToolContract(censusCompareGeographies, {
+      ...base,
+      geographies: ['99999'],
+    });
+    const data = result.structuredContent as {
+      error: { data: { reason: string; recovery: { hint: string } } };
+    };
+    expect(result.isError).toBe(true);
+    expect(data.error.data.reason).toBe('no_data');
+    expect(data.error.data.recovery.hint).toContain('full GEOID');
+    expect(
+      result.content.map((block) => (block.type === 'text' ? block.text : '')).join('\n'),
+    ).toContain('full GEOID');
+  });
+
+  it('omits continuation and scope data when the entire result fits exactly at the cap', async () => {
+    mockQueryData.mockResolvedValue(fixture());
+    const result = await runToolContract(censusCompareGeographies, { ...base, limit: 5 });
+    expect(result.isError).toBeFalsy();
+    const data = result.structuredContent as {
+      rows: Array<{ scope_rank?: number }>;
+      truncated: boolean;
+    };
+    expect(data.truncated).toBe(false);
+    expect(data).not.toHaveProperty('nextOffset');
+    expect(data).not.toHaveProperty('scopeCount');
+    expect(data.rows.every((row) => !Object.hasOwn(row, 'scope_rank'))).toBe(true);
+    expect(
+      result.content.map((block) => (block.type === 'text' ? block.text : '')).join('\n'),
+    ).not.toContain('nextOffset');
+  });
+
+  it('preserves return-order ordinals when every estimate is nonnumeric', async () => {
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'Z',
+        geographyFips: '003',
+        geographyGeoid: '53003',
+        variables: { GEO_ID: { estimate: null, value: 'Z', label: 'ID', suppressed: false } },
+      },
+      {
+        geographyName: 'A',
+        geographyFips: '001',
+        geographyGeoid: '53001',
+        variables: { GEO_ID: { estimate: null, value: 'A', label: 'ID', suppressed: false } },
+      },
+    ]);
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const out = await censusCompareGeographies.handler(
+      censusCompareGeographies.input.parse({ variables: ['GEO_ID'], geography_level: 'county' }),
+      ctx,
+    );
+    expect(out.rows.map((row) => [row.geography_geoid, row.rank])).toEqual([
+      ['53003', 1],
+      ['53001', 2],
+    ]);
+    expect(getEnrichment(ctx).notice).toContain('rows are not ranked');
+  });
+});
 
 beforeEach(async () => {
   vi.clearAllMocks();

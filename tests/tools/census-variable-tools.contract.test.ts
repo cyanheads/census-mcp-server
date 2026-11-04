@@ -62,6 +62,221 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe('discovery paging and geography scopes (#81, #85)', () => {
+  const serveBusiness = () => {
+    routes['/data/2023/cbp/variables.json'] = {
+      variables: {
+        EMPSZES: {
+          label: 'Employment size',
+          predicateType: 'string',
+          required: 'default displayed',
+          group: 'CBP',
+          attributes: 'EMPSZES_LABEL',
+        },
+        NAICS2017: {
+          label: 'Industry',
+          predicateType: 'string',
+          required: 'default displayed',
+          group: 'CBP',
+          values: { item: { '00': 'All industries', '62': 'Health care' } },
+        },
+      },
+    };
+    routes['/data/2023/cbp/geography.json'] = {
+      fips: [
+        { name: 'us', geoLevelDisplay: '010' },
+        { name: 'county', geoLevelDisplay: '050', requires: ['state'] },
+        {
+          name: 'county',
+          geoLevelDisplay: '050',
+          requires: ['state'],
+          wildcard: ['state'],
+          optionalWithWCFor: 'state',
+        },
+        {
+          name: 'tract',
+          geoLevelDisplay: '140',
+          requires: ['state', 'county'],
+          wildcard: ['county'],
+          optionalWithWCFor: 'county',
+        },
+      ],
+    };
+    routes['/data/2023/cbp'] = (() => {
+      const u = calls.at(-1)!;
+      return Promise.resolve(
+        Response.json(
+          u.searchParams.get('for') === 'us:1'
+            ? [
+                ['EMPSZES_LABEL', 'EMPSZES', 'us'],
+                ['All establishments', '001', '1'],
+                ['1,000 employees or more', '260', '1'],
+              ]
+            : [
+                ['EMPSZES_LABEL', 'EMPSZES', 'state', 'county'],
+                ['All establishments', '001', '06', '037'],
+                ['1,000 to 1,499 employees', '262', '06', '037'],
+                ['5,000 employees or more', '273', '06', '037'],
+                ['5,000 employees or more', '273', '53', '033'],
+              ],
+        ),
+      );
+    }) satisfies RouteFn;
+  };
+
+  it('validates a reachable hierarchy, separates level caches and pages the filtered live union', async () => {
+    serveBusiness();
+    const base = { predicate: 'EMPSZES', dataset: 'cbp', year: 2023 };
+    const national = await runToolContract(censusListPredicateValues, base);
+    expect(national.structuredContent).toMatchObject({
+      values: [{ code: '001' }, { code: '260' }],
+      geography_level: 'us',
+    });
+    expect(textOf(national)).toContain('us');
+    const pages: string[] = [];
+    for (const [offset, expected, nextOffset] of [
+      [0, ['262'], 1],
+      [1, ['273'], undefined],
+      [2, [], undefined],
+      [9, [], undefined],
+    ] as const) {
+      const result = await runToolContract(censusListPredicateValues, {
+        ...base,
+        geography_level: 'county',
+        query: 'employees',
+        within_naics: '62',
+        limit: 1,
+        offset,
+      });
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toMatchObject({
+        totalCount: 2,
+        geography_level: 'county',
+        truncated: nextOffset !== undefined,
+        values: expected.map((code) => ({ code })),
+      });
+      if (nextOffset !== undefined) {
+        expect(result.structuredContent).toHaveProperty('nextOffset', nextOffset);
+        expect(textOf(result)).toContain(`offset: ${nextOffset}`);
+      } else expect(result.structuredContent).not.toHaveProperty('nextOffset');
+      for (const code of expected) {
+        expect(textOf(result)).toContain(code);
+        pages.push(code);
+      }
+      expect(textOf(result)).toContain('NAICS2017=62');
+      expect(textOf(result)).toContain('county');
+      if (offset >= 2) expect(textOf(result)).toContain('past the');
+    }
+    expect(pages).toEqual(['262', '273']);
+    const again = await runToolContract(censusListPredicateValues, base);
+    expect(again.structuredContent).toMatchObject({ values: [{ code: '001' }, { code: '260' }] });
+    const dataCalls = calls.filter((u) => u.pathname === '/data/2023/cbp');
+    expect(dataCalls.map((u) => u.searchParams.get('for'))).toEqual(['us:1', 'county:*']);
+    expect(dataCalls[1]?.searchParams.get('NAICS2017')).toBe('62');
+    expect(calls.filter((u) => u.pathname.endsWith('geography.json'))).toHaveLength(1);
+  });
+
+  it.each([
+    ['invented level', 'geography_not_supported'],
+    ['tract', 'parent_required'],
+  ] as const)(
+    'rejects %s before enumeration with recovery on both surfaces',
+    async (geography_level, reason) => {
+      serveBusiness();
+      const result = await runToolContract(censusListPredicateValues, {
+        predicate: 'EMPSZES',
+        dataset: 'cbp',
+        geography_level,
+      });
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          data: { reason, recovery: { hint: expect.stringContaining('census_list_geographies') } },
+        },
+      });
+      expect(textOf(result)).toContain('census_list_geographies');
+      expect(calls.every((u) => u.pathname !== '/data/2023/cbp')).toBe(true);
+    },
+  );
+
+  it('does not claim live validity when geography metadata is absent', async () => {
+    serveBusiness();
+    routes['/data/2023/cbp/geography.json'] = { fips: [] };
+    const result = await runToolContract(censusListPredicateValues, {
+      predicate: 'EMPSZES',
+      dataset: 'cbp',
+      geography_level: 'county',
+    });
+    expect(result.structuredContent).toMatchObject({
+      error: { data: { reason: 'upstream_error' } },
+    });
+    expect(textOf(result)).toContain('could not be validated');
+    expect(calls.every((u) => u.pathname !== '/data/2023/cbp')).toBe(true);
+  });
+
+  it('keeps explicit dictionary geography as an escaped caveat rather than claiming level validity', async () => {
+    serveBusiness();
+    const result = await runToolContract(censusListPredicateValues, {
+      predicate: 'NAICS2017',
+      dataset: 'cbp',
+      geography_level: 'county',
+      limit: 1,
+      offset: 1,
+    });
+    expect(result.structuredContent).toMatchObject({
+      source: 'dataset_dictionary',
+      values: [{ code: '62', label: 'Health care' }],
+      totalCount: 2,
+      truncated: false,
+    });
+    expect(result.structuredContent).not.toHaveProperty('geography_level');
+    expect(result.structuredContent).not.toHaveProperty('nextOffset');
+    expect(textOf(result)).toContain('does not validate publication at geography_level "county"');
+    expect(calls.map((u) => u.pathname)).toEqual(['/data/2023/cbp/variables.json']);
+  });
+
+  it('pages the real ranking across code and keyword tiers without changing match metadata', async () => {
+    routes['/data/2020/dec/dhc/variables.json'] = {
+      variables: {
+        STATE: { label: 'Geography', group: 'N/A', predicateType: 'string', limit: 0 },
+        FOO_1N: { label: 'State', group: 'FOO', predicateType: 'int' },
+        BAR_1N: { label: 'State', group: 'BAR', predicateType: 'int' },
+      },
+    };
+    const combined: string[] = [];
+    for (const [offset, expected, nextOffset] of [
+      [0, ['STATE', 'BAR_1N'], 2],
+      [2, ['FOO_1N'], undefined],
+      [3, [], undefined],
+      [4, [], undefined],
+    ] as const) {
+      const result = await runToolContract(censusSearchVariables, {
+        query: 'STATE',
+        dataset: 'dec/dhc',
+        year: 2020,
+        limit: 2,
+        offset,
+      });
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toMatchObject({
+        totalMatches: 3,
+        truncated: nextOffset !== undefined,
+        variables: expected.map((variable_code) => ({ variable_code })),
+      });
+      if (nextOffset !== undefined)
+        expect(result.structuredContent).toHaveProperty('nextOffset', nextOffset);
+      else expect(result.structuredContent).not.toHaveProperty('nextOffset');
+      for (const code of expected) {
+        expect(textOf(result)).toContain(code);
+        combined.push(code);
+      }
+      if (offset >= 3) expect(textOf(result)).toContain('past the');
+    }
+    expect(combined).toEqual(['STATE', 'BAR_1N', 'FOO_1N']);
+    expect(calls.map((u) => u.pathname)).toEqual(['/data/2020/dec/dhc/variables.json']);
+  });
+});
+
 const textOf = (result: { content: Array<{ type: string; text?: string }> }) =>
   result.content.map((c) => c.text ?? '').join('\n');
 
@@ -408,7 +623,7 @@ describe('census_search_variables matches a variable or table code (#63)', () =>
     expect(out.totalMatches).toBe(6);
     expect(out.truncated).toBe(true);
     expect(out.notice).toBe(
-      '6 variables matched — 3 not shown; the table continues in code order after S1701_C02_001E. Raise limit (max 100), or search a later variable code on its own — a word added to a table code ends the code match.',
+      '6 variables matched — 3 not shown; the table continues in code order after S1701_C02_001E. Call again with offset: 3, keeping query, dataset, year and limit unchanged, for the next page. Raise limit (max 100) for a larger page.',
     );
     expect(textOf(result)).toContain('the table continues in code order after S1701_C02_001E');
     expect(textOf(result)).not.toContain('### `S1701_C02_001M`');
@@ -1667,6 +1882,50 @@ describe('census_list_predicate_values checks dec/ddhcb POPGROUP against both te
   const published = (measure: string) =>
     popgroupRows(measure, codesOf(ddhcbPopgroups.national[measure] ?? ''));
 
+  it('both publication probes stop at the remaining invocation budget (#79)', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    try {
+      serveDdhcb(published);
+      const metadata = routes[`${DATA}/variables.json`];
+      let requests = 0;
+      routes[`${DATA}/variables.json`] = (() => {
+        requests++;
+        if (requests === 1) return Promise.reject(new TypeError('connection reset'));
+        return new Promise<Response>((resolve) =>
+          setTimeout(() => resolve(new Response(JSON.stringify(metadata))), 29_000),
+        );
+      }) satisfies RouteFn;
+      const signals: AbortSignal[] = [];
+      routes[DATA] = ((init) => {
+        const signal = init?.signal as AbortSignal;
+        signals.push(signal);
+        return new Promise<Response>((_, reject) =>
+          signal.addEventListener('abort', () => reject(signal.reason), { once: true }),
+        );
+      }) satisfies RouteFn;
+      const pending = runToolContract(censusListPredicateValues, {
+        predicate: 'POPGROUP',
+        dataset: 'ddhcb',
+      });
+      await vi.advanceTimersByTimeAsync(50_000);
+      const result = await pending;
+      expect(result.isError).toBe(true);
+      const error = predicateValuesOut(result).error;
+      expect(error?.data).toMatchObject({ reason: 'upstream_error', callDeadlineExceeded: true });
+      const recovery = error?.data.recovery as { hint: string };
+      expect(recovery).toMatchObject({ hint: expect.any(String) });
+      expect(textOf(result)).toContain(recovery.hint);
+      // Each of the two parallel probes gets a 15-second attempt, then its remaining budget.
+      expect(signals).toHaveLength(4);
+      expect(signals.every((signal) => signal.aborted)).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    }
+  });
+
   it('lists the 2,996 groups the two tables publish between them, on both surfaces', async () => {
     serveDdhcb(published);
 
@@ -2027,6 +2286,66 @@ describe('census_list_predicate_values publication check under cancellation and 
     expect(out.values?.map((v) => v.code)).toEqual(['001', '1002']);
     expect(out.notice).toContain('was not possible on this call');
     expect(out.notice).not.toContain('CENSUS_API_KEY');
+  });
+
+  it('retains optional publication degradation inside its shorter budget', async () => {
+    vi.useFakeTimers();
+    try {
+      serveDdhca();
+      routes['/data/2020/dec/ddhca'] = hang;
+      const pending = runToolContract(censusListPredicateValues, {
+        predicate: 'POPGROUP',
+        dataset: 'dec/ddhca',
+      });
+      await vi.advanceTimersByTimeAsync(20_000);
+      const result = await pending;
+      expect(result.isError).toBeFalsy();
+      expect(predicateValuesOut(result).source).toBe('dataset_dictionary');
+      expect(predicateValuesOut(result).notice).toContain('was not possible on this call');
+      expect(textOf(result)).toContain('was not possible on this call');
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('total-call expiry during a publication check cannot become an unchecked success', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    try {
+      serveDdhca();
+      const metadata = routes['/data/2020/dec/ddhca/variables.json'];
+      let requests = 0;
+      routes['/data/2020/dec/ddhca/variables.json'] = (() => {
+        requests++;
+        if (requests === 1) return Promise.reject(new TypeError('connection reset'));
+        return new Promise<Response>((resolve) =>
+          setTimeout(() => resolve(new Response(JSON.stringify(metadata))), 29_000),
+        );
+      }) satisfies RouteFn;
+      routes['/data/2020/dec/ddhca'] = hang;
+      const pending = runToolContract(censusListPredicateValues, {
+        predicate: 'POPGROUP',
+        dataset: 'dec/ddhca',
+      });
+      await vi.advanceTimersByTimeAsync(50_000);
+      const result = await pending;
+      expect(result.isError).toBe(true);
+      const error = predicateValuesOut(result).error;
+      expect(error?.data).toMatchObject({
+        reason: 'upstream_error',
+        retryable: true,
+        callDeadlineExceeded: true,
+      });
+      const recovery = error?.data.recovery as { hint: string };
+      expect(recovery).toMatchObject({ hint: expect.any(String) });
+      expect(textOf(result)).toContain(recovery.hint);
+      expect(predicateValuesOut(result)).not.toHaveProperty('source');
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    }
   });
 
   /**

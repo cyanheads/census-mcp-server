@@ -5,7 +5,7 @@
  */
 
 import { JsonRpcErrorCode, unauthorized } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { censusListPredicateValues } from '@/mcp-server/tools/definitions/census-list-predicate-values.tool.js';
 
@@ -34,6 +34,7 @@ const mockFetchPredicateValues = vi.fn();
 const mockFindVariable = vi.fn();
 const mockGetFilterDimensions = vi.fn();
 const mockFindPublicationProbes = vi.fn();
+const mockCheckGeography = vi.fn();
 
 beforeEach(async () => {
   vi.clearAllMocks();
@@ -41,6 +42,7 @@ beforeEach(async () => {
   const { getCensusApiService } = await import('@/services/census-api/census-api-service.js');
   vi.mocked(getCensusApiService).mockReturnValue({
     fetchPredicateValues: mockFetchPredicateValues,
+    checkGeography: mockCheckGeography,
   } as never);
 
   const { getVariableCacheService } = await import(
@@ -53,6 +55,7 @@ beforeEach(async () => {
   } as never);
 
   mockGetFilterDimensions.mockResolvedValue([]);
+  mockCheckGeography.mockResolvedValue({ status: 'ok', acceptedParents: [] });
   // Default: the dataset offers no measure column, so a value map is returned unchecked.
   mockFindPublicationProbes.mockResolvedValue([]);
 });
@@ -90,6 +93,119 @@ const call = (overrides: Record<string, unknown> = {}) =>
   });
 
 describe('censusListPredicateValues — dimensions with no published value list', () => {
+  it('preserves uppercase normalization and dictionary industry-scope behavior (characterization)', async () => {
+    mockFindVariable.mockResolvedValue(popgroup);
+    const ctx = createMockContext({ errors: censusListPredicateValues.errors });
+    const result = await censusListPredicateValues.handler(
+      call({ predicate: ' popgroup ', dataset: 'dec/ddhca', within_naics: '62' }),
+      ctx,
+    );
+    expect(result.predicate).toBe('POPGROUP');
+    expect(result.values.map((v) => v.code)).toEqual(['001', '1002', '2670']);
+    expect(mockFetchPredicateValues).not.toHaveBeenCalled();
+  });
+
+  it('names and passes the requested live geography on both client surfaces', async () => {
+    mockFindVariable.mockResolvedValue(empszes);
+    mockFetchPredicateValues.mockResolvedValue([{ code: '273', label: '5,000 employees or more' }]);
+    const result = await runToolContract(censusListPredicateValues, {
+      predicate: 'EMPSZES',
+      dataset: 'cbp',
+      geography_level: ' County ',
+    });
+    expect(result.structuredContent).toMatchObject({
+      geography_level: 'county',
+      values: [{ code: '273' }],
+      source: 'live_query',
+    });
+    expect(mockFetchPredicateValues).toHaveBeenCalledWith(
+      expect.objectContaining({ geographyLevel: 'county' }),
+      expect.anything(),
+    );
+    expect(mockCheckGeography).toHaveBeenCalledWith(
+      expect.objectContaining({ geographyLevel: 'county', geographyFips: '*', scopeParents: [] }),
+      expect.anything(),
+    );
+    const text = result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+    expect(text).toContain('county');
+    expect(text).toContain('273');
+    expect(text).toContain('geography level');
+  });
+
+  it.each([
+    [
+      { status: 'level_not_supported', availableLevels: ['us', 'county'] },
+      'geography_not_supported',
+    ],
+    [
+      { status: 'parent_required', missingParents: ['state'], wildcardRelaxes: false },
+      'parent_required',
+    ],
+  ])('rejects a live geography that cannot be enumerated nationally: %s', async (check, reason) => {
+    mockFindVariable.mockResolvedValue(empszes);
+    mockCheckGeography.mockResolvedValue(check);
+    const result = await runToolContract(censusListPredicateValues, {
+      predicate: 'EMPSZES',
+      dataset: 'cbp',
+      geography_level: 'tract',
+    });
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({ error: { data: { reason } } });
+    expect(result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n')).toContain(
+      'census_list_geographies',
+    );
+    expect(mockFetchPredicateValues).not.toHaveBeenCalled();
+  });
+
+  it('discloses that an explicit geography does not scope a dictionary list', async () => {
+    mockFindVariable.mockResolvedValue(popgroup);
+    const result = await runToolContract(censusListPredicateValues, {
+      predicate: 'POPGROUP',
+      dataset: 'dec/ddhca',
+      geography_level: 'county',
+    });
+    expect(result.structuredContent).toMatchObject({
+      source: 'dataset_dictionary',
+      notice: expect.stringContaining('does not validate publication at geography_level "county"'),
+    });
+    expect(result.structuredContent).not.toHaveProperty('geography_level');
+    expect(mockCheckGeography).not.toHaveBeenCalled();
+  });
+
+  it('pages filtered codes before the limit and distinguishes past-end from no matches', async () => {
+    mockFindVariable.mockResolvedValue(popgroup);
+    for (const [offset, codes, nextOffset] of [
+      [0, ['1002'], 1],
+      [1, ['2670'], undefined],
+      [2, [], undefined],
+    ] as const) {
+      const result = await runToolContract(censusListPredicateValues, {
+        predicate: 'POPGROUP',
+        dataset: 'dec/ddhca',
+        query: 'alone',
+        limit: 1,
+        offset,
+      });
+      expect(result.structuredContent).toMatchObject({
+        values: codes.map((code) => ({ code })),
+        totalCount: 2,
+        truncated: nextOffset !== undefined,
+      });
+      if (nextOffset !== undefined)
+        expect(result.structuredContent).toHaveProperty('nextOffset', nextOffset);
+      else expect(result.structuredContent).not.toHaveProperty('nextOffset');
+      const text = result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+      for (const code of codes) expect(text).toContain(code);
+      if (offset === 2) expect(text).toContain('past the');
+    }
+  });
+
+  it.each([-1, 0.5])('rejects offset %s', (offset) => {
+    expect(
+      censusListPredicateValues.input.safeParse({ predicate: 'EMPSZES', dataset: 'cbp', offset })
+        .success,
+    ).toBe(false);
+  });
   /**
    * `variables.json` carries a value map for NAICS and POPGROUP only, so EMPSZES, LFO, RCPSZES,
    * TAXSTAT, and TYPOP have no offline source at all — wildcarding the dimension on the data
@@ -167,7 +283,7 @@ describe('censusListPredicateValues — dimensions with no published value list'
     const ctx = createMockContext({ errors: censusListPredicateValues.errors });
     await censusListPredicateValues.handler(call(), ctx);
 
-    expect(getEnrichment(ctx).notice).toBeUndefined();
+    expect(getEnrichment(ctx).notice).not.toContain('within_naics');
   });
 
   it('scopes the enumeration by the dataset own NAICS dimension and flags the limit', async () => {

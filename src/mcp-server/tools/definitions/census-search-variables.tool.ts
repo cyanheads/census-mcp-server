@@ -36,9 +36,17 @@ function codeMissNotice(
 export const censusSearchVariables = tool('census_search_variables', {
   title: 'Search Census Variables',
   description:
-    'Search Census variables by keyword across variable labels and concept groups, or look one up by its code. Returns variable codes with human-readable labels — use this to go from a concept like "median household income" to the variable code B19013_001E needed for data queries. A query that is one variable or table code, such as B19013_001E or B19013, returns that variable or the table\'s variables, in code order, ahead of any keyword matches; a code the dataset does not publish gets a notice naming the dataset that does, when one is confirmed. On ACS datasets it returns both estimate (E suffix) and margin-of-error (M suffix) codes so you can request both; the ACS comparison profiles (acs/acs5/cprofile, acs/acs1/cprofile) and the other dataset families publish no margins of error. Also use it to find the predicate codes a dataset filters on, such as NAICS2017 in cbp. Adding a word narrows the results, since every word must match; when totalMatches exceeds the limit, a more specific query reaches the rest — except past the limit of a table code, where a later variable\'s own code does.',
+    'Search Census variables by keyword across variable labels and concept groups, or look one up by its code. Returns variable codes with human-readable labels — use this to go from a concept like "median household income" to the variable code B19013_001E needed for data queries. A query that is one variable or table code, such as B19013_001E or B19013, returns that variable or the table\'s variables, in code order, ahead of any keyword matches; a code the dataset does not publish gets a notice naming the dataset that does, when one is confirmed. On ACS datasets it returns both estimate (E suffix) and margin-of-error (M suffix) codes so you can request both; the ACS comparison profiles (acs/acs5/cprofile, acs/acs1/cprofile) and the other dataset families publish no margins of error. Also use it to find the predicate codes a dataset filters on, such as NAICS2017 in cbp. Adding a word narrows the results, since every word must match. Use offset to continue the same search beyond limit; nextOffset names the next page.',
   annotations: { readOnlyHint: true, openWorldHint: false },
   input: z.object({
+    offset: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .describe(
+        'Matching variables to skip in the existing rank order (default: 0). Keep query, dataset, year and limit unchanged when following nextOffset.',
+      ),
     query: z
       .string()
       .describe(
@@ -61,7 +69,7 @@ export const censusSearchVariables = tool('census_search_variables', {
       .max(100)
       .optional()
       .describe(
-        'Maximum results to return (default: 20, max: 100). Increase if totalMatches greatly exceeds the limit.',
+        'Maximum results per page (default: 20, max: 100). Follow nextOffset to continue the same search.',
       ),
   }),
   output: z.object({
@@ -116,14 +124,18 @@ export const censusSearchVariables = tool('census_search_variables', {
     truncated: z
       .boolean()
       .optional()
-      .describe('True when totalMatches exceeded the limit and results were cut off.'),
+      .describe('True when more matching variables remain after the current page.'),
+    nextOffset: z
+      .number()
+      .optional()
+      .describe('Offset for the next page; absent when no matches remain after this page.'),
     shown: z.number().optional().describe('Number of variables returned after the limit.'),
     cap: z.number().optional().describe('The limit that was applied.'),
     notice: z
       .string()
       .optional()
       .describe(
-        'Guidance when no variables matched, when no variable contained every query word and the results hold only some of them, or when results were truncated — suggests other keywords, a narrower query, or a higher limit. For a code the dataset does not publish, it names the sibling dataset confirmed to hold it, or census_get_variable for an attribute column (annotation, flag, label, or significance); for a table cut at the limit, the last code shown.',
+        'Guidance for no matches, partial-term matches, continuation, the final page or an offset past the end. For a code the dataset does not publish, names the confirmed sibling dataset or census_get_variable for an attribute column; for a table cut inside its code tier, names the last code shown and the next offset.',
       ),
   },
   // The notice quotes the query.
@@ -170,15 +182,18 @@ export const censusSearchVariables = tool('census_search_variables', {
     const { defaultYear } = getDiscoveryConfig();
     const year = input.year ?? DATASET_LATEST_YEARS[dataset] ?? defaultYear;
     const limit = input.limit ?? 20;
+    const offset = input.offset ?? 0;
 
     ctx.log.info('Searching Census variables', { query: input.query, dataset, year, limit });
 
     const service = getVariableCacheService();
     const { variables, totalMatches, codeMatches, matchedTermCount, termCount, codeMiss } =
-      await service.searchVariables({ query: input.query, dataset, year, limit }, ctx);
+      await service.searchVariables({ query: input.query, dataset, year, limit, offset }, ctx);
 
     ctx.enrich.echo(input.query);
-    ctx.enrich({ dataset, year, totalMatches });
+    const nextOffset = offset + variables.length;
+    const truncated = nextOffset < totalMatches;
+    ctx.enrich({ dataset, year, totalMatches, truncated, ...(truncated && { nextOffset }) });
 
     const partial =
       matchedTermCount < termCount
@@ -189,24 +204,33 @@ export const censusSearchVariables = tool('census_search_variables', {
       ctx.enrich.notice(
         `"${input.query}" has no letters or digits to match. Search with words from a variable's label or concept, such as "median household income".`,
       );
-    } else if (variables.length === 0) {
+    } else if (totalMatches > 0 && variables.length === 0) {
+      ctx.enrich.notice(
+        `offset ${offset} is past the last of the ${totalMatches} matching variables. Pass an offset below ${totalMatches}, or offset: 0 to start again.${partial ? ` ${partial}` : ''}`,
+      );
+    } else if (totalMatches === 0) {
       ctx.enrich.notice(
         codeMiss
           ? codeMissNotice(input.query, codeMiss, { dataset, year })
           : `No variables matched "${input.query}". Try broader keywords or a different dataset.`,
       );
-    } else if (totalMatches > limit) {
+    } else if (truncated) {
       const shown = `${totalMatches} variables matched — ${totalMatches - variables.length} not shown`;
       // A table cut inside its code tier: words added to the code drop it, so narrowing cannot help.
+      const continuation = `Call again with offset: ${nextOffset}, keeping query, dataset, year and limit unchanged, for the next page.`;
       const truncation =
-        codeMatches > variables.length
-          ? `${shown}; the table continues in code order after ${variables.at(-1)?.code}. ${limit < 100 ? 'Raise limit (max 100), or search' : 'Search'} a later variable code on its own — a word added to a table code ends the code match.`
-          : `${shown}. ${limit < 100 ? 'Narrow the query or raise limit (max 100).' : 'Narrow the query to reach the rest.'}`;
+        codeMatches > nextOffset
+          ? `${shown}; the table continues in code order after ${variables.at(-1)?.code}. ${continuation}${limit < 100 ? ' Raise limit (max 100) for a larger page.' : ''}`
+          : `${shown}. ${continuation} ${limit < 100 ? 'Narrow the query or raise limit (max 100).' : 'Narrow the query for fewer matches.'}`;
       ctx.enrich.truncated({
         shown: variables.length,
         cap: limit,
         guidance: partial ? `${partial} ${truncation}` : truncation,
       });
+    } else if (offset > 0) {
+      ctx.enrich.notice(
+        `This is the last page of ${totalMatches} matching variables; offset: 0 starts again.${partial ? ` ${partial}` : ''}`,
+      );
     } else if (partial) {
       ctx.enrich.notice(partial);
     }

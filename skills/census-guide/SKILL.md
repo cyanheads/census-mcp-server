@@ -4,7 +4,7 @@ description: "Census Bureau data through the census_* tools: choose the dataset 
 license: Apache-2.0
 metadata:
   author: cyanheads
-  version: "1.0"
+  version: "1.1"
 ---
 
 ## Scope
@@ -25,7 +25,7 @@ Dataset discovery, variable search and lookup, geography resolution, and geograp
 ## Gates
 
 **Pick the survey before the variable.**
-- ACS 1-year covers only geographies of 65,000 or more people, and the ACS 1-year Supplemental Estimates (acs/acsse, K-prefixed tables) geographies of 20,000 or more. Everything smaller is in the ACS 5-year family.
+- Standard ACS 1-year products generally cover areas of 65,000 or more people; Supplemental Estimates (acs/acsse, K-prefixed tables) generally start at 20,000. Selected population profiles require an area of 500,000 and a subgroup of 65,000; selected subject tables have separate subgroup rules. Continuity and metropolitan-area exceptions apply, so a missing row does not prove an area is below a threshold. For broader coverage, use the corresponding ACS 5-year product and rediscover its variable codes; changing the dataset does not translate them.
 - A 5-year estimate describes its whole period, not its last year: report acs/acs5 2024 as "2020–2024", never as "2024".
 - Compare 1-year estimates only with 1-year estimates and 5-year only with 5-year, even when a larger area also has a 1-year figure.
 - pep/charv publishes no place, tract, or other sub-county level. A city's population comes from dec/pl (2020 count) or the ACS (an estimate with a margin). Name which source a figure came from, and do not mix sources inside one comparison.
@@ -39,7 +39,7 @@ Dataset discovery, variable search and lookup, geography resolution, and geograp
 **Change over time.**
 - Consecutive 5-year estimates share four years of data. Compare 5-year periods that do not overlap (2015–2019 with 2020–2024), or 1-year with 1-year.
 - Prefer the comparison profiles (acs/acs5/cprofile, acs/acs1/cprofile) for change questions: the earlier period is restated in the vintage's dollars, and each line has a significance column ending in SS, marked `*` where the change is statistically significant at 90 percent and empty where it is not.
-- The 5-year comparison profiles cover only geographies of 5,000 or more people. A smaller county or place has no row there; fall back to two non-overlapping acs/acs5 vintages and the test above.
+- The 5-year comparison profiles generally cover areas of 5,000 or more people. When an area is absent, check its code and coverage; for a change question, fall back to two non-overlapping acs/acs5 vintages and the test above. A single acs/acs5/profile result offers broader geographic coverage but does not preserve comparison history.
 - ACS dollar values are in the inflation-adjusted dollars the label names ("in 2024 inflation-adjusted dollars"). Before comparing dollars across vintages outside the comparison profiles, adjust the earlier figure with the CPI-U-RS ratio of the two years.
 
 **Boundaries change between vintages.**

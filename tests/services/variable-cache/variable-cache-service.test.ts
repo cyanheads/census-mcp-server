@@ -12,6 +12,7 @@ import {
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { httpStatusToErrorCode } from '@cyanheads/mcp-ts-core/utils';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { censusCallContext } from '@/services/census-api/census-request.js';
 import { censusHttpError } from '@/services/census-api/errors.js';
 import {
   DATASET_AVAILABLE_YEARS,
@@ -1203,7 +1204,7 @@ describe('describeEmptyPredicatedResult', () => {
     ]);
 
     expect(text).toBe(
-      'A predicate value that does not exist in dec/ddhca (2020) also returns nothing rather than an error, so check the POPGROUP value this query sent — census_list_predicate_values enumerates the codes each dimension accepts.',
+      'A predicate value that does not exist in dec/ddhca (2020) also returns nothing rather than an error, so check the POPGROUP value this query sent — census_list_predicate_values enumerates the codes each dimension accepts. A valid code can also be unpublished at the queried geography level; pass the same geography_level to a live enumeration, while dictionary lists do not validate publication at that level.',
     );
   });
 });
@@ -2061,6 +2062,34 @@ const codesFor = async (query: string, limit = 50) =>
 describe('VariableCacheService.searchVariables — whole-word, all-terms ranking (#34)', () => {
   beforeEach(() => serve({ '/data/2024/acs/acs5/variables.json': acsSearchVariablesJson }));
 
+  it('pages ranked keywords after matching without changing totals or fallback terms', async () => {
+    const expected = [
+      'B19013_001E',
+      'B19013_001M',
+      'B19013B_001E',
+      'B19013B_001M',
+      'B22008_001E',
+      'B22008_001M',
+    ];
+    for (const [offset, codes] of [
+      [0, expected.slice(0, 2)],
+      [2, expected.slice(2, 4)],
+      [4, expected.slice(4)],
+      [6, []],
+      [9, []],
+    ] as const) {
+      const page = await service.searchVariables(
+        { query: 'median household income', dataset: 'acs/acs5', year: 2024, offset, limit: 2 },
+        createMockContext(),
+      );
+      expect(page.variables.map((v) => v.code)).toEqual(codes);
+      expect(page.totalMatches).toBe(6);
+      expect(page.matchedTermCount).toBe(3);
+      expect(page.termCount).toBe(3);
+      expect(page).not.toHaveProperty('codeMiss');
+    }
+  });
+
   it('ranks the base variable ahead of its subgroup variants and other tables', async () => {
     const result = await acs('median household income');
 
@@ -2660,6 +2689,44 @@ describe('VariableCacheService — annotation and flag columns (#48)', () => {
 });
 
 describe('VariableCacheService — universe from groups.json (#53)', () => {
+  it('optional universes respect the invocation budget without swallowing its expiry (#79)', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = censusCallContext(createMockContext());
+      await vi.advanceTimersByTimeAsync(40_000);
+      vi.stubGlobal(
+        'fetch',
+        vi.fn((url: string | URL, init?: RequestInit) => {
+          if (String(url).endsWith('variables.json'))
+            return Promise.resolve(
+              new Response(
+                JSON.stringify({
+                  variables: {
+                    B19013_001E: { label: 'Income', predicateType: 'int', group: 'B19013' },
+                  },
+                }),
+              ),
+            );
+          return new Promise<Response>((_, reject) =>
+            init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), {
+              once: true,
+            }),
+          );
+        }),
+      );
+      const pending = service
+        .getVariablesByCode(['B19013_001E'], 'acs/acs5', 2024, ctx)
+        .catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(await pending).toMatchObject({
+        data: { reason: 'variables_unavailable', callDeadlineExceeded: true },
+      });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   const groupsJson = {
     groups: [
       {

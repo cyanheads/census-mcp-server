@@ -4,11 +4,12 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { censusQueryData } from '@/mcp-server/tools/definitions/census-query-data.tool.js';
 import { yearNotAvailable } from '@/services/census-api/errors.js';
 import { DATASET_AVAILABLE_YEARS } from '@/services/variable-cache/variable-cache-service.js';
+import { readNotice } from '../helpers/markdown-readback.js';
 
 vi.mock('@/services/census-api/census-api-service.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/services/census-api/census-api-service.js')>()),
@@ -104,6 +105,130 @@ beforeEach(async () => {
 });
 
 describe('censusQueryData', () => {
+  it.each([
+    ['acs/acs1', '65,000', 'acs/acs5'],
+    ['acs/acsse', '20,000', 'acs/acs5'],
+    ['acs/acs1/profile', '65,000', 'acs/acs5/profile'],
+    ['acs/acs1/cprofile', '65,000', 'acs/acs5/profile'],
+    ['acs/acs5/cprofile', '5,000', 'acs/acs5/profile'],
+    ['acs/acs1/spp', '500,000', 'acs/acs5'],
+    ['acs/acs1/subject', '65,000', 'acs/acs5/subject'],
+  ])(
+    'explains possible coverage for empty %s results without losing code checks',
+    async (dataset, threshold, alternative) => {
+      mockQueryData.mockResolvedValue([]);
+      const result = await runToolContract(censusQueryData, {
+        variables: ['B01003_001E'],
+        dataset,
+        year: 2024,
+        geography_level: 'county',
+        geography_fips: '019',
+        parent_fips: '53',
+      });
+      const data = result.structuredContent as {
+        error: { data: { reason: string; recovery: { hint: string } } };
+      };
+      expect(data.error.data.reason).toBe('no_data');
+      const hint = data.error.data.recovery.hint;
+      expect(hint).toContain(threshold);
+      expect(hint).toContain(alternative);
+      expect(hint).toContain('census_search_variables');
+      expect(hint).toContain('possible');
+      expect(hint).toContain('literally');
+      expect(hint).toContain('census_resolve_geography');
+      const text = result.content
+        .filter((block) => block.type === 'text')
+        .map((block) => block.text)
+        .join('\n');
+      expect(text).toContain(threshold);
+      expect(text).toContain('census_search_variables');
+      if (dataset.endsWith('/cprofile')) expect(hint).toContain('comparison history');
+      if (dataset.endsWith('/spp')) expect(hint).toContain('subgroup');
+      if (dataset.endsWith('/subject')) expect(hint).toContain('subgroup');
+    },
+  );
+
+  it.each(['acs/acs1', 'acs/acsse', 'acs/acs5/cprofile'])(
+    'keeps %s missing-member coverage independent of pagination',
+    async (dataset) => {
+      mockQueryData.mockResolvedValue([
+        { geographyName: 'King', geographyFips: '033', geographyGeoid: '53033', variables: {} },
+        { geographyName: 'Pierce', geographyFips: '053', geographyGeoid: '53053', variables: {} },
+      ]);
+      const result = await runToolContract(censusQueryData, {
+        variables: ['B01003_001E'],
+        dataset,
+        year: 2024,
+        geography_level: 'county',
+        geography_fips: '019,033,053',
+        parent_fips: '53',
+        limit: 1,
+      });
+      expect(result.isError).not.toBe(true);
+      const data = result.structuredContent as { notice: string };
+      expect(data.notice).toContain('1 of the 3');
+      expect(data.notice).toContain('019');
+      expect(data.notice).toContain('possible');
+      expect(data.notice).toContain('census_search_variables');
+      expect(readNotice(result)).toBe(data.notice);
+    },
+  );
+
+  it.each([
+    { offset: 0, limit: 2, count: 2, more: true, next: 2 },
+    { offset: 2, limit: 2, count: 2, more: true, next: 4 },
+    { offset: 4, limit: 2, count: 1, more: false, next: undefined },
+    { offset: 5, limit: 2, count: 0, more: false, next: undefined },
+    { offset: 9, limit: 2, count: 0, more: false, next: undefined },
+    { offset: 4, limit: 1, count: 1, more: false, next: undefined },
+    { offset: 0, limit: 5, count: 5, more: false, next: undefined },
+  ])(
+    'exposes continuation on both surfaces for offset $offset, limit $limit',
+    async ({ offset, limit, count, more, next }) => {
+      mockQueryData.mockResolvedValue(
+        [5, 3, 1, 4, 2].map((code) => ({
+          geographyName: `County ${code}`,
+          geographyFips: String(code).padStart(3, '0'),
+          geographyGeoid: `53${String(code).padStart(3, '0')}`,
+          variables: {
+            B01003_001E: { estimate: code * 100, label: 'Population', suppressed: false },
+          },
+        })),
+      );
+      const result = await runToolContract(censusQueryData, {
+        variables: ['B01003_001E'],
+        geography_level: 'county',
+        geography_fips: '*',
+        parent_fips: '53',
+        offset,
+        limit,
+      });
+      expect(result.isError).not.toBe(true);
+      const data = result.structuredContent as {
+        rows: { geography_geoid: string }[];
+        totalCount: number;
+        truncated: boolean;
+        nextOffset?: number;
+        notice?: string;
+      };
+      expect(data.rows).toHaveLength(count);
+      expect(data.totalCount).toBe(5);
+      expect(data.truncated).toBe(more);
+      expect(data.nextOffset).toBe(next);
+      const text = result.content
+        .filter((block) => block.type === 'text')
+        .map((block) => block.text)
+        .join('\n');
+      expect(text).toContain(`**truncated:** ${more}`);
+      if (next !== undefined) expect(text).toContain(`**nextOffset:** ${next}`);
+      else expect(text).not.toContain('**nextOffset:**');
+      if (offset === 4) expect(data.notice).toContain('last page');
+      if (offset >= 5) expect(data.notice).toContain('past the last');
+      if (offset === 2)
+        expect(data.rows.map((row) => row.geography_geoid)).toEqual(['53003', '53004']);
+    },
+  );
+
   it('returns enriched rows for a valid query', async () => {
     mockQueryData.mockResolvedValue([
       {

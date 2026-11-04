@@ -4,9 +4,8 @@
  * @module services/census-api/census-api-service
  */
 
-import type { Context } from '@cyanheads/mcp-ts-core';
 import { McpError, serviceUnavailable, unauthorized } from '@cyanheads/mcp-ts-core/errors';
-import { fetchWithTimeout, type RequestContext, withRetry } from '@cyanheads/mcp-ts-core/utils';
+import { fetchWithTimeout, type RequestContext } from '@cyanheads/mcp-ts-core/utils';
 import { getDiscoveryConfig, getServerConfig } from '@/config/server-config.js';
 import {
   DATASET_AVAILABLE_YEARS,
@@ -14,7 +13,13 @@ import {
   getVariableCacheService,
   isAcsDataset,
 } from '@/services/variable-cache/variable-cache-service.js';
-import { censusDeadlineError, censusHttpError, FIRST_UNKNOWN_ONLY } from './errors.js';
+import {
+  type CensusRequestContext as Context,
+  isCensusCallDeadline,
+  readCensusText,
+  withCensusRetry,
+} from './census-request.js';
+import { censusHttpError, FIRST_UNKNOWN_ONLY } from './errors.js';
 import type {
   CensusDataRow,
   CensusGeographyLevel,
@@ -46,8 +51,8 @@ const DATA_ATTEMPT_TIMEOUT_MS = 15_000;
  * than this server's error. Every California block group on acs/acs5 2024 with 49 variables
  * answered in 11–14 s end to end, so the first attempt keeps its full 15 s and a second full
  * attempt still fits after a fast transient failure. A hung endpoint settles here, 20 s inside the
- * client default once the metadata requests ahead of it are cached; those requests carry no
- * deadline of their own.
+ * client default once metadata is cached. Metadata and this local ceiling also share a 50 s
+ * upstream budget on keyed tool calls; standalone metadata calls retain their local timeouts.
  */
 const DATA_REQUEST_DEADLINE_MS = 40_000;
 
@@ -614,7 +619,7 @@ export class CensusApiService {
       predicates: predicateKeys,
     });
 
-    const raw = await withRetry(
+    const raw = await withCensusRetry(
       async ({ signal, remainingMs }) => {
         let response: Response;
         try {
@@ -632,7 +637,7 @@ export class CensusApiService {
             requestedCodes: params.variables,
           });
         }
-        return parseDataBody(response.status, await response.text());
+        return parseDataBody(response.status, await readCensusText(response, ctx));
       },
       {
         operation: 'CensusApiService.queryData',
@@ -641,8 +646,10 @@ export class CensusApiService {
         signal: ctx.signal,
         deadlineMs: DATA_REQUEST_DEADLINE_MS,
       },
+      ctx,
+      params,
     ).catch(async (error: unknown) => {
-      throw await this.pointAtSibling(censusDeadlineError(error, params), params, ctx);
+      throw await this.pointAtSibling(error, params, ctx);
     });
 
     return this.parseResponse(raw, params, ctx);
@@ -659,12 +666,19 @@ export class CensusApiService {
     ctx: Context,
   ): Promise<unknown> {
     if (!(error instanceof McpError) || error.data?.reason !== 'variable_not_found') return error;
-    const holders = await getVariableCacheService().findSiblingDatasets(
-      error.data.missingCodes as string[],
-      scope.dataset,
-      scope.year,
-      ctx,
-    );
+    let holders: Map<string, string>;
+    try {
+      holders = await getVariableCacheService().findSiblingDatasets(
+        error.data.missingCodes as string[],
+        scope.dataset,
+        scope.year,
+        ctx,
+      );
+    } catch (probeError) {
+      // Enrichment cannot replace the upstream's deterministic rejection with a timeout.
+      if (isCensusCallDeadline(probeError) && !ctx.signal.aborted) return error;
+      throw probeError;
+    }
     if (holders.size === 0) return error;
     return new McpError(error.code, error.message, {
       ...error.data,
@@ -773,15 +787,20 @@ export class CensusApiService {
 
     ctx.log.debug('Fetching geography levels', { dataset, year });
 
-    const levels = await withRetry(
-      async () => {
+    const levels = await withCensusRetry(
+      async ({ signal, remainingMs }) => {
         let response: Response;
         try {
-          response = await fetchWithTimeout(url, 10_000, ctx as unknown as RequestContext, {
-            signal: ctx.signal,
-            // A 404 here is an expected outcome, not a fault — log it at debug.
-            expectedStatuses: [404],
-          });
+          response = await fetchWithTimeout(
+            url,
+            Math.min(10_000, remainingMs),
+            ctx as unknown as RequestContext,
+            {
+              signal,
+              // A 404 here is an expected outcome, not a fault — log it at debug.
+              expectedStatuses: [404],
+            },
+          );
         } catch (err) {
           // 404 means the year has no data for this dataset — return empty so the handler
           // can throw year_not_available instead of a generic upstream error.
@@ -795,7 +814,7 @@ export class CensusApiService {
           });
         }
 
-        const text = await response.text();
+        const text = await readCensusText(response, ctx);
 
         if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
           throw serviceUnavailable('Census API geography endpoint returned HTML.', {
@@ -821,6 +840,8 @@ export class CensusApiService {
         baseDelayMs: 1000,
         signal: ctx.signal,
       },
+      ctx,
+      { dataset, year },
     );
 
     this.geographyLevelsCache.set(cacheKey, { levels, fetchedAt: Date.now() });
@@ -852,6 +873,8 @@ export class CensusApiService {
       code: string;
       /** Attribute column carrying each code's label (e.g. "EMPSZES_LABEL"), when published. */
       labelAttribute?: string;
+      /** Validated live enumeration level; dictionary publication checks retain the national scope. */
+      geographyLevel?: string;
       /**
        * Measure variable to request instead of the label column, forcing the enumeration to
        * read the data file. Codes come back unlabelled, so this is for checking which codes the
@@ -875,7 +898,8 @@ export class CensusApiService {
     const scopeKey = params.naicsScope
       ? `${params.naicsScope.code}=${params.naicsScope.value}`
       : '';
-    const cacheKey = `${params.dataset}|${params.year}|${params.code}|${scopeKey}|${params.measure ?? ''}`;
+    const geographyLevel = params.geographyLevel ?? 'us';
+    const cacheKey = `${params.dataset}|${params.year}|${params.code}|${scopeKey}|${params.measure ?? ''}|${geographyLevel}`;
     const cached = this.predicateValuesCache.get(cacheKey);
     if (cached && Date.now() - cached.fetchedAt < ttlMs) {
       ctx.log.debug('Predicate values cache hit', { dataset: params.dataset, code: params.code });
@@ -886,7 +910,8 @@ export class CensusApiService {
       ? `&${encodeURIComponent(params.naicsScope.code)}=${encodeURIComponent(params.naicsScope.value)}`
       : '';
     const getColumn = params.measure ?? params.labelAttribute ?? params.code;
-    const url = `${CENSUS_API_BASE}/${params.year}/${params.dataset}?get=${encodeURIComponent(getColumn)}&${encodeURIComponent(params.code)}=*${scopeClause}&for=us:1&key=${censusApiKey}`;
+    const forClause = `${geographyLevel}:${geographyLevel === 'us' ? '1' : '*'}`;
+    const url = `${CENSUS_API_BASE}/${params.year}/${params.dataset}?get=${encodeURIComponent(getColumn)}&${encodeURIComponent(params.code)}=*${scopeClause}&for=${encodeURIComponent(forClause)}&key=${censusApiKey}`;
 
     ctx.log.debug('Enumerating predicate values', {
       dataset: params.dataset,
@@ -894,7 +919,7 @@ export class CensusApiService {
       code: params.code,
     });
 
-    const raw = await withRetry(
+    const raw = await withCensusRetry(
       async ({ signal, remainingMs }) => {
         let response: Response;
         try {
@@ -912,7 +937,7 @@ export class CensusApiService {
           });
         }
         // A dimension with nothing to enumerate under this scope answers 204 with no body.
-        return parseDataBody(response.status, await response.text());
+        return parseDataBody(response.status, await readCensusText(response, ctx));
       },
       {
         operation: 'CensusApiService.fetchPredicateValues',
@@ -921,9 +946,9 @@ export class CensusApiService {
         signal: params.signal ? AbortSignal.any([ctx.signal, params.signal]) : ctx.signal,
         deadlineMs: params.deadlineMs ?? DATA_REQUEST_DEADLINE_MS,
       },
-    ).catch((error: unknown) => {
-      throw censusDeadlineError(error, params);
-    });
+      ctx,
+      params,
+    );
 
     const values: CensusPredicateValue[] = [];
     if (raw.length > 1) {

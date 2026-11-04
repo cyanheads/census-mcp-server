@@ -6,6 +6,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, validationError } from '@cyanheads/mcp-ts-core/errors';
 import { getDiscoveryConfig } from '@/config/server-config.js';
+import { describeAcsCoverage } from '@/mcp-server/tools/acs-coverage.js';
 import { renderNotice } from '@/mcp-server/tools/notice-trailer.js';
 import {
   renderVariable,
@@ -22,7 +23,9 @@ import {
   padFips,
   planQueryColumns,
 } from '@/services/census-api/census-api-service.js';
+import { censusCallContext } from '@/services/census-api/census-request.js';
 import { levelNotSupportedMessage } from '@/services/census-api/errors.js';
+import type { CensusDataRow } from '@/services/census-api/types.js';
 import {
   DATASET_LATEST_YEARS,
   defaultLabelColumnsFor,
@@ -119,7 +122,15 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
       .max(500)
       .optional()
       .describe(
-        'Maximum geographies to return (default: 50, max: 500). When results are truncated, totalCount says how many matched.',
+        'Maximum geographies per page (default: 50, max: 500). totalCount counts the matched set before paging; nextOffset reaches the next page.',
+      ),
+    offset: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .describe(
+        'Rows to skip in the sorted matched set (default: 0), not a rank. Equal numeric estimates share competition ranks and are ordered by GEOID. An offset at or past totalCount returns no rows.',
       ),
   }),
   output: z.object({
@@ -161,7 +172,13 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
             rank: z
               .number()
               .describe(
-                'Rank of this geography by the sort variable (1 = highest when sort_dir is desc).',
+                'Competition rank in the matched set before paging (1 = highest when sort_dir is desc). Equal numeric estimates share a rank, with gaps after ties: 1, 2, 2, 4. Nonnumeric rows follow every number with sequential ordinals; an entirely nonnumeric comparison retains Census return order.',
+              ),
+            scope_rank: z
+              .number()
+              .optional()
+              .describe(
+                'Rank among all fetched geographies before the geographies filter, using the same competition rule as rank. Present only with a nonempty geographies filter; scopeCount gives the size of that fetched set.',
               ),
           })
           .describe('One ranked geography row with variable values.'),
@@ -172,10 +189,20 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
   enrichment: {
     totalCount: z
       .number()
-      .describe('Total number of geographies matched before the limit was applied.'),
-    truncated: z
-      .boolean()
-      .describe('True when totalCount exceeds the limit and results were cut off.'),
+      .describe('Total geographies matched after the geographies filter, before offset and limit.'),
+    truncated: z.boolean().describe('True only when more matched rows remain after this page.'),
+    nextOffset: z
+      .number()
+      .optional()
+      .describe(
+        'Row offset for the next page, present only when truncated is true. An offset counts rows rather than competition ranks.',
+      ),
+    scopeCount: z
+      .number()
+      .optional()
+      .describe(
+        'Number of fetched geographies before the nonempty geographies filter; the denominator for scope_rank. Absent without that filter.',
+      ),
     sortVariable: z
       .string()
       .describe(
@@ -187,7 +214,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
       .string()
       .optional()
       .describe(
-        'Guidance when results were truncated, when the sort column holds no number on any row (so the rows are in the order the Census returned them rather than ranked), when geographies entries matched no row, when a bare level code matched more than one state, or when the dataset declares filter dimensions the comparison left unset — how to narrow scope, raise the limit, correct the FIPS codes, or add the predicates that pin what the ranking covers. For an unset dimension it also quotes the label of the default the Census API applied, which is what says whether the ranking is on a total or on one category. On dec/ddhca and dec/ddhcb tables that split the population groups between them, it names the sibling tables a geography left out of the ranking may sit in. Also names any variable codes whose flags could not be checked because the request had no room left under the Census 50-column limit — a withheld value there reads as 0 and ranks as one.',
+        'Guidance when results were truncated, when the sort column holds no number on any row (so the rows are in the order the Census returned them rather than ranked), when geographies entries matched no row, when a bare level code matched more than one state, or when the dataset declares filter dimensions the comparison left unset — how to narrow scope, raise the limit, correct the FIPS codes, or add the predicates that pin what the ranking covers. Unmatched geographies include applicable ACS publication coverage guidance and variable rediscovery when switching datasets. For an unset dimension it also quotes the label of the default the Census API applied, which is what says whether the ranking is on a total or on one category. On dec/ddhca and dec/ddhcb tables that split the population groups between them, it names the sibling tables a geography left out of the ranking may sit in. Also names any variable codes whose flags could not be checked because the request had no room left under the Census 50-column limit — a withheld value there reads as 0 and ranks as one.',
       ),
   },
   // The notice quotes unmatched geographies entries and the labels of applied defaults.
@@ -293,7 +320,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
     {
       reason: 'upstream_error',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Census API was unreachable, returned an error, or did not finish answering the data request within its 40-second limit across retries.',
+      when: "Census API returned an error, was unreachable, or exceeded the shared 50-second upstream budget or the data request's 40-second ceiling within it.",
       retryable: true,
       thrownBy: 'service',
       recovery:
@@ -302,6 +329,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
   ],
 
   async handler(input, ctx) {
+    const upstream = censusCallContext(ctx);
     const requestedCodes = normalizeVariableCodes(input.variables);
     if (requestedCodes.length === 0) {
       throw validationError('At least one variable code is required.', {
@@ -367,7 +395,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
         ...(parentFips !== undefined && { parentFips }),
         ...(countyFips !== undefined && { countyFips }),
       },
-      ctx,
+      upstream,
     );
 
     if (check.status === 'level_not_supported') {
@@ -451,7 +479,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
     const { predicates, wildcards } = normalizePredicates(input.predicates);
     const predicateCheck = await variableCacheService.checkPredicates(
       { dataset, year, supplied: Object.keys(predicates) },
-      ctx,
+      upstream,
     );
 
     if (predicateCheck.unknown.length > 0) {
@@ -473,7 +501,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
       requestedCodes,
       dataset,
       year,
-      ctx,
+      upstream,
     );
     const sortBy = variables[requestedCodes.indexOf(sortKey)] as string;
     const tableSplit = describeTableSplit(variables, dataset, false);
@@ -483,7 +511,11 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
 
     // A dataset that publishes several records per geography answers with one row each. The
     // columns that separate them are requested so an ambiguous ranking can name what to pin.
-    const recordDimensions = await variableCacheService.getRecordDimensions(dataset, year, ctx);
+    const recordDimensions = await variableCacheService.getRecordDimensions(
+      dataset,
+      year,
+      upstream,
+    );
     const recordColumns = recordLabelColumnsFor(recordDimensions);
 
     // Labels, flag columns, and wildcard label columns all come from the same metadata. A code
@@ -492,7 +524,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
       [...variables, ...wildcards],
       dataset,
       year,
-      ctx,
+      upstream,
     );
 
     // Count every column the request will send against the Census API's 50-column limit before
@@ -530,13 +562,11 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
         dataset,
         year,
       },
-      ctx,
+      upstream,
     );
 
     if (rows.length === 0) {
-      // Only steer toward acs/acs5 from a dataset that actually covers less than it does.
-      // Predicates can empty a result on their own — ecnbasic publishes nothing at county level
-      // until an industry is named, and an unknown value is a 204 — so they take priority.
+      // Predicate publication and ACS coverage are possible causes alongside code errors.
       const predicateHint = describeEmptyPredicatedResult(
         unfiltered,
         Object.keys(predicates),
@@ -544,11 +574,8 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
         year,
         variables,
       );
-      const hint = predicateHint
-        ? `${predicateHint} Otherwise confirm the level with census_list_geographies.`
-        : dataset.startsWith('acs/acs1')
-          ? `ACS1 only covers geographies with 65,000+ population — switch to dataset "acs/acs5" for smaller geographies, or confirm the level with census_list_geographies.`
-          : `Confirm ${input.geography_level} is populated in ${dataset} (${year}) with census_list_geographies, and that within names a valid state FIPS.`;
+      const coverage = describeAcsCoverage(dataset);
+      const hint = `${predicateHint ? `${predicateHint} ` : ''}${coverage ? `${coverage} ` : ''}Confirm ${input.geography_level} is supported in ${dataset} (${year}) with census_list_geographies, and check the state and county FIPS codes with census_resolve_geography.`;
       throw ctx.fail(
         'no_data',
         `No geographies returned for ${input.geography_level} in ${dataset} (${year}).`,
@@ -586,7 +613,34 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
       );
     }
 
-    let filteredRows = rows;
+    const sortedScope = [...rows].sort((a, b) => {
+      const aVal = a.variables[sortBy]?.estimate;
+      const bVal = b.variables[sortBy]?.estimate;
+      if (typeof aVal !== 'number') return typeof bVal === 'number' ? 1 : 0;
+      if (typeof bVal !== 'number') return -1;
+      if (aVal === bVal) {
+        return a.geographyGeoid < b.geographyGeoid
+          ? -1
+          : a.geographyGeoid > b.geographyGeoid
+            ? 1
+            : 0;
+      }
+      return sortDir === 'desc' ? bVal - aVal : aVal - bVal;
+    });
+    // Offsets count rows, while equal numeric values share a competition rank. Use the same
+    // rule over the fetched scope and the matched subset before slicing either into pages.
+    const rankRows = (ordered: CensusDataRow[]) => {
+      let rank = 0;
+      let previous: number | null | undefined;
+      return ordered.map((row, index) => {
+        const value = row.variables[sortBy]?.estimate;
+        if (typeof value !== 'number' || value !== previous) rank = index + 1;
+        previous = value;
+        return { row, rank };
+      });
+    };
+    const scopeRanks = new Map(rankRows(sortedScope).map(({ row, rank }) => [row, rank]));
+    let filteredRows = sortedScope;
     let unmatchedGeographies: string[] = [];
     let ambiguousGeographies: string[] = [];
     if (input.geographies && input.geographies.length > 0) {
@@ -594,7 +648,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
       // when within scopes the comparison to a single state.
       const requested = [...new Set(input.geographies.map((g) => g.trim()).filter(Boolean))];
       const geoSet = new Set(requested);
-      filteredRows = rows.filter(
+      filteredRows = sortedScope.filter(
         (r) => geoSet.has(r.geographyGeoid) || geoSet.has(r.geographyFips),
       );
 
@@ -611,6 +665,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
       ambiguousGeographies = requested.filter((g) => (bareMatches.get(g) ?? 0) > 1);
 
       if (filteredRows.length === 0) {
+        const coverage = describeAcsCoverage(dataset);
         throw ctx.fail(
           'no_data',
           `None of the ${requested.length} requested geographies matched a ${input.geography_level} in ${dataset} (${year}): ${requested.join(', ')}.`,
@@ -620,33 +675,21 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
             geographyLevel: input.geography_level,
             unmatchedGeographies,
             recovery: {
-              hint: `The geographies filter matches a row's full GEOID (level plus parents, e.g. "53033" for a WA county) or its bare level code ("033") when within scopes the comparison to one state. Take a GEOID from the geography_geoid field of a census_query_data row, or build it from census_resolve_geography by concatenating state_fips, then county_fips when present, then fips_summary.${tableSplit ? ` ${tableSplit}` : ''}`,
+              hint: `The geographies filter matches a row's full GEOID (level plus parents, e.g. "53033" for a WA county) or its bare level code ("033") when within scopes the comparison to one state. Take a GEOID from the geography_geoid field of a census_query_data row, or build it from census_resolve_geography by concatenating state_fips, then county_fips when present, then fips_summary.${coverage ? ` ${coverage}` : ''}${tableSplit ? ` ${tableSplit}` : ''}`,
             },
           },
         );
       }
     }
 
-    // Sort by sort_by variable (non-suppressed values first, then suppressed at end)
-    const sorted = [...filteredRows].sort((a, b) => {
-      const aVal = a.variables[sortBy]?.estimate;
-      const bVal = b.variables[sortBy]?.estimate;
+    const totalCount = filteredRows.length;
+    const offset = input.offset ?? 0;
+    const sliced = rankRows(filteredRows).slice(offset, offset + limit);
+    const end = offset + sliced.length;
+    const truncated = end < totalCount;
+    const hasSubset = input.geographies !== undefined && input.geographies.length > 0;
 
-      if (aVal === null && bVal === null) return 0;
-      if (aVal === null) return 1;
-      if (bVal === null) return -1;
-      if (aVal === undefined && bVal === undefined) return 0;
-      if (aVal === undefined) return 1;
-      if (bVal === undefined) return -1;
-
-      return sortDir === 'desc' ? bVal - aVal : aVal - bVal;
-    });
-
-    const totalCount = sorted.length;
-    const truncated = totalCount > limit;
-    const sliced = sorted.slice(0, limit);
-
-    const resultRows = sliced.map((row, idx) => {
+    const resultRows = sliced.map(({ row, rank }) => {
       const enrichedVariables: Record<string, VariableEntry> = {};
       for (const [code, val] of Object.entries(row.variables)) {
         enrichedVariables[code] = toVariableEntry(val, metadata.get(code)?.label ?? val.label);
@@ -659,11 +702,20 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
         variables: enrichedVariables,
         ...(row.appliedFilters && { applied_filters: row.appliedFilters }),
         ...(row.record && { record: row.record }),
-        rank: idx + 1,
+        rank,
+        ...(hasSubset && { scope_rank: scopeRanks.get(row) }),
       };
     });
 
-    ctx.enrich({ totalCount, truncated, sortVariable: sortBy, dataset, year });
+    ctx.enrich({
+      totalCount,
+      truncated,
+      ...(truncated && { nextOffset: end }),
+      ...(hasSubset && { scopeCount: rows.length }),
+      sortVariable: sortBy,
+      dataset,
+      year,
+    });
 
     const notices: string[] = [];
     // Lead with the unfiltered-dimension warning: it says the ranking answers a different
@@ -696,21 +748,43 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
         ...(accepted.includes('county') && open(countyFips) ? ['within_county'] : []),
       ];
       const ways = [
+        `call again with offset: ${end} for the next page`,
         ...(limit < 500 ? ['increase the limit parameter (max 500)'] : []),
         ...(scopes.length > 0 ? [`use ${scopes.join(' or ')} to narrow the scope`] : []),
         ...(ranked ? ['flip sort_dir to see the other end of the ranking'] : []),
       ];
-      const hidden = totalCount - sliced.length;
+      const hidden = totalCount - end;
       const options =
         ways.length > 1 ? `${ways.slice(0, -1).join(', ')}, or ${ways.at(-1)}` : ways[0];
       notices.push(
         `Results truncated — ${hidden.toLocaleString('en-US')} more ${hidden === 1 ? 'geography' : 'geographies'} not shown.${options ? ` To see more, ${options}.` : ''}`,
+      );
+    } else if (offset >= totalCount) {
+      notices.push(
+        `offset ${offset} is at or past the last of the ${totalCount} matched rows, so no rows are returned. Pass an offset below ${totalCount}; offset: 0 starts from the first row.`,
+      );
+    } else if (offset > 0) {
+      notices.push(
+        `Rows ${offset + 1}–${end} of ${totalCount}. This is the last page; offset: 0 starts from the first row.`,
+      );
+    }
+    const crossesTie = (boundary: number) => {
+      const before = filteredRows[boundary - 1]?.variables[sortBy]?.estimate;
+      return (
+        typeof before === 'number' && before === filteredRows[boundary]?.variables[sortBy]?.estimate
+      );
+    };
+    if (sliced.length > 0 && (crossesTie(offset) || crossesTie(end))) {
+      notices.push(
+        'A page boundary falls inside a numeric tie group; equal values share a rank, and the remaining tied rows are on the adjacent page.',
       );
     }
     if (unmatchedGeographies.length > 0) {
       notices.push(
         `No ${input.geography_level} matched ${unmatchedGeographies.length} of the requested geographies: ${unmatchedGeographies.join(', ')}. Entries must be a full GEOID (level plus parents, e.g. "53033"), or a bare level code when within scopes the comparison to one state.`,
       );
+      const coverage = describeAcsCoverage(dataset);
+      if (coverage) notices.push(coverage);
     }
     if (ambiguousGeographies.length > 0) {
       notices.push(
@@ -740,6 +814,7 @@ export const censusCompareGeographies = tool('census_compare_geographies', {
           : '';
       lines.push(`### ${row.rank}. ${row.geography_name}${recordSuffix}`);
       lines.push(`**FIPS:** \`${row.geography_fips}\` · **GEOID:** \`${row.geography_geoid}\``);
+      if (row.scope_rank !== undefined) lines.push(`**Scope rank:** ${row.scope_rank}`);
       for (const [code, entry] of Object.entries(row.variables)) {
         lines.push(...renderVariable(code, entry as VariableEntry));
       }

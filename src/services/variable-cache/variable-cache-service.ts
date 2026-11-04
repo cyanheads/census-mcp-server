@@ -6,11 +6,17 @@
  * @module services/variable-cache/variable-cache-service
  */
 
-import type { Context } from '@cyanheads/mcp-ts-core';
 import { McpError, notFound, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
-import { fetchWithTimeout, type RequestContext, withRetry } from '@cyanheads/mcp-ts-core/utils';
+import { fetchWithTimeout, type RequestContext } from '@cyanheads/mcp-ts-core/utils';
 import { getDiscoveryConfig } from '@/config/server-config.js';
 import type { WildcardColumn } from '@/services/census-api/census-api-service.js';
+import {
+  type CensusRequestContext as Context,
+  censusRemainingMs,
+  isCensusCallDeadline,
+  readCensusText,
+  withCensusRetry,
+} from '@/services/census-api/census-request.js';
 import { censusHttpError, yearNotAvailable } from '@/services/census-api/errors.js';
 import type {
   CensusVariable,
@@ -555,7 +561,7 @@ export function describeEmptyPredicatedResult(
 
   if (supplied.length > 0) {
     parts.push(
-      `A predicate value that does not exist in ${dataset} (${year}) also returns nothing rather than an error, so check the ${listCodes(supplied)} ${supplied.length === 1 ? 'value' : 'values'} this query sent — census_list_predicate_values enumerates the codes each dimension accepts.`,
+      `A predicate value that does not exist in ${dataset} (${year}) also returns nothing rather than an error, so check the ${listCodes(supplied)} ${supplied.length === 1 ? 'value' : 'values'} this query sent — census_list_predicate_values enumerates the codes each dimension accepts. A valid code can also be unpublished at the queried geography level; pass the same geography_level to a live enumeration, while dictionary lists do not validate publication at that level.`,
     );
   }
 
@@ -648,14 +654,14 @@ export class VariableCacheService {
    * the search.
    */
   async searchVariables(
-    params: { query: string; dataset: string; year: number; limit: number },
+    params: { query: string; dataset: string; year: number; limit: number; offset?: number },
     ctx: Context,
   ): Promise<VariableSearchResult & { codeMiss?: CodeMiss }> {
     const { dataset, year } = params;
     const entry = await this.getEntry(dataset, year, ctx);
     const token = codeToken(params.query);
     const code = token === undefined ? undefined : spellingIn(entry, token);
-    const result = rankVariables(entry.variables, params.query, params.limit, code);
+    const result = rankVariables(entry.variables, params.query, params.limit, code, params.offset);
     const unmatched = result.totalMatches === 0 || result.matchedTermCount < result.termCount;
     if (!unmatched || code === undefined || !looksLikeCode(code)) return result;
 
@@ -717,7 +723,7 @@ export class VariableCacheService {
     const deadline = new AbortController();
     const timer = setTimeout(
       () => deadline.abort(new Error('Sibling dataset lookup ran out of time.')),
-      SIBLING_LOOKUP_DEADLINE_MS,
+      Math.min(SIBLING_LOOKUP_DEADLINE_MS, censusRemainingMs(ctx, { dataset, year })),
     );
     const signal = ctx.signal ? AbortSignal.any([ctx.signal, deadline.signal]) : deadline.signal;
     try {
@@ -738,6 +744,7 @@ export class VariableCacheService {
           return [];
         }),
       );
+      censusRemainingMs(ctx, { dataset, year });
       return new Map(found.flat());
     } finally {
       clearTimeout(timer);
@@ -1009,7 +1016,7 @@ export class VariableCacheService {
       deadlineMs,
     }: { mapError?: (error: unknown) => unknown; deadlineMs?: number } = {},
   ): Promise<unknown> {
-    return withRetry(
+    return withCensusRetry(
       async ({ signal, remainingMs }) => {
         let response: Response;
         try {
@@ -1023,7 +1030,7 @@ export class VariableCacheService {
         } catch (error) {
           throw mapError(error);
         }
-        const text = await response.text();
+        const text = await readCensusText(response, ctx);
 
         if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
           throw serviceUnavailable(
@@ -1048,6 +1055,8 @@ export class VariableCacheService {
         signal: ctx.signal,
         ...(deadlineMs !== undefined && { deadlineMs }),
       },
+      ctx,
+      { ...scope, reason: 'variables_unavailable' },
     );
   }
 
@@ -1122,7 +1131,7 @@ export class VariableCacheService {
     try {
       raw = (await this.fetchMetadata(url, what, { dataset, year }, ctx)) as RawVariableRecord;
     } catch (error) {
-      if (ctx.signal?.aborted) throw error;
+      if (ctx.signal?.aborted || isCensusCallDeadline(error)) throw error;
       throw this.metadataUnavailable(what, { dataset, year }, error);
     }
 
@@ -1174,7 +1183,7 @@ export class VariableCacheService {
       }
     } catch (error) {
       // Checked on the signal: an abort during the retry backoff rethrows its raw reason.
-      if (ctx.signal?.aborted) throw error;
+      if (ctx.signal?.aborted || isCensusCallDeadline(error)) throw error;
       if (!(error instanceof McpError && error.data?.status === 404)) {
         ctx.log.warning('groups.json could not be fetched; returning variables without universe', {
           dataset,

@@ -14,6 +14,7 @@ import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getServerConfig } from '@/config/server-config.js';
 import { censusCompareGeographies } from '@/mcp-server/tools/definitions/census-compare-geographies.tool.js';
+import { censusListPredicateValues } from '@/mcp-server/tools/definitions/census-list-predicate-values.tool.js';
 import { censusQueryData } from '@/mcp-server/tools/definitions/census-query-data.tool.js';
 import { allToolDefinitions } from '@/mcp-server/tools/definitions/index.js';
 import { initCensusApiService } from '@/services/census-api/census-api-service.js';
@@ -160,6 +161,138 @@ const errorOf = (result: { structuredContent?: unknown }) =>
       error: { code: number; message: string; data: Record<string, unknown> };
     }
   ).error;
+
+describe('ACS missing-geography coverage on both client surfaces', () => {
+  it.each([
+    { tool: 'query', dataset: 'acs/acsse', mode: 'empty', threshold: '20,000' },
+    { tool: 'query', dataset: 'acs/acs1', mode: 'partial', threshold: '65,000' },
+    { tool: 'compare', dataset: 'acs/acsse', mode: 'empty', threshold: '20,000' },
+    { tool: 'compare', dataset: 'acs/acs5/cprofile', mode: 'partial', threshold: '5,000' },
+    { tool: 'compare', dataset: 'acs/acs5/cprofile', mode: 'all-missing', threshold: '5,000' },
+    { tool: 'compare', dataset: 'acs/acs1/spp', mode: 'all-missing', threshold: '500,000' },
+  ])(
+    '$tool $dataset $mode retains code checks and explains possible coverage',
+    async ({ tool, dataset, mode, threshold }) => {
+      serveMetadata(dataset, 2024, {
+        B01003_001E: { label: 'Population', predicateType: 'int' },
+      });
+      serveData(dataset, 2024, (url) =>
+        mode === 'empty'
+          ? new Response(null, { status: 204 })
+          : [
+              [...getList(url), 'state', 'county'],
+              ...['033', '053'].map((county) => [
+                ...getList(url).map((code) => (code === 'NAME' ? `County ${county}` : '100000')),
+                '53',
+                county,
+              ]),
+            ],
+      );
+      const common = {
+        variables: ['B01003_001E'],
+        dataset,
+        year: 2024,
+        geography_level: 'county',
+        limit: 1,
+      };
+      const result =
+        tool === 'query'
+          ? await runToolContract(censusQueryData, {
+              ...common,
+              parent_fips: '53',
+              geography_fips: '019,033,053',
+            })
+          : await runToolContract(censusCompareGeographies, {
+              ...common,
+              within: '53',
+              geographies: mode === 'all-missing' ? ['53019'] : ['53019', '53033', '53053'],
+            });
+      if (mode === 'partial') {
+        expect(result.isError).not.toBe(true);
+        const notice = structured(result).notice;
+        expect(notice).toContain(threshold);
+        expect(notice).toContain('possible');
+        expect(notice).toContain('census_search_variables');
+        expect(notice).toContain(tool === 'query' ? '1 of the 3' : '1 of the requested');
+        expect(readNotice(result)).toBe(notice);
+      } else {
+        expect(result.isError).toBe(true);
+        const error = errorOf(result);
+        expect(error.data.reason).toBe('no_data');
+        const recovery = error.data.recovery as { hint: string };
+        expect(recovery.hint).toContain(threshold);
+        expect(recovery.hint).toContain('possible');
+        expect(recovery.hint).toContain('census_search_variables');
+        expect(recovery.hint).toContain(
+          mode === 'all-missing' ? 'GEOID' : 'census_resolve_geography',
+        );
+        expect(textOf(result)).toContain(threshold);
+        expect(textOf(result)).toContain('census_search_variables');
+      }
+      expect(dataCalls(dataset, 2024)).toHaveLength(1);
+    },
+  );
+
+  it.each(['acs/acs5', 'acs/acs5/profile', 'cbp'])(
+    'does not invent a population floor for %s',
+    async (dataset) => {
+      const year = dataset === 'cbp' ? 2023 : 2024;
+      serveMetadata(dataset, year, { B01003_001E: { label: 'Population', predicateType: 'int' } });
+      serveData(dataset, year, () => new Response(null, { status: 204 }));
+      const common = { variables: ['B01003_001E'], dataset, year, geography_level: 'county' };
+      const results = [
+        await runToolContract(censusQueryData, {
+          ...common,
+          parent_fips: '53',
+          geography_fips: '999',
+        }),
+        await runToolContract(censusCompareGeographies, { ...common, within: '53' }),
+      ];
+      for (const result of results) {
+        expect(errorOf(result).data.reason).toBe('no_data');
+        expect(textOf(result)).not.toContain('population');
+        expect(textOf(result)).not.toContain('Coverage is a possible');
+      }
+    },
+  );
+
+  it('does not call a matched but off-page geography missing', async () => {
+    serveMetadata('acs/acs1', 2024, { B01003_001E: { label: 'Population', predicateType: 'int' } });
+    serveData('acs/acs1', 2024, (url) => [
+      [...getList(url), 'state', 'county'],
+      ...['033', '053'].map((county) => [
+        ...getList(url).map((code) => (code === 'NAME' ? `County ${county}` : '100000')),
+        '53',
+        county,
+      ]),
+    ]);
+    const common = {
+      variables: ['B01003_001E'],
+      dataset: 'acs/acs1',
+      year: 2024,
+      geography_level: 'county',
+      limit: 1,
+    };
+    const results = [
+      await runToolContract(censusQueryData, {
+        ...common,
+        parent_fips: '53',
+        geography_fips: '033,053',
+      }),
+      await runToolContract(censusCompareGeographies, {
+        ...common,
+        within: '53',
+        geographies: ['53033', '53053'],
+      }),
+    ];
+    for (const result of results) {
+      expect(result.isError).not.toBe(true);
+      expect(textOf(result)).not.toContain('Coverage is a possible');
+      expect(textOf(result)).not.toContain('No row came back');
+      expect(textOf(result)).not.toContain('No county matched');
+    }
+  });
+});
 
 const acsVariables = {
   B01003_001E: { label: 'Estimate!!Total', concept: 'Total Population', predicateType: 'int' },
@@ -1318,6 +1451,7 @@ type Paged = ReturnType<typeof structured> & {
   totalCount?: number;
   totalRows?: number;
   truncated?: boolean;
+  nextOffset?: number;
 };
 
 const paged = (result: { structuredContent?: unknown }) => structured(result) as Paged;
@@ -1361,7 +1495,9 @@ describe('census_query_data returns at most limit rows, in GEOID order, paged by
 
     expect(pages.map((p) => p.rows.length)).toEqual([500, 500, 234]);
     expect(pages.flatMap((p) => p.rows.map((r) => r.geography_geoid))).toEqual(all);
-    expect(pages.every((p) => p.totalCount === 1234 && p.truncated === true)).toBe(true);
+    expect(pages.map((p) => p.totalCount)).toEqual([1234, 1234, 1234]);
+    expect(pages.map((p) => p.truncated)).toEqual([true, true, false]);
+    expect(pages.map((p) => p.nextOffset)).toEqual([500, 1000, undefined]);
     expect(pages[1]?.notice).toContain('Rows 501–1,000 of 1,234');
     expect(pages[1]?.notice).toContain('offset: 1000');
     // The last page names no next offset: there is nothing after it.
@@ -1382,7 +1518,8 @@ describe('census_query_data returns at most limit rows, in GEOID order, paged by
       expect(out.rows).toEqual([]);
       expect(out.totalCount).toBe(1234);
       expect(out.totalRows).toBe(0);
-      expect(out.truncated).toBe(true);
+      expect(out.truncated).toBe(false);
+      expect(out.nextOffset).toBeUndefined();
       expect(out.notice).toContain(`offset ${offset.toLocaleString('en-US')}`);
       expect(out.notice).toContain('1,234 rows');
       expect(out.notice).toMatch(/offset below 1,234/);
@@ -1955,7 +2092,7 @@ describe('census_compare_geographies refuses a ranking it cannot make', () => {
     expect(out.notice).not.toContain('sort_dir');
   });
 
-  it('offers no way to see more when an unranked, unscoped list is at the maximum limit', async () => {
+  it('offers the next page when an unranked, unscoped list is at the maximum limit', async () => {
     serveMetadata('acs/acs5', 2024, acsVariables);
     serveData('acs/acs5', 2024, (url) => {
       const header = getList(url);
@@ -1979,7 +2116,7 @@ describe('census_compare_geographies refuses a ranking it cannot make', () => {
     expect(out.rows).toHaveLength(500);
     expect(out.notice).toContain('Results truncated — 1 more geography not shown.');
     expect(out.notice).not.toContain('undefined');
-    expect(out.notice).not.toContain('To see more');
+    expect(out.notice).toContain('offset: 500');
   });
 
   it.each([
@@ -3683,6 +3820,216 @@ describe('a "*" parent the level does not wildcard is refused before the data re
   });
 });
 
+describe('keyed calls share one upstream budget (#79)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  /** Successful metadata remains useful even when it consumes most of the call budget. */
+  const slowMetadata = (data: Body) => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: string | URL, init?: RequestInit) => {
+        const url = new URL(String(input));
+        calls.push(url);
+        const delayMs = url.pathname.endsWith('geography.json') ? 9_000 : 29_000;
+        const metadata = url.pathname.endsWith('geography.json')
+          ? { fips: [{ name: 'state', geoLevelDisplay: '040' }] }
+          : { variables: acsVariables };
+        if (url.pathname.endsWith('.json')) {
+          return new Promise<Response>((resolve) =>
+            setTimeout(() => resolve(new Response(JSON.stringify(metadata))), delayMs),
+          );
+        }
+        if (data === HANG)
+          return new Promise<Response>((_, reject) =>
+            init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), {
+              once: true,
+            }),
+          );
+        return Promise.resolve(new Response(JSON.stringify(data)));
+      }),
+    );
+  };
+  const input = { variables: ['B19013_001E'], geography_level: 'state', geography_fips: '53' };
+
+  it('slow successful metadata still produces the same answer (characterization)', async () => {
+    slowMetadata([
+      ['NAME', 'B19013_001E', 'state'],
+      ['Washington', '103748', '53'],
+    ]);
+    const pending = runToolContract(censusQueryData, input);
+    await vi.advanceTimersByTimeAsync(38_000);
+    const result = await pending;
+    expect(result.isError).toBeFalsy();
+    expect(structured(result).rows[0]?.geography_name).toBe('Washington');
+    expect(textOf(result)).toContain('Washington');
+    expect(calls).toHaveLength(3);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('the data request gets only the time left after metadata', async () => {
+    slowMetadata(HANG);
+    let settled = false;
+    const pending = runToolContract(censusQueryData, input).finally(() => {
+      settled = true;
+    });
+    await vi.advanceTimersByTimeAsync(50_000);
+    const atDeadline = settled;
+    await vi.runAllTimersAsync();
+    const result = await pending;
+    expect(atDeadline).toBe(true);
+    expect(result.isError).toBe(true);
+    expect(errorOf(result).data).toMatchObject({ reason: 'upstream_error', retryable: true });
+    const hint = (errorOf(result).data.recovery as { hint: string }).hint;
+    expect(textOf(result)).toContain(hint);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([
+    ['query', censusQueryData, input],
+    ['compare', censusCompareGeographies, { variables: ['B19013_001E'], geography_level: 'state' }],
+    ['predicate', censusListPredicateValues, { dataset: 'cbp', year: 2023, predicate: 'EMPSZES' }],
+  ] as const)(
+    '%s caps cold variables metadata on both error surfaces',
+    async (_name, definition, args) => {
+      serveMetadata('acs/acs5', 2024, acsVariables);
+      routes.unshift({ match: (u) => u.pathname.endsWith('variables.json'), respond: () => HANG });
+      let settled = false;
+      const pending = runToolContract(definition as never, args as never).finally(() => {
+        settled = true;
+      });
+      await vi.advanceTimersByTimeAsync(50_000);
+      const atDeadline = settled;
+      await vi.runAllTimersAsync();
+      const result = await pending;
+      expect(atDeadline).toBe(true);
+      const error = errorOf(result);
+      expect(['upstream_error', 'variables_unavailable']).toContain(error.data.reason);
+      expect(error.data.retryable).toBe(true);
+      expect(textOf(result)).toContain((error.data.recovery as { hint: string }).hint);
+      expect(textOf(result)).toContain(`reason ${error.data.reason}`);
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
+
+  it.each(['headers', 'body', 'backoff'] as const)(
+    'caller cancellation during metadata %s remains cancellation',
+    async (stage) => {
+      const controller = new AbortController();
+      vi.stubGlobal(
+        'fetch',
+        vi.fn((url: string | URL, init?: RequestInit) => {
+          calls.push(new URL(String(url)));
+          if (String(url).endsWith('geography.json'))
+            return Promise.resolve(
+              new Response(JSON.stringify({ fips: [{ name: 'state', geoLevelDisplay: '040' }] })),
+            );
+          if (stage === 'backoff') return Promise.reject(new TypeError('connection refused'));
+          if (stage === 'body')
+            return Promise.resolve(
+              new Response(
+                new ReadableStream({
+                  start(stream) {
+                    init?.signal?.addEventListener(
+                      'abort',
+                      () => stream.error(init.signal?.reason),
+                      { once: true },
+                    );
+                  },
+                }),
+              ),
+            );
+          return new Promise<Response>((_, reject) =>
+            init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), {
+              once: true,
+            }),
+          );
+        }),
+      );
+      const pending = runToolContract(censusQueryData, input, {
+        context: { signal: controller.signal },
+      });
+      await vi.advanceTimersByTimeAsync(100);
+      controller.abort();
+      await vi.advanceTimersByTimeAsync(1);
+      const result = await pending;
+      expect(errorOf(result).code).toBe(JsonRpcErrorCode.RequestCancelled);
+      expect(errorOf(result).data?.reason).toBeUndefined();
+      expect(textOf(result)).not.toContain('Recovery:');
+      expect(textOf(result)).toContain(errorOf(result).message);
+      expect(calls).toHaveLength(2);
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
+
+  it('exhausted transport failures carry reason and recovery on both surfaces', async () => {
+    serveMetadata('acs/acs5', 2024, acsVariables);
+    serveData('acs/acs5', 2024, () => {
+      throw new TypeError('connection reset');
+    });
+    const pending = runToolContract(censusQueryData, input);
+    await vi.runAllTimersAsync();
+    const result = await pending;
+    const error = errorOf(result);
+    expect(error.data).toMatchObject({
+      reason: 'upstream_error',
+      retryable: true,
+      retryAttempts: 4,
+    });
+    expect(textOf(result)).toContain((error.data.recovery as { hint: string }).hint);
+    expect(textOf(result)).toContain('reason upstream_error');
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('a sibling-enrichment hang cannot outlive the call or replace variable_not_found', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: string | URL, init?: RequestInit) => {
+        const url = new URL(String(input));
+        calls.push(url);
+        if (url.pathname.includes('/variables/'))
+          return new Promise<Response>((_, reject) =>
+            init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), {
+              once: true,
+            }),
+          );
+        const delayMs = url.pathname.endsWith('geography.json')
+          ? 9_000
+          : url.pathname.endsWith('variables.json')
+            ? 29_000
+            : 11_000;
+        const body = url.pathname.endsWith('geography.json')
+          ? { fips: [{ name: 'state', geoLevelDisplay: '040' }] }
+          : { variables: acsVariables };
+        return new Promise<Response>((resolve) =>
+          setTimeout(
+            () =>
+              resolve(
+                url.pathname.endsWith('.json')
+                  ? new Response(JSON.stringify(body))
+                  : new Response("error: unknown variable 'S1701_C03_001E'", { status: 400 }),
+              ),
+            delayMs,
+          ),
+        );
+      }),
+    );
+    const pending = runToolContract(censusQueryData, { ...input, variables: ['S1701_C03_001E'] });
+    await vi.advanceTimersByTimeAsync(50_000);
+    const result = await pending;
+    expect(errorOf(result).data.reason).toBe('variable_not_found');
+    expect(textOf(result)).toContain('census_search_variables');
+    expect(calls.filter((url) => url.pathname.includes('/variables/'))).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
 describe('a hung data endpoint settles inside the client timeout (#78)', () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -4203,6 +4550,20 @@ describe('no error repeats itself between its message and its recovery hint (#62
     },
 
     // census_list_predicate_values
+    {
+      tool: tool('census_list_predicate_values'),
+      reason: 'geography_not_supported',
+      label: 'an unknown live enumeration level',
+      input: { dataset: 'cbp', predicate: 'EMPSZES', geography_level: 'unknown level' },
+      serve: serveCbp,
+    },
+    {
+      tool: tool('census_list_predicate_values'),
+      reason: 'parent_required',
+      label: 'a live enumeration level requiring a concrete parent',
+      input: { dataset: 'cbp', predicate: 'EMPSZES', geography_level: 'tract' },
+      serve: serveCbp,
+    },
     {
       tool: tool('census_list_predicate_values'),
       reason: 'dataset_not_found',

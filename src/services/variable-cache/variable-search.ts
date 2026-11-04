@@ -21,7 +21,7 @@ export interface VariableSearchResult {
   termCount: number;
   /** Variables matched — the code tier and the keyword tier together — before any limit. */
   totalMatches: number;
-  /** Matching variables in rank order, cut to the limit. */
+  /** Matching variables in rank order, paged by offset and limit. */
   variables: CensusVariable[];
 }
 
@@ -131,6 +131,7 @@ export function rankVariables(
   query: string,
   limit: number,
   code?: string,
+  offset = 0,
 ): VariableSearchResult {
   const queryWords = words(query);
   const terms = [...new Set(queryWords)];
@@ -217,7 +218,7 @@ export function rankVariables(
 
   if (codeTier.length === 0) {
     return {
-      variables: tier.slice(0, limit).map((c) => c.variable),
+      variables: tier.slice(offset, offset + limit).map((c) => c.variable),
       totalMatches: tier.length,
       codeMatches: 0,
       matchedTermCount: best,
@@ -233,7 +234,7 @@ export function rankVariables(
       : []),
   ];
   return {
-    variables: ranked.slice(0, limit),
+    variables: ranked.slice(offset, offset + limit),
     totalMatches: ranked.length,
     codeMatches: codeTier.length,
     matchedTermCount: terms.length,

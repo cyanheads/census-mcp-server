@@ -21,8 +21,12 @@ import {
   padFips,
   planQueryColumns,
 } from '@/services/census-api/census-api-service.js';
+import { censusCallContext } from '@/services/census-api/census-request.js';
 import type { SuppliedParent } from '@/services/census-api/types.js';
-import { initVariableCacheService } from '@/services/variable-cache/variable-cache-service.js';
+import {
+  initVariableCacheService,
+  VariableCacheService,
+} from '@/services/variable-cache/variable-cache-service.js';
 
 vi.mock('@/config/server-config.js', () => ({
   getDiscoveryConfig: vi.fn(() => ({ defaultYear: 2024, variableCacheTtlHours: 24 })),
@@ -1215,6 +1219,50 @@ describe('CensusApiService.fetchGeographyLevels', () => {
 });
 
 describe('CensusApiService.fetchPredicateValues', () => {
+  it('separates national and county caches while deduplicating counties', async () => {
+    queue(
+      [
+        ['EMPSZES_LABEL', 'EMPSZES', 'us'],
+        ['All establishments', '001', '1'],
+      ],
+      [
+        ['EMPSZES_LABEL', 'EMPSZES', 'state', 'county'],
+        ['All establishments', '001', '06', '037'],
+        ['5,000 employees or more', '273', '06', '037'],
+        ['5,000 employees or more', '273', '53', '033'],
+      ],
+    );
+    const national = await service.fetchPredicateValues(
+      { dataset: 'cbp', year: 2023, code: 'EMPSZES', labelAttribute: 'EMPSZES_LABEL' },
+      createMockContext(),
+    );
+    const county = await service.fetchPredicateValues(
+      {
+        dataset: 'cbp',
+        year: 2023,
+        code: 'EMPSZES',
+        labelAttribute: 'EMPSZES_LABEL',
+        geographyLevel: 'county',
+      },
+      createMockContext(),
+    );
+    const nationalAgain = await service.fetchPredicateValues(
+      {
+        dataset: 'cbp',
+        year: 2023,
+        code: 'EMPSZES',
+        labelAttribute: 'EMPSZES_LABEL',
+        geographyLevel: 'us',
+      },
+      createMockContext(),
+    );
+    expect(national.map((v) => v.code)).toEqual(['001']);
+    expect(county.map((v) => v.code)).toEqual(['001', '273']);
+    expect(nationalAgain.map((v) => v.code)).toEqual(['001']);
+    expect(requestedUrls).toHaveLength(2);
+    expect(new URL(requestedUrls[0]!).searchParams.get('for')).toBe('us:1');
+    expect(new URL(requestedUrls[1]!).searchParams.get('for')).toBe('county:*');
+  });
   const enumerate = (overrides: Record<string, unknown> = {}) =>
     service.fetchPredicateValues(
       {
@@ -1636,6 +1684,153 @@ describe('CensusApiService — one deadline across the data request’s attempts
     expect(requestedUrls).toHaveLength(1);
     expect(vi.getTimerCount()).toBe(0);
   });
+});
+
+describe('Census upstream budgets and transport errors (#79)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it('preserves Context accessors, symbols, methods, and the caller signal', () => {
+    const original = createMockContext();
+    const symbol = Symbol('context-store');
+    const store = {};
+    Object.defineProperty(original, symbol, { value: store });
+    const get = vi.fn(() => 'current');
+    Object.defineProperty(original, 'accessor', { get });
+    const scoped = censusCallContext(original);
+    expect(get).not.toHaveBeenCalled();
+    for (const key of Reflect.ownKeys(original)) {
+      expect(Object.getOwnPropertyDescriptor(scoped, key)).toEqual(
+        Object.getOwnPropertyDescriptor(original, key),
+      );
+    }
+    expect(scoped.signal).toBe(original.signal);
+    expect(scoped.enrich).toBe(original.enrich);
+    expect(scoped.state).toBe(original.state);
+    expect(Object.getOwnPropertyDescriptor(scoped, symbol)?.value).toBe(store);
+  });
+
+  const operations = [
+    [
+      'data',
+      (ctx: ReturnType<typeof createMockContext>) =>
+        service.queryData(
+          {
+            variables: ['B19013_001E'],
+            dataset: 'acs/acs5',
+            year: 2023,
+            geographyLevel: 'state',
+            geographyFips: '53',
+          },
+          ctx,
+        ),
+      'upstream_error',
+    ],
+    [
+      'geography',
+      (ctx: ReturnType<typeof createMockContext>) =>
+        service.fetchGeographyLevels('acs/acs5', 2023, ctx),
+      'upstream_error',
+    ],
+    [
+      'variables',
+      (ctx: ReturnType<typeof createMockContext>) =>
+        new VariableCacheService().lookupVariables(['B19013_001E'], 'acs/acs5', 2023, ctx),
+      'variables_unavailable',
+    ],
+    [
+      'enumeration',
+      (ctx: ReturnType<typeof createMockContext>) =>
+        service.fetchPredicateValues({ dataset: 'cbp', year: 2023, code: 'EMPSZES' }, ctx),
+      'upstream_error',
+    ],
+  ] as const;
+
+  it.each(operations)(
+    '%s normalizes exhausted header and streamed-body network failures',
+    async (_name, call, reason) => {
+      for (const afterHeaders of [false, true]) {
+        let attempts = 0;
+        vi.stubGlobal(
+          'fetch',
+          vi.fn(() => {
+            attempts++;
+            const error = new TypeError('connection reset; private upstream text');
+            return afterHeaders
+              ? Promise.resolve(
+                  new Response(
+                    new ReadableStream({
+                      start(controller) {
+                        controller.error(error);
+                      },
+                    }),
+                  ),
+                )
+              : Promise.reject(error);
+          }),
+        );
+        const pending = call(censusCallContext(createMockContext())).catch(
+          (error: unknown) => error,
+        );
+        await vi.runAllTimersAsync();
+        const error = (await pending) as McpError;
+        expect(error.data).toMatchObject({
+          reason,
+          retryable: true,
+          retryAttempts: 4,
+          recovery: { hint: expect.stringContaining('Retry the request') },
+        });
+        expect(error.message).not.toContain('private upstream text');
+        expect(error.data).not.toHaveProperty('body');
+        expect(error.data).not.toHaveProperty('responseBody');
+        expect(attempts).toBe(4);
+        expect(vi.getTimerCount()).toBe(0);
+      }
+    },
+  );
+
+  it.each(operations)(
+    '%s bounds stalled bodies within the invocation budget',
+    async (_name, call, reason) => {
+      const signals: AbortSignal[] = [];
+      vi.stubGlobal(
+        'fetch',
+        vi.fn((_url: string | URL, init?: RequestInit) => {
+          const signal = init?.signal as AbortSignal;
+          signals.push(signal);
+          return Promise.resolve(
+            new Response(
+              new ReadableStream({
+                start(controller) {
+                  signal.addEventListener('abort', () => controller.error(signal.reason), {
+                    once: true,
+                  });
+                },
+              }),
+            ),
+          );
+        }),
+      );
+      let settled = false;
+      const pending = call(censusCallContext(createMockContext()))
+        .catch((error: unknown) => error)
+        .finally(() => {
+          settled = true;
+        });
+      await vi.advanceTimersByTimeAsync(50_000);
+      expect(settled).toBe(true);
+      const error = (await pending) as McpError;
+      expect(error.data).toMatchObject({ reason, retryable: true });
+      expect(signals.every((signal) => signal.aborted)).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
 });
 
 describe('padFips', () => {

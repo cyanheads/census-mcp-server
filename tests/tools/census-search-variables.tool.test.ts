@@ -3,7 +3,7 @@
  * @module tests/tools/census-search-variables.tool.test
  */
 
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { censusSearchVariables } from '@/mcp-server/tools/definitions/census-search-variables.tool.js';
 
@@ -31,6 +31,78 @@ beforeEach(async () => {
 });
 
 describe('censusSearchVariables', () => {
+  it('keeps genuine absent-code recovery (characterization)', async () => {
+    mockSearchVariables.mockResolvedValue({
+      variables: [],
+      totalMatches: 0,
+      termCount: 1,
+      matchedTermCount: 0,
+      codeMiss: { kind: 'absent', code: 'NOPE_1' },
+    });
+    const result = await runToolContract(censusSearchVariables, { query: 'NOPE_1' });
+    expect(result.structuredContent).toMatchObject({
+      totalMatches: 0,
+      notice: expect.stringContaining('No variable or table'),
+    });
+  });
+
+  it('passes offset to ranking and exposes continuation on both surfaces', async () => {
+    mockSearchVariables.mockResolvedValue({
+      variables: [{ code: 'C24010_051E', label: 'Estimate!!Total', predicateType: 'int' }],
+      totalMatches: 146,
+      codeMatches: 146,
+      termCount: 1,
+      matchedTermCount: 1,
+    });
+    const result = await runToolContract(censusSearchVariables, {
+      query: 'C24010',
+      limit: 1,
+      offset: 100,
+    });
+    expect(mockSearchVariables).toHaveBeenCalledWith(
+      expect.objectContaining({ offset: 100 }),
+      expect.anything(),
+    );
+    expect(result.structuredContent).toMatchObject({
+      totalMatches: 146,
+      nextOffset: 101,
+      truncated: true,
+    });
+    const text = result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+    expect(text).toContain('C24010_051E');
+    expect(text).toContain('offset: 101');
+  });
+
+  it.each([2, 3])(
+    'treats an empty existing match page at offset %s as past-end',
+    async (offset) => {
+      mockSearchVariables.mockResolvedValue({
+        variables: [],
+        totalMatches: 2,
+        codeMatches: 2,
+        termCount: 1,
+        matchedTermCount: 1,
+      });
+      const result = await runToolContract(censusSearchVariables, {
+        query: 'B19013',
+        limit: 1,
+        offset,
+      });
+      expect(result.structuredContent).toMatchObject({
+        totalMatches: 2,
+        truncated: false,
+        notice: expect.stringContaining('past the'),
+      });
+      expect(result.structuredContent).not.toHaveProperty('nextOffset');
+      expect(result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n')).not.toContain(
+        'No variables matched',
+      );
+    },
+  );
+
+  it.each([-1, 0.5])('rejects offset %s', (offset) => {
+    expect(censusSearchVariables.input.safeParse({ query: 'income', offset }).success).toBe(false);
+  });
   it('returns matching variables for a keyword query', async () => {
     mockSearchVariables.mockResolvedValue({
       variables: [
@@ -298,7 +370,7 @@ describe('censusSearchVariables', () => {
       ctx,
     );
     expect(getEnrichment(ctx).notice).toBe(
-      '372 variables matched — 368 not shown; the table continues in code order after S1701_C02_001M. Raise limit (max 100), or search a later variable code on its own — a word added to a table code ends the code match.',
+      '372 variables matched — 368 not shown; the table continues in code order after S1701_C02_001M. Call again with offset: 4, keeping query, dataset, year and limit unchanged, for the next page. Raise limit (max 100) for a larger page.',
     );
 
     const atMax = createMockContext({ errors: censusSearchVariables.errors });
@@ -318,7 +390,7 @@ describe('censusSearchVariables', () => {
       atMax,
     );
     const notice = getEnrichment(atMax).notice as string;
-    expect(notice).toContain('after S1701_C01_100E. Search a later variable code on its own');
+    expect(notice).toContain('after S1701_C01_100E. Call again with offset: 100');
     expect(notice).not.toMatch(/narrow|raise limit/i);
   });
 
@@ -336,7 +408,7 @@ describe('censusSearchVariables', () => {
       ctx,
     );
     expect(getEnrichment(ctx).notice).toBe(
-      '2 variables matched — 1 not shown. Narrow the query or raise limit (max 100).',
+      '2 variables matched — 1 not shown. Call again with offset: 1, keeping query, dataset, year and limit unchanged, for the next page. Narrow the query or raise limit (max 100).',
     );
   });
 

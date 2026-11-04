@@ -194,6 +194,13 @@ describe('bounded count inputs', () => {
       minimum: 0,
       maximum: undefined,
     },
+    {
+      definition: censusCompareGeographies,
+      field: 'offset',
+      base: { variables: ['B19013_001E'], geography_level: 'county' },
+      minimum: 0,
+      maximum: undefined,
+    },
   ] as const;
 
   const label = (entry: (typeof bounded)[number]) => `${entry.definition.name} ${entry.field}`;

@@ -7,6 +7,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, validationError } from '@cyanheads/mcp-ts-core/errors';
 import { getDiscoveryConfig } from '@/config/server-config.js';
+import { describeAcsCoverage } from '@/mcp-server/tools/acs-coverage.js';
 import { renderNotice } from '@/mcp-server/tools/notice-trailer.js';
 import {
   renderVariable,
@@ -23,6 +24,7 @@ import {
   padFips,
   planQueryColumns,
 } from '@/services/census-api/census-api-service.js';
+import { censusCallContext } from '@/services/census-api/census-request.js';
 import { levelNotSupportedMessage } from '@/services/census-api/errors.js';
 import type { CensusDataRow, SuppliedParent } from '@/services/census-api/types.js';
 import {
@@ -274,10 +276,12 @@ export const censusQueryData = tool('census_query_data', {
     totalCount: z
       .number()
       .describe('Number of rows the query matched, before offset and limit were applied.'),
-    truncated: z
-      .boolean()
+    truncated: z.boolean().describe('True when more matched rows remain after this page.'),
+    nextOffset: z
+      .number()
+      .optional()
       .describe(
-        'True when rows were left out by offset or limit — totalCount exceeds the rows returned.',
+        'Offset for the next page, present only when more matched rows remain. Keep the other query inputs unchanged.',
       ),
     dataset: z.string().describe('Dataset queried.'),
     year: z.number().describe('Vintage year queried.'),
@@ -285,7 +289,7 @@ export const censusQueryData = tool('census_query_data', {
       .string()
       .optional()
       .describe(
-        'Warning that the dataset declares filter dimensions the query left unset, naming each one alongside the label of the default the Census API applied to it. That default is an all-categories total on some dimensions and one ordinary category on others, so the label is what says which. Also carries the warning that a geography came back on more than one row, naming the column that separates the records and the values it took; the codes of a comma-separated geography_fips that no row came back for; the range of rows returned when offset or limit left some out, with the offset of the next page; the sibling tables a missing group, geography, or value may sit in, on dec/ddhca and dec/ddhcb tables that split the population groups between them; and any variable codes whose flags could not be checked because the request had no room left under the Census 50-column limit — a withheld value there reads as 0.',
+        'Warning that the dataset declares filter dimensions the query left unset, naming each one alongside the label of the default the Census API applied to it. That default is an all-categories total on some dimensions and one ordinary category on others, so the label is what says which. Also carries the warning that a geography came back on more than one row, naming the column that separates the records and the values it took; the codes of a comma-separated geography_fips that no row came back for, with applicable ACS publication coverage guidance and variable rediscovery when switching datasets; the range of rows returned when offset or limit left some out, with the offset of the next page; the sibling tables a missing group, geography, or value may sit in, on dec/ddhca and dec/ddhcb tables that split the population groups between them; and any variable codes whose flags could not be checked because the request had no room left under the Census 50-column limit — a withheld value there reads as 0.',
       ),
   },
   // The notice quotes geography_fips codes and the labels of applied defaults.
@@ -376,7 +380,7 @@ export const censusQueryData = tool('census_query_data', {
     {
       reason: 'upstream_error',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Census API returned an error, was unreachable, or did not finish answering the data request within its 40-second limit across retries.',
+      when: "Census API returned an error, was unreachable, or exceeded the shared 50-second upstream budget or the data request's 40-second ceiling within it.",
       retryable: true,
       thrownBy: 'service',
       recovery:
@@ -385,6 +389,7 @@ export const censusQueryData = tool('census_query_data', {
   ],
 
   async handler(input, ctx) {
+    const upstream = censusCallContext(ctx);
     const requested = normalizeVariableCodes(input.variables);
     if (requested.length === 0) {
       throw validationError('At least one variable code is required.', {
@@ -437,7 +442,7 @@ export const censusQueryData = tool('census_query_data', {
         ...(countyFips !== undefined && { countyFips }),
         ...(tractFips !== undefined && { tractFips }),
       },
-      ctx,
+      upstream,
     );
 
     if (check.status === 'level_not_supported') {
@@ -535,7 +540,7 @@ export const censusQueryData = tool('census_query_data', {
     const { predicates, wildcards } = normalizePredicates(input.predicates);
     const predicateCheck = await variableCacheService.checkPredicates(
       { dataset, year, supplied: Object.keys(predicates) },
-      ctx,
+      upstream,
     );
 
     if (predicateCheck.unknown.length > 0) {
@@ -552,7 +557,12 @@ export const censusQueryData = tool('census_query_data', {
 
     // The dataset's own spelling of each code, which the request sends and the rows are keyed by.
     // The predicate check has loaded variables.json, so this spends no request.
-    const variables = await variableCacheService.resolveSpellings(requested, dataset, year, ctx);
+    const variables = await variableCacheService.resolveSpellings(
+      requested,
+      dataset,
+      year,
+      upstream,
+    );
 
     const unfiltered = predicateCheck.unset;
     const defaultLabelColumns = defaultLabelColumnsFor(unfiltered);
@@ -560,7 +570,11 @@ export const censusQueryData = tool('census_query_data', {
     // A dataset that publishes several records per geography answers with one row each. Requesting
     // the columns that separate them is what makes a row attributable to a record rather than one
     // of two identical-looking answers; it does not change which rows come back.
-    const recordDimensions = await variableCacheService.getRecordDimensions(dataset, year, ctx);
+    const recordDimensions = await variableCacheService.getRecordDimensions(
+      dataset,
+      year,
+      upstream,
+    );
     const recordColumns = recordLabelColumnsFor(recordDimensions);
 
     // Labels, flag columns, and wildcard label columns all come from the same metadata. A code
@@ -570,7 +584,7 @@ export const censusQueryData = tool('census_query_data', {
       [...variables, ...wildcards],
       dataset,
       year,
-      ctx,
+      upstream,
     );
 
     // Count every column the request will send against the Census API's 50-column limit before
@@ -609,13 +623,11 @@ export const censusQueryData = tool('census_query_data', {
         dataset,
         year,
       },
-      ctx,
+      upstream,
     );
 
     if (rows.length === 0) {
-      // Only steer toward acs/acs5 from a dataset that actually covers less than it does.
-      // Predicates can empty a result on their own — ecnbasic publishes nothing at county level
-      // until an industry is named, and an unknown value is a 204 — so they take priority.
+      // Predicate publication and ACS coverage are possible causes alongside literal code errors.
       const predicateHint = describeEmptyPredicatedResult(
         unfiltered,
         Object.keys(predicates),
@@ -623,11 +635,8 @@ export const censusQueryData = tool('census_query_data', {
         year,
         variables,
       );
-      const hint = predicateHint
-        ? `${predicateHint} Otherwise confirm the FIPS codes with census_resolve_geography.`
-        : dataset.startsWith('acs/acs1')
-          ? `ACS1 only covers geographies with 65,000+ population — switch to dataset "acs/acs5" for smaller geographies, or confirm the FIPS codes with census_resolve_geography.`
-          : `Confirm the FIPS codes exist in ${dataset} (${year}) — census_resolve_geography returns them for a place name. The Census API matches geography_fips literally at the width of its level, so a short code finds nothing: a county is "051", not "51". If the level itself is in doubt, call census_list_geographies.`;
+      const coverage = describeAcsCoverage(dataset);
+      const hint = `${predicateHint ? `${predicateHint} ` : ''}${coverage ? `${coverage} ` : ''}Confirm the FIPS codes exist in ${dataset} (${year}) — census_resolve_geography returns them for a place name. The Census API matches geography_fips literally at the width of its level, so a short code finds nothing: a county is "051", not "51". If the level itself is in doubt, call census_list_geographies.`;
       throw ctx.fail(
         'no_data',
         `No data returned for ${input.geography_level} in ${dataset} (${year}).`,
@@ -644,7 +653,8 @@ export const censusQueryData = tool('census_query_data', {
     const limit = input.limit ?? 50;
     const offset = input.offset ?? 0;
     const page = ordered.slice(offset, offset + limit);
-    const truncated = page.length < ordered.length;
+    const nextOffset = offset + page.length;
+    const truncated = nextOffset < ordered.length;
 
     const enrichedRows = page.map((row) => {
       const enrichedVariables: Record<string, VariableEntry> = {};
@@ -666,6 +676,7 @@ export const censusQueryData = tool('census_query_data', {
       totalRows: enrichedRows.length,
       totalCount: ordered.length,
       truncated,
+      ...(truncated && { nextOffset }),
       dataset,
       year,
     });
@@ -699,7 +710,11 @@ export const censusQueryData = tool('census_query_data', {
     // A list code the Census publishes nothing for is dropped from the rows without an error. Named
     // ahead of the table guidance, which says where such a code's group may sit instead.
     const unmatchedCodes = describeUnmatchedCodes(input.geography_fips, rows);
-    if (unmatchedCodes) notices.push(unmatchedCodes);
+    if (unmatchedCodes) {
+      notices.push(unmatchedCodes);
+      const coverage = describeAcsCoverage(dataset);
+      if (coverage) notices.push(coverage);
+    }
     // On tables that split POPGROUP groups, a "*" level, a comma-separated list of geographies, or
     // a "*" group can come back short, and codes from several tables can read null, with nothing in
     // the rows to say so.
@@ -711,7 +726,7 @@ export const censusQueryData = tool('census_query_data', {
         !wildcards.includes('POPGROUP'),
     );
     if (tableSplit) notices.push(tableSplit);
-    if (truncated) {
+    if (page.length < ordered.length) {
       // A scope input narrows only when the level takes that parent and the query left it open.
       // Without geography metadata nothing is known about the parents, so none is suggested. A
       // tract sits inside one county, so it is offered only once the county is concrete — with

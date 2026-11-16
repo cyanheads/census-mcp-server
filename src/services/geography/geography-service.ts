@@ -210,11 +210,12 @@ const COUNTY_SUBDIVISION = 'county subdivision' satisfies GeographyType;
 
 /**
  * The twelve states whose county subdivisions — towns and townships — are general-purpose local
- * governments, which the Census publishes everywhere it publishes places (Census geography
- * glossary, "County Subdivision"). Only a name with one of these suffixes auto-detects to the
- * subdivision level: elsewhere a subdivision is a statistical census county division or a
- * nonfunctioning township, and would displace a closer answer ("Winston, NC" is Winston-Salem, not
- * Winston township).
+ * governments that can perform the same functions as incorporated places, which the Census
+ * publishes everywhere it publishes places (Census geography glossary, "County Subdivision"). Only
+ * a name with one of these suffixes auto-detects to the subdivision level: elsewhere a subdivision
+ * is a statistical census county division or a township without a place's powers — nonfunctioning,
+ * or a government such as an Ohio or Illinois township — and would displace a closer answer
+ * ("Winston, NC" is Winston-Salem, not Winston township).
  */
 const GOVERNMENT_SUBDIVISION_STATES = new Set([
   'CT',
@@ -319,9 +320,9 @@ const TIGERWEB_LAYERS = {
     stateInName: false,
     variantRetries: true,
   },
-  // Every state has county subdivisions: the towns and townships that govern in twelve of them,
-  // census county divisions (CCDs) and nonfunctioning townships elsewhere. FUNCSTAT tells a
-  // government (A) from the rest.
+  // Every state has county subdivisions: towns and townships that govern like places in twelve of
+  // them; elsewhere census county divisions (CCDs), nonfunctioning townships, and township
+  // governments with narrower powers. FUNCSTAT tells a government (A) from the rest.
   'county subdivision': {
     service: 'TIGERweb/Places_CouSub_ConCity_SubMCD',
     layers: [1],

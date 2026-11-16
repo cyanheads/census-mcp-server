@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.8.0](changelog/0.8.x/0.8.0.md) — 2026-11-15 · ⚠️ Breaking
+
+census_query_data takes a whole table through group, variable labels move to one top-level variable_labels map, census_resolve_geography reaches county subdivisions and Connecticut's pre-2022 counties, and the 2025 ACS 1-year vintages, nonemp 2024, and geoinfo land area join the catalog.
+
 ## [0.7.2](changelog/0.7.x/0.7.2.md) — 2026-11-03
 
 Census result pagination, geography-scoped predicate discovery, and shared upstream request budgets.

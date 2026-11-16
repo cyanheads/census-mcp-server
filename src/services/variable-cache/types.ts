@@ -78,6 +78,21 @@ export interface CensusVariable {
   values?: Record<string, string>;
 }
 
+/** A table a data query can request whole, with `group(<ID>)` in its `get=` list. */
+export interface CensusGroup {
+  /**
+   * Every column `group(<ID>)` returns, in line order: the table's columns sorted by code, each
+   * followed by its variables.json `attributes` in the order listed — `B01001_001E`,
+   * `B01001_001EA`, `B01001_001M`, `B01001_001MA`, `B01001_002E`, … — with the `GEO_ID` and `NAME`
+   * every table carries at their own sorted place. The same set the Census API returns; current
+   * vintages also return it in this order, while older ones (acs/acs5 2010, dec/pl 2010) place
+   * annotations elsewhere.
+   */
+  columns: string[];
+  /** Table ID in the dataset's spelling (e.g. "B01001"). */
+  id: string;
+}
+
 /** A filter dimension the dataset declares required and the query did not set. */
 export interface UnsetPredicate {
   code: string;
@@ -106,6 +121,11 @@ export interface RecordDimension {
 
 /** Outcome of checking a caller's predicate map against a dataset's own variables.json. */
 export interface PredicateCheck {
+  /**
+   * Every filter dimension the dataset declares, set or not, sorted. Empty on a dataset whose only
+   * required variable is `GEOCOMP` (`geoinfo`, the ACS tables), where no predicate picks a record.
+   */
+  filterDimensions: string[];
   /** Supplied predicate codes that are not variables in this dataset+year. */
   unknown: string[];
   /**

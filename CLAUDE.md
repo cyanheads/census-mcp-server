@@ -2,8 +2,8 @@
 
 **Server:** census-mcp-server
 **Version:** 0.7.2
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.18`
-**Engines:** Bun ≥1.4.0, Node ≥24.0.0
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.22`
+**Engines:** Bun ≥1.4.4, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.4.0
 **Zod:** ^4.6.7
 
@@ -164,7 +164,7 @@ For env booleans use `z.stringbool()`, never `z.coerce.boolean()` — `Boolean("
 
 ### Census call contracts
 
-The three keyed handlers construct `censusCallContext(ctx)` once and pass that scoped context to every service call. `census-request.ts` preserves the original caller signal and Context property descriptors while carrying one absolute 50-second upstream budget through metadata, data, retries, body reads, backoff, and error-enrichment probes. `withCensusRetry` also retains the data request's 40-second ceiling within the time left. Exhausted transport failures carry `upstream_error` or `variables_unavailable` and recovery; caller cancellation and deterministic input/HTTP errors retain their meaning. Optional publication/universe work can degrade within its shorter budget, but total-call expiry cannot become successful unchecked data. Sibling-hint expiry preserves an established `variable_not_found` error.
+The three keyed handlers construct `censusCallContext(ctx)` once and pass that scoped context to every service call. `census-request.ts` preserves the original caller signal and Context property descriptors while carrying one absolute 50-second upstream budget through metadata, data, retries, body reads, backoff, and error-enrichment probes. `withCensusRetry` also retains the data request's 40-second ceiling within the time left. Exhausted transport failures carry `upstream_error` or `variables_unavailable` and recovery; caller cancellation and deterministic input/HTTP errors retain their meaning. Optional publication/universe work can degrade within its shorter budget, but total-call expiry cannot become successful unchecked data. Sibling-hint expiry preserves an established `variable_not_found` error. `GeographyService.resolveGeography` wraps its caller with `censusCallContext` itself, so every TIGERweb and geocoder request of one resolution shares that 50-second budget; expiry is `resolution_unavailable`, and the namesake check degrades to unavailable instead of failing the call.
 
 `census_query_data`, `census_compare_geographies`, `census_search_variables`, and `census_list_predicate_values` page the complete ordered match set with `offset` and `limit`. `truncated` means rows remain after this page; `nextOffset` is present only then. Totals precede slicing. Final and past-end pages have no continuation, and an empty slice of existing matches is not a no-match error.
 
@@ -272,7 +272,7 @@ src/
   services/
     census-api/
       census-api-service.ts             # Census Data API client — queries, suppression mapping
-      census-request.ts                 # Shared keyed-call budget, retry and body-read boundary
+      census-request.ts                 # Shared call budget (keyed calls and geography resolution), retry and body-read boundary
       errors.ts                         # Upstream HTTP failure classification (year_not_available, variable_not_found)
       types.ts                          # Census data types
     geography/
@@ -284,8 +284,9 @@ src/
       types.ts                          # Variable types
   mcp-server/
     tools/acs-coverage.ts               # ACS publication guidance for missing geographies
+    tools/boundary-vintage.ts           # Tract-vintage and Connecticut county-scheme guidance for a named code with no row
     tools/notice-trailer.ts             # Notice render that escapes quoted caller and upstream text in content[]
-    tools/variable-entry.ts             # Per-variable output entry + rendering shared by both data tools
+    tools/variable-entry.ts             # Per-variable output entry, variable_labels legend, and rendering shared by both data tools
     tools/definitions/
       census-list-datasets.tool.ts
       census-list-geographies.tool.ts
@@ -405,7 +406,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 
 ## Bundling
 
-`bun run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. `mcpb pack` reads `.mcpbignore`, not `.gitignore`, so every root path the bundle must not ship — source, tests, docs, caches, logs, agent docs, plugin manifests, gitignored local files — needs a root-anchored line there (`/docs/`, never `docs/`, which also strips `node_modules/*/docs/`); `lint:packaging` names each missing or unanchored line. Root `skills/` ships on purpose. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips four classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs (`framework-skills/`, `skills/`, `.claude/`, `.agents/`, `SKILL.md`); platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on; node-gyp build output beside a `binding.gyp` (`config.gypi`, Makefiles, `obj.target/`, `.deps/`, object files and debug symbols), which records the packing machine's paths — compiled `*.node` addons stay; and build-only package files — the framework's `changelog/`, `scripts/`, `templates/`, `CLAUDE.md`, `AGENTS.md`, and config bases (`biome.json`, `vitest.config.base.mjs`, `config/tsconfig.base.json`), and `better-sqlite3`'s `deps/` and `src/` C sources. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected. Consumers who don't need it can delete `manifest.json` and `.mcpbignore`; `lint:packaging` skips cleanly.
+`bun run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. `mcpb pack` reads `.mcpbignore`, not `.gitignore`, so every root path the bundle must not ship — source, tests, docs, caches, logs, agent docs, plugin manifests, gitignored local files — needs a root-anchored line there (`/docs/`, never `docs/`, which also strips `node_modules/*/docs/`); `lint:packaging` names each missing or unanchored line. Root `skills/` ships on purpose. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips four classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs — `framework-skills/`, `skills/`, `.claude/`, `.agents/`, `AGENTS.md`, and `CLAUDE.md` at a package's root, and `SKILL.md` anywhere (a `skills/` deeper in a package is runtime code and stays); platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on; node-gyp build output beside a `binding.gyp` (`config.gypi`, Makefiles, `obj.target/`, `.deps/`, object files and debug symbols), which records the packing machine's paths — compiled `*.node` addons stay; and build-only package files — the framework's `changelog/`, `scripts/`, `templates/`, and config bases (`biome.json`, `vitest.config.base.mjs`, `config/tsconfig.base.json`), and `better-sqlite3`'s `deps/` and `src/` C sources. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected. Consumers who don't need it can delete `manifest.json` and `.mcpbignore`; `lint:packaging` skips cleanly.
 
 **Adding an env var requires both files:** `server.json` (registry discovery, `environmentVariables[]`) and `manifest.json` (bundle install UX, `mcp_config.env` + `user_config`). `lint:packaging` (run by `devcheck`) verifies the env var names match, that every `user_config` option is wired into `mcp_config.env` as `"X": "${user_config.X}"` (the host substitutes nothing else — `"${X}"` reaches the server as that literal string), and that an optional string option carries `"default": ""`.
 

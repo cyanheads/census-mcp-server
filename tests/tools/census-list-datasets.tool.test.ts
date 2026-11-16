@@ -33,7 +33,7 @@ describe('censusListDatasets', () => {
   it.each([
     ['cbp', 2023, 'NAICS2017'],
     ['ecnbasic', 2022, 'NAICS2022'],
-    ['nonemp', 2023, 'NAICS2022'],
+    ['nonemp', 2024, 'NAICS2022'],
   ])(
     'catalogs %s with its latest year and required industry predicate',
     async (id, latestYear, naics) => {
@@ -264,18 +264,19 @@ describe('censusListDatasets', () => {
     ['dec/sdhc', [2020]],
     [
       'acs/acs1/subject',
-      [2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024],
+      [2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024, 2025],
     ],
     ['acs/acs5/cprofile', [2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024]],
     [
       'acs/acs1/cprofile',
-      [2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024],
+      [2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024, 2025],
     ],
-    ['acs/acsse', [2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024]],
+    ['acs/acsse', [2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024, 2025]],
     [
       'acs/acs1/spp',
-      [2009, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024],
+      [2009, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024, 2025],
     ],
+    ['geoinfo', [2020, 2021, 2022, 2023, 2024, 2025]],
   ])('lists %s with the vintages it serves, on both surfaces (#43, #52)', async (id, years) => {
     const result = await censusListDatasets.handler(
       censusListDatasets.input.parse({}),
@@ -341,6 +342,86 @@ describe('censusListDatasets', () => {
     for (const id of ['acs/acs5/cprofile', 'acs/acs1/cprofile']) {
       expect(await descriptionOf(id)).toMatch(/no margins? of error/i);
     }
+  });
+
+  /**
+   * The 2021–2024 acs/acs1/cprofile vintages carry 2020 columns that read not applicable; the 2025
+   * vintage covers 2021–2025 and publishes no 2020 column at all.
+   */
+  it('scopes the not-applicable 2020 columns to the acs/acs1/cprofile vintages that carry them (#91)', async () => {
+    const description = await descriptionOf('acs/acs1/cprofile');
+
+    expect(description).toContain('2021 through 2024 vintages');
+    expect(description).toContain('not applicable');
+    expect(description).toContain('later vintages have no 2020 columns');
+  });
+
+  describe('geoinfo (#92)', () => {
+    it('is listed under its code and found by a density search, with the land-area measures', async () => {
+      for (const filter of ['geoinfo', 'density', 'land area']) {
+        const ctx = createMockContext();
+        const result = await censusListDatasets.handler(
+          censusListDatasets.input.parse({ filter }),
+          ctx,
+        );
+        expect(result.datasets.map((d) => d.dataset_id)).toContain('geoinfo');
+      }
+
+      const description = await descriptionOf('geoinfo');
+      for (const code of [
+        'AREALAND_SQMI',
+        'AREAWATR_SQMI',
+        'AREALAND',
+        'AREAWATR',
+        'INTPTLAT',
+        'INTPTLON',
+      ]) {
+        expect(description).toContain(code);
+      }
+      expect(description).toContain('square meters');
+      expect(description).toContain('square miles');
+    });
+
+    it('gives the density recipe: same level, codes, and an explicit year on both calls', async () => {
+      const description = await descriptionOf('geoinfo');
+
+      expect(description).toMatch(/same geography level and codes/);
+      expect(description).toMatch(/same year to both calls/);
+      expect(description).toMatch(/then divide/);
+      // Areas start at 2020, on that decade's tracts; older tract codes partly survive, so a join
+      // half-works rather than failing visibly.
+      expect(description).toMatch(/tract count from 2019 or earlier is on 2010 tracts/);
+      expect(description).toMatch(/drops every tract the 2020 Census redrew/);
+      expect(description).toMatch(/water-only tract has an AREALAND_SQMI of 0/);
+    });
+
+    it('names the 2020 delineations GEO_ID tells apart and the 2021–2022 ZCTA coverage', async () => {
+      const description = await descriptionOf('geoinfo');
+
+      for (const fact of ['8600000US98101', '860Z200US98101', 'GEO_ID', '32,923', '33,774']) {
+        expect(description).toContain(fact);
+      }
+      expect(description).toMatch(/once per delineation/);
+    });
+
+    it('carries the entry and its vintages on both surfaces', async () => {
+      const result = await censusListDatasets.handler(
+        censusListDatasets.input.parse({ filter: 'geoinfo' }),
+        createMockContext(),
+      );
+      const entry = result.datasets.find((d) => d.dataset_id === 'geoinfo');
+      const text = (censusListDatasets.format!(result)[0] as { text: string }).text;
+
+      expect(entry?.available_years).toEqual([2020, 2021, 2022, 2023, 2024, 2025]);
+      expect(text).toContain('**ID:** `geoinfo`');
+      expect(text).toContain(`### ${entry?.name}`);
+      expect(text).toContain(entry?.description as string);
+      expect(text).toContain('**Years:** 2020, 2021, 2022, 2023, 2024, 2025');
+    });
+
+    it('is named in the tool description among the dataset families', () => {
+      expect(censusListDatasets.description).toContain('geoinfo');
+    });
   });
 
   it('names the acs/acs1/spp default, the group lookup, and the vintages left out (#52)', async () => {

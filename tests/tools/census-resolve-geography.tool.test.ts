@@ -7,6 +7,7 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { censusResolveGeography } from '@/mcp-server/tools/definitions/census-resolve-geography.tool.js';
+import { readNotice } from '../helpers/markdown-readback.js';
 
 vi.mock('@/services/geography/geography-service.js', () => ({
   getGeographyService: vi.fn(),
@@ -193,6 +194,7 @@ describe('censusResolveGeography', () => {
     for (const geography_type of [
       'state',
       'county',
+      'county subdivision',
       'place',
       'tract',
       'metropolitan statistical area/micropolitan statistical area',
@@ -532,6 +534,127 @@ describe('censusResolveGeography', () => {
     expect(censusResolveGeography.input.shape.name.description).toContain('Brooklyn, NY');
   });
 
+  const textOf = (result: { content: Array<{ type: string; text?: string }> }) =>
+    result.content.map((c) => c.text ?? '').join('\n');
+
+  it('returns a county subdivision with its own code and the county_fips it is queried under', async () => {
+    mockResolveGeography.mockResolvedValue({
+      name: 'Edison township',
+      geographyType: 'county subdivision',
+      stateFips: '34',
+      countyFips: '023',
+      countySubdivisionFips: '20230',
+      fipsSummary: '20230',
+    });
+
+    const result = await runToolContract(censusResolveGeography, { name: 'Edison, NJ' });
+
+    expect(result.structuredContent).toEqual({
+      name: 'Edison township',
+      geography_type: 'county subdivision',
+      state_fips: '34',
+      county_fips: '023',
+      county_subdivision_fips: '20230',
+      fips_summary: '20230',
+    });
+    const text = textOf(result);
+    expect(text).toContain('**County subdivision FIPS:** `20230`');
+    expect(text).toContain('for county subdivision queries');
+    // A resolved subdivision is queried by fips_summary, so its own line carries no usage note.
+    expect(text).toMatch(/^\*\*County subdivision FIPS:\*\* `20230`$/m);
+  });
+
+  it('names every active subdivision of the name, each with its county and code', async () => {
+    mockResolveGeography.mockResolvedValue({
+      name: 'Union County',
+      geographyType: 'county',
+      stateFips: '34',
+      countyFips: '039',
+      fipsSummary: '039',
+      namesakes: {
+        kind: 'found',
+        subdivisions: [
+          { name: 'Union township', countyFips: '019', countySubdivisionFips: '74420' },
+          { name: 'Union township', countyFips: '039', countySubdivisionFips: '74480' },
+        ],
+      },
+    });
+
+    const result = await runToolContract(censusResolveGeography, { name: 'Union, NJ' });
+
+    const notice =
+      '2 county subdivisions with their own governments share this name — Union township (county 019, county subdivision 74420), Union township (county 039, county subdivision 74480): resolve one with geography_type "county subdivision" and its county_fips.';
+    expect(result.structuredContent).toMatchObject({ fips_summary: '039', notice });
+    expect(textOf(result)).toContain(notice);
+    expect(result.structuredContent).not.toHaveProperty('namesakes');
+  });
+
+  it('joins every notice a result carries into the one notice field', async () => {
+    mockResolveGeography.mockResolvedValue({
+      name: 'Kings County',
+      geographyType: 'county',
+      stateFips: '36',
+      countyFips: '047',
+      fipsSummary: '047',
+      borough: 'Brooklyn',
+      namesakes: { kind: 'unavailable' },
+    });
+
+    const result = await runToolContract(censusResolveGeography, { name: 'Brooklyn, NY' });
+
+    expect((result.structuredContent as { notice: string }).notice).toBe(
+      '"Brooklyn" is the New York City borough coextensive with Kings County. Whether a county subdivision with its own government shares this name could not be checked, because TIGERweb did not answer; geography_type "county subdivision" resolves one directly.',
+    );
+  });
+
+  it('says a Connecticut county is the pre-2022 one, with the vintages that publish it', async () => {
+    mockResolveGeography.mockResolvedValue({
+      name: 'Windham County',
+      geographyType: 'county',
+      stateFips: '09',
+      countyFips: '015',
+      fipsSummary: '015',
+      legacyCounty: true,
+    });
+
+    const result = await runToolContract(censusResolveGeography, { name: 'Windham County, CT' });
+
+    expect(result.structuredContent).toMatchObject({
+      county_fips: '015',
+      notice:
+        "Windham County (county 015) is one of Connecticut's eight counties before 2022: every dataset vintage through 2021, the 2020 Census included, publishes it, and vintages from 2022 publish the nine planning regions (counties 110–190) in its place.",
+    });
+    expect(result.structuredContent).not.toHaveProperty('legacy_county');
+  });
+
+  it('describes county subdivisions, the twelve-state tier, and Connecticut counties', () => {
+    const { name, geography_type, county_fips } = censusResolveGeography.input.shape;
+    const output = censusResolveGeography.output.shape;
+    const notice = censusResolveGeography.enrichment?.notice.description ?? '';
+
+    expect(name.description).toContain('Cherry Hill, NJ');
+    expect(name.description).toContain('Clinton Township, MI');
+    expect(name.description).toContain('Fairfield County, CT');
+    expect(geography_type.description).toContain('CT, ME, MA, MI, MN, NH, NJ, NY, PA, RI, VT, WI');
+    expect(geography_type.description).toContain('Plymouth, MA');
+    expect(county_fips.description).toContain('county subdivision');
+    // census_query_data zero-pads its county_fips the same way.
+    expect(county_fips.description).not.toContain('pads nothing');
+    expect(output.county_subdivision_fips.description).toContain('street address');
+    expect(notice).toContain('county subdivision');
+    expect(notice).toContain('Connecticut');
+  });
+
+  it('names county subdivision in the ambiguous_name and county_scope_unsupported recoveries', () => {
+    const recovery = (reason: string) =>
+      censusResolveGeography.errors?.find((e) => e.reason === reason)?.recovery ?? '';
+
+    expect(recovery('ambiguous_name')).toContain('county subdivision');
+    expect(recovery('county_scope_unsupported')).toBe(
+      'Drop county_fips, or set geography_type to "county", "county subdivision", or "tract" to use it.',
+    );
+  });
+
   it('throws ambiguous_name when service rejects with ambiguity', async () => {
     const { McpError, JsonRpcErrorCode: codes } = await import('@cyanheads/mcp-ts-core/errors');
     mockResolveGeography.mockRejectedValue(
@@ -668,5 +791,122 @@ describe('censusResolveGeography', () => {
     expect(text).toContain('033');
     expect(text).toContain('parent_fips');
     expect(text).toContain('geography_fips');
+  });
+});
+
+describe('censusResolveGeography — a resolved tract is a 2020 tract (#94)', () => {
+  const TRACT_NOTICE =
+    'Tract 007101 is a 2020 census tract: ACS 5-year vintages from 2020 and the 2020 Census files publish it and its block groups, while earlier vintages publish earlier tracts — 2010 tracts, or 2000 tracts on acs/acs5 2009 and dec/pl 2000 — where this code can be missing.';
+
+  it.each([
+    [
+      'a street address',
+      '400 Broad St, Seattle, WA 98109',
+      { name: '400 BROAD ST, SEATTLE, WA, 98109', blockGroupFips: '2', placeFips: '63000' },
+    ],
+    [
+      'a tract name',
+      'Census Tract 71.01, King County, WA',
+      { name: 'Census Tract 71.01; King County; Washington' },
+    ],
+  ])('says so on both surfaces for %s', async (_kind, name, fields) => {
+    mockResolveGeography.mockResolvedValue({
+      geographyType: 'tract',
+      stateFips: '53',
+      countyFips: '033',
+      tractFips: '007101',
+      fipsSummary: '007101',
+      ...fields,
+    });
+
+    const result = await runToolContract(censusResolveGeography, { name });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({ tract_fips: '007101', notice: TRACT_NOTICE });
+    expect(readNotice(result)).toBe(TRACT_NOTICE);
+  });
+
+  it.each([
+    [
+      'a county',
+      { name: 'King County', geographyType: 'county', stateFips: '53', countyFips: '033' },
+      '033',
+    ],
+    [
+      'a place',
+      { name: 'Seattle city', geographyType: 'place', stateFips: '53', placeFips: '63000' },
+      '63000',
+    ],
+  ])('carries no tract notice for %s', async (_kind, fields, fipsSummary) => {
+    mockResolveGeography.mockResolvedValue({ ...fields, fipsSummary });
+
+    const result = await runToolContract(censusResolveGeography, { name: 'Seattle, WA' });
+
+    expect(result.structuredContent).not.toHaveProperty('notice');
+    expect(result.content.map((c) => ('text' in c ? c.text : '')).join('\n')).not.toContain(
+      '2020 census tract',
+    );
+  });
+
+  it('names the planning region and the earlier county scheme for a Connecticut tract, "*" intact', async () => {
+    mockResolveGeography.mockResolvedValue({
+      name: '1 MAIN ST, GREENWICH, CT, 06830',
+      geographyType: 'tract',
+      stateFips: '09',
+      countyFips: '190',
+      tractFips: '010101',
+      countySubdivisionFips: '33620',
+      fipsSummary: '010101',
+    });
+
+    const result = await runToolContract(censusResolveGeography, {
+      name: '1 Main St, Greenwich, CT 06830',
+    });
+
+    const notice = (result.structuredContent as { notice: string }).notice;
+    expect(notice).toBe(
+      'Tract 010101 is a 2020 census tract: ACS 5-year vintages from 2020 and the 2020 Census files publish it and its block groups, while earlier vintages publish earlier tracts — 2010 tracts, or 2000 tracts on acs/acs5 2009 and dec/pl 2000 — where this code can be missing. In Connecticut it sits under its planning region, county 190, which vintages from 2022 publish; vintages through 2021, the 2020 Census included, publish the same tract code under one of the eight counties from before 2022 (001–015) — census_query_data at the tract level with geography_fips "*", county_fips "*", and parent_fips "09" lists each under its county there.',
+    );
+    // A bare "*" pair in live Markdown would read as emphasis; the notice reads back exactly.
+    expect(readNotice(result)).toBe(notice);
+  });
+
+  it('joins the tract notice after the other notes a result carries', async () => {
+    mockResolveGeography.mockResolvedValue({
+      name: 'Census Tract 7071.01; Plymouth County; Massachusetts',
+      geographyType: 'tract',
+      stateFips: '25',
+      countyFips: '023',
+      tractFips: '707101',
+      fipsSummary: '707101',
+      namesakes: { kind: 'unavailable' },
+    });
+
+    const result = await runToolContract(censusResolveGeography, {
+      name: 'Census Tract 7071.01, MA',
+    });
+
+    expect((result.structuredContent as { notice: string }).notice).toMatch(
+      /could not be checked, because TIGERweb did not answer; .* Tract 707101 is a 2020 census tract:/,
+    );
+  });
+
+  it('states it in the tract_fips and notice descriptions', () => {
+    expect(censusResolveGeography.output.shape.tract_fips.description).toContain(
+      'It is a 2020 census tract, which ACS 5-year vintages from 2020 and the 2020 Census files publish',
+    );
+    expect(censusResolveGeography.enrichment?.notice.description).toContain(
+      'or a census tract, which is a 2020 tract',
+    );
+  });
+
+  it('declares resolution_unavailable for every way an upstream fails, with a retry recovery', () => {
+    const entry = censusResolveGeography.errors?.find((e) => e.reason === 'resolution_unavailable');
+    expect(entry?.when).toContain('HTTP error');
+    expect(entry?.when).toContain('did not answer in time');
+    expect(entry?.when).toContain("the call's 50-second upstream budget");
+    expect(entry?.recovery).toBe(
+      'Retry the request; if it keeps failing, the Census geography service is temporarily unavailable.',
+    );
   });
 });

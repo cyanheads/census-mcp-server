@@ -1,6 +1,6 @@
 # census-mcp-server - Directory Structure
 
-Generated on: 2026-11-04 00:18:23
+Generated on: 2026-11-16 05:11:23
 
 ```text
 census-mcp-server/
@@ -167,6 +167,7 @@ census-mcp-server/
 │   │       │   ├── census-search-variables.tool.ts
 │   │       │   └── index.ts
 │   │       ├── acs-coverage.ts
+│   │       ├── boundary-vintage.ts
 │   │       ├── notice-trailer.ts
 │   │       └── variable-entry.ts
 │   ├── services/
@@ -189,7 +190,8 @@ census-mcp-server/
 │   ├── fixtures/
 │   │   └── dec-ddhcb-2020-popgroup.json
 │   ├── helpers/
-│   │   └── markdown-readback.ts
+│   │   ├── markdown-readback.ts
+│   │   └── variable-labels-readback.ts
 │   ├── prompts/
 │   ├── resources/
 │   ├── scripts/
@@ -202,6 +204,7 @@ census-mcp-server/
 │   │   └── variable-cache/
 │   │       └── variable-cache-service.test.ts
 │   └── tools/
+│       ├── boundary-vintage.test.ts
 │       ├── census-compare-geographies.tool.test.ts
 │       ├── census-data-tools.contract.test.ts
 │       ├── census-get-variable.tool.test.ts
@@ -213,7 +216,8 @@ census-mcp-server/
 │       ├── census-search-variables.tool.test.ts
 │       ├── census-variable-tools.contract.test.ts
 │       ├── notice-trailer.test.ts
-│       └── tool-input-contract.test.ts
+│       ├── tool-input-contract.test.ts
+│       └── variable-entry.test.ts
 ├── .dockerignore
 ├── .env.example
 ├── .gitattributes

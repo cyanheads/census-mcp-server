@@ -59,7 +59,7 @@ const DATASETS = [
     datasetId: 'acs/acs1/cprofile',
     name: 'ACS 1-Year Comparison Profiles',
     description:
-      'ACS 1-year profile lines for the vintage year beside the four years before it, with CP-prefix codes whose middle segment names the year — CP03_2024_062E is 2024 median household income. The 2020 columns come back as not applicable, since the 2020 ACS1 was not released. The comparison profiles publish no margins of error: no M code exists for any estimate. Same coverage restriction as ACS1 (geographies with 65,000+ population only).',
+      'ACS 1-year profile lines for the vintage year beside the four years before it, with CP-prefix codes whose middle segment names the year — CP03_2024_062E is 2024 median household income. The 2021 through 2024 vintages carry 2020 columns that come back as not applicable, since the 2020 ACS1 was not released; later vintages have no 2020 columns. The comparison profiles publish no margins of error: no M code exists for any estimate. Same coverage restriction as ACS1 (geographies with 65,000+ population only).',
   },
   {
     datasetId: 'acs/acsse',
@@ -133,12 +133,18 @@ const DATASETS = [
     description:
       'Businesses with no paid employees — sole proprietors, self-employed, and other single-person operations that County Business Patterns excludes. Queries must set the predicates NAICS2022 (industry; earlier vintages use the NAICS revision of their year), LFO (legal form of organization), and RCPSZES (receipts size class) — omitting one returns the total across every category of it rather than an error, and census_list_predicate_values enumerates the codes each one takes. The 1997 through 2007 vintages declare only the industry dimension, and publish no label for it, so their rows carry no applied_filters at all. Geography levels are us, state, county, metropolitan/micropolitan statistical area, and combined statistical area; census_resolve_geography turns a name into a code for every one of those but us, which takes the literal value 1. The 2008 through 2011 vintages exist upstream but reject the NAME column every query here requests, so they are not listed.',
   },
+  {
+    datasetId: 'geoinfo',
+    name: 'Geography Information — Land Area and Internal Points',
+    description:
+      'Land area, water area, and internal point of every geography level from us down to block group and ZIP code tabulation area (ZCTA) — the denominator the count datasets lack. AREALAND and AREAWATR are in square meters, AREALAND_SQMI and AREAWATR_SQMI in square miles, and INTPTLAT and INTPTLON are the latitude and longitude of the internal point. No filter dimension and no margins of error. For population density, query the count (e.g., acs/acs5 B01003_001E or dec/pl P1_001N) and AREALAND_SQMI at the same geography level and codes, passing the same year to both calls — each dataset defaults to its own latest vintage — then divide. Areas start with 2020, on that decade\'s tract boundaries; a tract count from 2019 or earlier is on 2010 tracts, so a GEOID join drops every tract the 2020 Census redrew and pairs the codes it kept with 2020 areas. A water-only tract has an AREALAND_SQMI of 0. The 2020 vintage returns ZCTAs, urban areas, congressional districts, and state legislative districts once per delineation it publishes, told apart only by GEO_ID: 8600000US98101 is the 2010 ZCTA acs/acs5 2020 uses, 860Z200US98101 the 2020 ZCTA of dec/dhc and later ACS vintages. Add GEO_ID to variables to label those rows, and pin one with predicates {"GEO_ID": "860Z200US98101"}. The 2021 and 2022 vintages carry 32,923 of the 33,774 2020 ZCTAs; 2023 onward carries all of them.',
+  },
 ];
 
 export const censusListDatasets = tool('census_list_datasets', {
   title: 'List Census Datasets',
   description:
-    'Browse available Census Bureau datasets with their supported vintage years. Use as the starting point when the right dataset is unknown — ACS5, ACS1, and their profile, subject, and comparison tables, population estimates, the decennial census files, and the business datasets (County Business Patterns, Economic Census, Nonemployer Statistics) serve different use cases. Pass the dataset_id value to the dataset parameter in other census tools. Each description names the predicates a dataset requires and the geography levels it publishes, both of which vary by dataset.',
+    'Browse available Census Bureau datasets with their supported vintage years. Use as the starting point when the right dataset is unknown — ACS5, ACS1, and their profile, subject, and comparison tables, population estimates, the decennial census files, the business datasets (County Business Patterns, Economic Census, Nonemployer Statistics), and geoinfo (land area and internal points, the denominator for population density) serve different use cases. Pass the dataset_id value to the dataset parameter in other census tools. Each description names the predicates a dataset requires and the geography levels it publishes, both of which vary by dataset.',
   annotations: { readOnlyHint: true, openWorldHint: false },
   input: z.object({
     filter: z

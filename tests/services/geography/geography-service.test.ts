@@ -50,6 +50,24 @@ const resolve = (name: string, geographyType?: GeographyType, countyFips?: strin
 const whereClauses = () =>
   requestedUrls.map((url) => decodeURIComponent(url.match(/where=([^&]*)/)?.[1] ?? ''));
 
+/**
+ * A TIGERweb answer as TIGERweb serves it: each row carries only the attributes its request's
+ * `outFields` names, so a field the service reads but never asks for never reaches it.
+ */
+const servedFields = (body: unknown, outFields: string[]): unknown => {
+  const { features } = body as { features?: Array<{ attributes: Record<string, unknown> }> };
+  if (!Array.isArray(features)) return body;
+  return {
+    ...(body as object),
+    features: features.map((f) => ({
+      ...f,
+      attributes: Object.fromEntries(
+        Object.entries(f.attributes).filter(([field]) => outFields.includes(field)),
+      ),
+    })),
+  };
+};
+
 beforeEach(() => {
   responses = [];
   requestedUrls = [];
@@ -68,9 +86,12 @@ beforeEach(() => {
       const where = form
         ? (form.get('where') ?? '')
         : decodeURIComponent(href.match(/where=([^&]*)/)?.[1] ?? '');
-      const body = routes
+      const fixture = routes
         ? (routes.get(`${layerPath} ${where}`) ?? { features: [] })
         : (responses.shift() ?? { features: [] });
+      // The geocoder takes no outFields and answers its layers whole.
+      const outFields = form ? form.get('outFields') : new URL(href).searchParams.get('outFields');
+      const body = outFields ? servedFields(fixture, outFields.split(',')) : fixture;
       return Promise.resolve(
         new Response(JSON.stringify(body), {
           status: 200,
@@ -329,7 +350,7 @@ describe('GeographyService.resolveGeography — place-then-county fallback', () 
     expect(message).toBe('No county named "Chatham County" exists in WA.');
     // The level just tried is the miss, so county is not among the levels offered.
     expect(data.recovery.hint).toBe(
-      'Check the spelling, set geography_type to search a different level (state, place, tract, metropolitan statistical area/micropolitan statistical area, combined statistical area, consolidated city, zip code tabulation area, economic place), or pass a full street address.',
+      'Check the spelling, set geography_type to search a different level (state, county subdivision, place, tract, metropolitan statistical area/micropolitan statistical area, combined statistical area, consolidated city, zip code tabulation area, economic place), or pass a full street address.',
     );
   });
 
@@ -811,6 +832,7 @@ describe('GeographyService.resolveGeography — ambiguous candidates', () => {
     expect(data.recovery.hint).toContain(
       're-call census_resolve_geography with county_fips set to the county',
     );
+    expect(data.recovery.hint).toMatch(/the county of the one you want\.$/);
     expect(data.candidates[0]).toMatchObject({ countyFips: '051', tractFips: '010401' });
   });
 
@@ -962,9 +984,19 @@ describe('GeographyService.resolveGeography — county scoping', () => {
     const err = await resolve('Nowhere County, WA', 'county', '033').catch((e: unknown) => e);
     const { message, data } = err as { message: string; data: { recovery: { hint: string } } };
 
-    expect(message).toBe('No county named "Nowhere County" exists in county 033 of WA.');
+    expect(message).toBe('No county named "Nowhere County" has code 033 in WA.');
     expect(data.recovery.hint).toContain('drop county_fips');
     expect(data.recovery.hint).not.toContain('033');
+  });
+
+  it('places a scoped miss on a level below the county inside that county', async () => {
+    queue({ features: [] }, { features: [] });
+
+    const err = await resolve('Nowhere Census Tract, WA', 'tract', '033').catch((e: unknown) => e);
+
+    expect((err as { message: string }).message).toBe(
+      'No tract named "Nowhere Census Tract" exists in county 033 of WA.',
+    );
   });
 });
 
@@ -1206,6 +1238,18 @@ describe('GeographyService.resolveGeography — state suffix forms', () => {
     expect(result).toMatchObject({ geographyType: 'county', stateFips: '13', countyFips: '051' });
     expect(whereClauses()[0]).toMatch(/LIKE '%Chatham County%' AND STATE='13'$/i);
   });
+
+  it.each(['constructor', '__proto__'])(
+    'reads "Nowhere, %s", a key every object carries, as no state',
+    async (suffix) => {
+      const err = await resolve(`Nowhere, ${suffix}`).catch((e: unknown) => e);
+
+      expect(err).toMatchObject({ data: { reason: 'no_match' } });
+      expect((err as { message: string }).message).toBe(
+        `No place or county matched "Nowhere, ${suffix}".`,
+      );
+    },
+  );
 
   it('matches the whole final segment, so "West Virginia" is never read as Virginia', async () => {
     queue({
@@ -1605,7 +1649,9 @@ describe('GeographyService.resolveGeography — Saint and accent retries', () =>
   });
 
   it('retries a bare "St" with its period', async () => {
+    // Minnesota's chain ends at the county subdivision level, so four primary queries come first.
     queue(
+      { features: [] },
       { features: [] },
       { features: [] },
       { features: [] },
@@ -1621,7 +1667,10 @@ describe('GeographyService.resolveGeography — Saint and accent retries', () =>
     );
 
     await expect(resolve('St Paul, MN')).resolves.toMatchObject({ placeFips: '58000' });
-    expect(whereClauses()[3]).toBe("UPPER(NAME) LIKE '%ST. PAUL%' AND STATE='27'");
+    expect(whereClauses()[3]).toBe(
+      "UPPER(NAME) LIKE '%ST PAUL%' AND STATE='27' AND COUSUB<>'00000'",
+    );
+    expect(whereClauses()[4]).toBe("UPPER(NAME) LIKE '%ST. PAUL%' AND STATE='27'");
   });
 
   it('retries "St." as "Saint" for the places spelled out in full', async () => {
@@ -1716,6 +1765,7 @@ describe('GeographyService.resolveGeography — Saint and accent retries', () =>
 
   it('reports a retry that matches two rows as ambiguous_name rather than picking one', async () => {
     queue(
+      { features: [] },
       { features: [] },
       { features: [] },
       { features: [] },
@@ -1978,7 +2028,62 @@ describe('GeographyService.resolveGeography — addresses', () => {
     });
     // Both come from layers the geocoder already answers — no second request.
     expect(requestedUrls).toHaveLength(1);
-    expect(requestedUrls[0]).toContain('layers=8,12,28');
+    expect(requestedUrls[0]).toContain('layers=8,12,22,28');
+  });
+
+  it.each([
+    [
+      '820 Mercer St, Cherry Hill, NJ 08002',
+      { STATE: '34', COUNTY: '007', TRACT: '603301' },
+      { COUSUB: '12280', STATE: '34', COUNTY: '007', NAME: 'Cherry Hill township' },
+      '12280',
+    ],
+    [
+      '400 Broad St, Seattle, WA 98109',
+      { STATE: '53', COUNTY: '033', TRACT: '007101' },
+      { COUSUB: '92928', STATE: '53', COUNTY: '033', NAME: 'Seattle CCD' },
+      '92928',
+    ],
+    // A code sent without its leading zero comes back padded to the five digits FIPS keys on.
+    [
+      '5583 Main St, Williamsville, NY 14221',
+      { STATE: '36', COUNTY: '029', TRACT: '009102' },
+      { COUSUB: '2000', STATE: '36', COUNTY: '029', NAME: 'Amherst town' },
+      '02000',
+    ],
+  ])(
+    'carries the county subdivision "%s" sits in, from geocoder layer 22',
+    async (address, tract, subdivision, code) => {
+      queue({
+        result: {
+          addressMatches: [
+            {
+              matchedAddress: address.toUpperCase(),
+              geographies: { 'Census Tracts': [tract], 'County Subdivisions': [subdivision] },
+            },
+          ],
+        },
+      });
+
+      const result = await resolve(address);
+
+      expect(result).toMatchObject({
+        geographyType: 'tract',
+        tractFips: tract.TRACT,
+        fipsSummary: tract.TRACT,
+        countySubdivisionFips: code,
+      });
+      expect(requestedUrls).toHaveLength(1);
+      expect(requestedUrls[0]).toContain('layers=8,12,22,28');
+    },
+  );
+
+  it('omits the county subdivision when the geocoder returns none', async () => {
+    queue(broadSt(true));
+
+    const result = await resolve('400 Broad St, Seattle, WA 98109');
+
+    expect(result).not.toHaveProperty('countySubdivisionFips');
   });
 
   it('omits place_fips for an address outside any incorporated place', async () => {
@@ -2338,7 +2443,7 @@ describe('GeographyService.resolveGeography — New York City boroughs', () => {
     ['Bronx, NY', 'BRONX', '005'],
     ['Richmond, NY', 'RICHMOND', '085'],
   ])(
-    'resolves "%s", already its county name, with the requests it always sent',
+    'resolves "%s", already its county name, with the requests any other name sends',
     async (name, term, county) => {
       serveNewYork();
 
@@ -2350,7 +2455,13 @@ describe('GeographyService.resolveGeography — New York City boroughs', () => {
         fipsSummary: county,
       });
       expect(result).not.toHaveProperty('borough');
-      expect(whereClauses()).toEqual([like(term, '36'), like(term, '36'), like(term, '36')]);
+      // Place, county, then the check for a governing subdivision a New York county answer gets.
+      expect(whereClauses()).toEqual([
+        like(term, '36'),
+        like(term, '36'),
+        like(term, '36'),
+        subdivisionClause(term, '36'),
+      ]);
       expect(requestedUrls[2]).toContain(COUNTIES);
     },
   );
@@ -2516,16 +2627,21 @@ describe('GeographyService.resolveGeography — New York City boroughs', () => {
 
     const err = await resolve('Brooklyn, NY', undefined, '061').catch((e: unknown) => e);
 
-    expect(err).toMatchObject({ data: { reason: 'no_match', attemptedTypes: ['county'] } });
+    // A county scope keeps the county and county subdivision levels of New York's chain.
+    expect(err).toMatchObject({
+      data: { reason: 'no_match', attemptedTypes: ['county', 'county subdivision'] },
+    });
     // The substituted term first, then the respelling retry of the name as given.
     expect(whereClauses()).toEqual([
       `${like('KINGS', '36')} AND COUNTY='061'`,
+      subdivisionClause('BROOKLYN', '36', '061'),
       `${like('BR__KLY_', '36')} AND COUNTY='061'`,
+      subdivisionClause('BR__KLY_', '36', '061'),
     ]);
     expect(hintOf(err)).toContain('Kings County (county 047)');
     // #62: the miss is the message's; the hint opens on the borough and the step.
     expect((err as { message: string }).message).toBe(
-      'No county named "Brooklyn" exists in county 061 of NY.',
+      'No county or county subdivision named "Brooklyn" exists in county 061 of NY.',
     );
     expect(hintOf(err)).toBe(
       'It is the New York City borough coextensive with Kings County (county 047), so drop county_fips or change it to 047.',
@@ -2548,6 +2664,16 @@ describe('GeographyService.resolveGeography — New York City boroughs', () => {
       `No place named "${name.replace(', NY', '')}" exists in NY.`,
     );
   });
+
+  it.each(['Constructor, NY', '__proto__, NY'])(
+    'reads "%s", a key every object carries, as no borough',
+    async (name) => {
+      const err = await resolve(name).catch((e: unknown) => e);
+
+      expect(err).toMatchObject({ data: { reason: 'no_match' } });
+      expect(hintOf(err)).not.toContain('borough');
+    },
+  );
 
   it('keeps the place-level no_match hint unchanged outside New York', async () => {
     const err = await resolve('Staten Island, VT', 'place').catch((e: unknown) => e);
@@ -2685,6 +2811,767 @@ describe('GeographyService.resolveGeography — New York City boroughs', () => {
   });
 });
 
+/** Layers and WHERE clauses shared by the county subdivision and Connecticut county suites. */
+const INCORPORATED_LAYER = 'Places_CouSub_ConCity_SubMCD/MapServer/4';
+const CDP_LAYER = 'Places_CouSub_ConCity_SubMCD/MapServer/5';
+const COUNTY_LAYER = 'State_County/MapServer/1';
+const SUBDIVISION_LAYER = 'Places_CouSub_ConCity_SubMCD/MapServer/1';
+
+/** `UPPER(NAME) LIKE` clause the service sends for a term, scoped to a state FIPS. */
+const likeClause = (term: string, stateFips?: string) =>
+  `UPPER(NAME) LIKE '%${term}%'${stateFips ? ` AND STATE='${stateFips}'` : ''}`;
+
+/**
+ * The county subdivision level's WHERE clause: the name, its scope, and the "County subdivisions
+ * not defined" placeholder rows (code 00000) left out. A trailing TOWNSHIP also asks for the
+ * charter township of that name.
+ */
+const subdivisionClause = (term: string, stateFips?: string, countyFips?: string) => {
+  const name = term.endsWith(' TOWNSHIP')
+    ? `(${likeClause(term)} OR ${likeClause(term.replace(/ TOWNSHIP$/, ' CHARTER TOWNSHIP'))})`
+    : likeClause(term);
+  return `${name}${stateFips ? ` AND STATE='${stateFips}'` : ''}${countyFips ? ` AND COUNTY='${countyFips}'` : ''} AND COUSUB<>'00000'`;
+};
+
+/** One TIGERweb county subdivision row. FUNCSTAT `A` is an active general-purpose government. */
+const subdivisionRow = (
+  name: string,
+  basename: string,
+  state: string,
+  county: string,
+  code: string,
+  funcstat = 'A',
+) =>
+  feature({
+    NAME: name,
+    BASENAME: basename,
+    STATE: state,
+    COUNTY: county,
+    COUSUB: code,
+    FUNCSTAT: funcstat,
+  });
+
+const placeRow = (name: string, basename: string, state: string, code: string) =>
+  feature({ NAME: name, BASENAME: basename, STATE: state, PLACE: code });
+
+const countyRow = (basename: string, state: string, code: string) =>
+  feature({ NAME: `${basename} County`, BASENAME: basename, STATE: state, COUNTY: code });
+
+/** The TIGERweb layer each request went to, in order. */
+const requestedLayers = () =>
+  requestedUrls.map((url) => url.match(/services\/(?:TIGERweb\/)?([^?]+)\/query/)?.[1] ?? url);
+
+describe('GeographyService.resolveGeography — county subdivisions', () => {
+  it('resolves "Cherry Hill, NJ" to Cherry Hill township, past a CDP that only contains the name', async () => {
+    route(CDP_LAYER, likeClause('CHERRY HILL', '34'), {
+      features: [placeRow('Cherry Hill Mall CDP', 'Cherry Hill Mall', '34', '12385')],
+    });
+    route(SUBDIVISION_LAYER, subdivisionClause('CHERRY HILL', '34'), {
+      features: [subdivisionRow('Cherry Hill township', 'Cherry Hill', '34', '007', '12280')],
+    });
+
+    const result = await resolve('Cherry Hill, NJ');
+
+    expect(result).toEqual({
+      name: 'Cherry Hill township',
+      geographyType: 'county subdivision',
+      stateFips: '34',
+      countyFips: '007',
+      countySubdivisionFips: '12280',
+      fipsSummary: '12280',
+    });
+    // Place and county first, the subdivision level last — and nothing after the answer.
+    expect(requestedLayers()).toEqual([
+      INCORPORATED_LAYER,
+      CDP_LAYER,
+      COUNTY_LAYER,
+      SUBDIVISION_LAYER,
+    ]);
+  });
+
+  it.each([
+    ['Edison, NJ', 'EDISON', '34', 'Edison township', 'Edison', '023', '20230'],
+    ['Upper Darby, PA', 'UPPER DARBY', '42', 'Upper Darby township', 'Upper Darby', '045', '79000'],
+    ['Amherst, NY', 'AMHERST', '36', 'Amherst town', 'Amherst', '029', '02000'],
+  ])(
+    'resolves "%s", which no place or county has, to its subdivision',
+    async (name, term, state, rowName, basename, county, code) => {
+      route(SUBDIVISION_LAYER, subdivisionClause(term, state), {
+        features: [subdivisionRow(rowName, basename, state, county, code)],
+      });
+
+      const result = await resolve(name);
+
+      expect(result).toMatchObject({
+        geographyType: 'county subdivision',
+        stateFips: state,
+        countyFips: county,
+        countySubdivisionFips: code,
+        fipsSummary: code,
+      });
+    },
+  );
+
+  it('resolves "Greenwich, CT" to Greenwich town over the Greenwich CDP of the same name', async () => {
+    route(CDP_LAYER, likeClause('GREENWICH', '09'), {
+      features: [placeRow('Greenwich CDP', 'Greenwich', '09', '33690')],
+    });
+    route(SUBDIVISION_LAYER, subdivisionClause('GREENWICH', '09'), {
+      features: [subdivisionRow('Greenwich town', 'Greenwich', '09', '190', '33620')],
+    });
+
+    const result = await resolve('Greenwich, CT');
+
+    expect(result).toMatchObject({
+      name: 'Greenwich town',
+      geographyType: 'county subdivision',
+      countyFips: '190',
+      fipsSummary: '33620',
+    });
+    expect(result).not.toHaveProperty('censusDesignatedPlace');
+  });
+
+  it('resolves "Bedford, MA" to Bedford town, not New Bedford city, which only contains the name', async () => {
+    route(INCORPORATED_LAYER, likeClause('BEDFORD', '25'), {
+      features: [placeRow('New Bedford city', 'New Bedford', '25', '45000')],
+    });
+    route(SUBDIVISION_LAYER, subdivisionClause('BEDFORD', '25'), {
+      features: [
+        subdivisionRow('New Bedford city', 'New Bedford', '25', '005', '45000', 'F'),
+        subdivisionRow('Bedford town', 'Bedford', '25', '017', '04615'),
+      ],
+    });
+
+    const result = await resolve('Bedford, MA');
+
+    expect(result).toMatchObject({ name: 'Bedford town', countyFips: '017', fipsSummary: '04615' });
+  });
+
+  /** The three Clinton townships of Michigan, as TIGERweb names them. */
+  const clintonTownships = (countyFips?: string) => ({
+    features: [
+      subdivisionRow('Clinton township', 'Clinton', '26', '091', '16500'),
+      subdivisionRow('Clinton charter township', 'Clinton', '26', '099', '16520'),
+      subdivisionRow('Clinton township', 'Clinton', '26', '135', '16540'),
+    ].filter((row) => !countyFips || row.attributes.COUNTY === countyFips),
+  });
+
+  it('reaches a charter township through a trailing "Township", listing every Clinton township by county', async () => {
+    route(SUBDIVISION_LAYER, subdivisionClause('CLINTON TOWNSHIP', '26'), clintonTownships());
+
+    const err = await resolve('Clinton Township, MI').catch((e: unknown) => e);
+    const { message, data } = err as {
+      message: string;
+      data: {
+        reason: string;
+        candidates: Array<{ countyFips: string; fipsSummary: string; name: string }>;
+        recovery: { hint: string };
+      };
+    };
+
+    expect(data.reason).toBe('ambiguous_name');
+    expect(message).toBe('"Clinton Township, MI" matched 3 geographies.');
+    expect(data.candidates.map((c) => [c.name, c.countyFips, c.fipsSummary])).toEqual([
+      ['Clinton township', '091', '16500'],
+      ['Clinton charter township', '099', '16520'],
+      ['Clinton township', '135', '16540'],
+    ]);
+    expect(data.recovery.hint).toContain('"Clinton charter township, MI" (county 099)');
+    expect(data.recovery.hint).toContain('"Clinton township, MI" (county 135)');
+    expect(data.recovery.hint).toContain('county_fips set to the county');
+  });
+
+  it('narrows "Clinton Township, MI" to the charter township with its county_fips', async () => {
+    route(
+      SUBDIVISION_LAYER,
+      subdivisionClause('CLINTON TOWNSHIP', '26', '099'),
+      clintonTownships('099'),
+    );
+
+    const result = await resolve('Clinton Township, MI', undefined, '99');
+
+    expect(result).toMatchObject({
+      name: 'Clinton charter township',
+      geographyType: 'county subdivision',
+      countyFips: '099',
+      fipsSummary: '16520',
+    });
+    // The place level carries no COUNTY, so a county scope drops it from the chain.
+    expect(requestedLayers()).toEqual([COUNTY_LAYER, SUBDIVISION_LAYER]);
+  });
+
+  it('lists every same-named township in "Springfield, PA" with its county', async () => {
+    const counties = ['045', '051', '061', '049', '085', '091', '017', '133', '015'];
+    route(SUBDIVISION_LAYER, subdivisionClause('SPRINGFIELD', '42'), {
+      features: counties.map((county, i) =>
+        subdivisionRow('Springfield township', 'Springfield', '42', county, String(73000 + i)),
+      ),
+    });
+
+    const err = await resolve('Springfield, PA').catch((e: unknown) => e);
+    const { data } = err as {
+      data: {
+        reason: string;
+        candidates: Array<{ countyFips: string }>;
+        recovery: { hint: string };
+      };
+    };
+
+    expect(data.reason).toBe('ambiguous_name');
+    expect(data.candidates.map((c) => c.countyFips)).toEqual(counties);
+    for (const county of counties) {
+      expect(data.recovery.hint).toContain(`"Springfield township, PA" (county ${county})`);
+    }
+    expect(data.recovery.hint).not.toContain('more');
+  });
+
+  it('tells two same-named subdivisions of one county apart by their full names', async () => {
+    route(SUBDIVISION_LAYER, subdivisionClause('RANGELEY', '23'), {
+      features: [
+        subdivisionRow('Rangeley plantation', 'Rangeley', '23', '007', '61875'),
+        subdivisionRow('Rangeley town', 'Rangeley', '23', '007', '61840'),
+      ],
+    });
+
+    const err = await resolve('Rangeley, ME').catch((e: unknown) => e);
+    const { data } = err as { data: { reason: string; recovery: { hint: string } } };
+
+    expect(data.reason).toBe('ambiguous_name');
+    expect(data.recovery.hint).toContain('"Rangeley town, ME" (county 007)');
+    expect(data.recovery.hint).toContain(
+      'and with its full name as listed where two share a county',
+    );
+  });
+
+  it.each([
+    [undefined, [COUNTY_LAYER, SUBDIVISION_LAYER]],
+    ['county subdivision', [SUBDIVISION_LAYER]],
+  ] as const)(
+    'resolves "Edison, NJ" inside county_fips 023 (geography_type %s)',
+    async (type, layers) => {
+      route(SUBDIVISION_LAYER, subdivisionClause('EDISON', '34', '023'), {
+        features: [subdivisionRow('Edison township', 'Edison', '34', '023', '20230')],
+      });
+
+      const result = await resolve('Edison, NJ', type, '023');
+
+      expect(result).toMatchObject({ geographyType: 'county subdivision', fipsSummary: '20230' });
+      expect(requestedLayers()).toEqual(layers);
+    },
+  );
+
+  it('resolves a county subdivision outside the twelve states when the level is set', async () => {
+    route(SUBDIVISION_LAYER, subdivisionClause('SEATTLE', '53'), {
+      features: [
+        subdivisionRow('Seattle East CCD', 'Seattle East', '53', '033', '92931', 'S'),
+        subdivisionRow('Seattle CCD', 'Seattle', '53', '033', '92928', 'S'),
+      ],
+    });
+
+    const result = await resolve('Seattle, WA', 'county subdivision');
+
+    expect(result).toEqual({
+      name: 'Seattle CCD',
+      geographyType: 'county subdivision',
+      stateFips: '53',
+      countyFips: '033',
+      countySubdivisionFips: '92928',
+      fipsSummary: '92928',
+    });
+  });
+
+  it('names county subdivision among the levels county_fips applies to', async () => {
+    const err = await resolve('Seattle, WA', 'place', '033').catch((e: unknown) => e);
+    const { message, data } = err as { message: string; data: { recovery: { hint: string } } };
+
+    expect(message).toBe(
+      'county_fips does not apply to the place level — only county, county subdivision, and tract sit within a county.',
+    );
+    expect(data.recovery.hint).toBe(
+      'Drop county_fips, or set geography_type to "county", "county subdivision", or "tract" to use it.',
+    );
+  });
+
+  /** The twelve states whose towns and townships govern (Census geography glossary). */
+  it.each(['CT', 'ME', 'MA', 'MI', 'MN', 'NH', 'NJ', 'NY', 'PA', 'RI', 'VT', 'WI'])(
+    'states a twelve-state miss in %s across all three levels it tried',
+    async (state) => {
+      const err = await resolve(`Nowhere Special, ${state}`).catch((e: unknown) => e);
+      const { message, data } = err as {
+        message: string;
+        data: { attemptedTypes: string[]; recovery: { hint: string } };
+      };
+
+      expect(data.attemptedTypes).toEqual(['place', 'county', 'county subdivision']);
+      expect(message).toBe(
+        `No place, county, or county subdivision named "Nowhere Special" exists in ${state}.`,
+      );
+      expect(data.recovery.hint).not.toContain('county subdivision');
+    },
+  );
+
+  describe('outside the twelve states, and without a state suffix, nothing changes', () => {
+    it('keeps "Winston, NC" on Winston-Salem, never querying the subdivision level', async () => {
+      route(INCORPORATED_LAYER, likeClause('WINSTON', '37'), {
+        features: [placeRow('Winston-Salem city', 'Winston-Salem', '37', '75000')],
+      });
+
+      const result = await resolve('Winston, NC');
+
+      expect(result).toMatchObject({ geographyType: 'place', placeFips: '75000' });
+      expect(requestedLayers()).not.toContain(SUBDIVISION_LAYER);
+    });
+
+    it('keeps "Choccolocco, AL" on its CDP rather than the Choccolocco CCD', async () => {
+      route(CDP_LAYER, likeClause('CHOCCOLOCCO', '01'), {
+        features: [placeRow('Choccolocco CDP', 'Choccolocco', '01', '14728')],
+      });
+
+      const result = await resolve('Choccolocco, AL');
+
+      expect(result).toMatchObject({ geographyType: 'place', placeFips: '14728' });
+      expect(requestedLayers()).not.toContain(SUBDIVISION_LAYER);
+    });
+
+    it('keeps "Hartford, CT" on Hartford city', async () => {
+      route(INCORPORATED_LAYER, likeClause('HARTFORD', '09'), {
+        features: [
+          placeRow('Hartford city', 'Hartford', '09', '37000'),
+          placeRow('West Hartford CDP', 'West Hartford', '09', '82660'),
+        ],
+      });
+
+      const result = await resolve('Hartford, CT');
+
+      expect(result).toMatchObject({ geographyType: 'place', placeFips: '37000' });
+      expect(requestedLayers()).toEqual([INCORPORATED_LAYER, CDP_LAYER]);
+    });
+
+    it.each(['Cherry Hill', 'Edison', 'Greenwich'])(
+      'never gives bare "%s" the subdivision level',
+      async (name) => {
+        await resolve(name).catch(() => undefined);
+
+        expect(requestedLayers().length).toBeGreaterThan(0);
+        expect(requestedLayers()).not.toContain(SUBDIVISION_LAYER);
+      },
+    );
+  });
+
+  describe('active subdivisions named exactly the input, beside a county or CDP answer', () => {
+    it('keeps "Plymouth, MA" on Plymouth County and names Plymouth town', async () => {
+      route(CDP_LAYER, likeClause('PLYMOUTH', '25'), {
+        features: [
+          placeRow('North Plymouth CDP', 'North Plymouth', '25', '48780'),
+          placeRow('Plymouth CDP', 'Plymouth', '25', '54275'),
+        ],
+      });
+      route(COUNTY_LAYER, likeClause('PLYMOUTH', '25'), {
+        features: [countyRow('Plymouth', '25', '023')],
+      });
+      route(SUBDIVISION_LAYER, subdivisionClause('PLYMOUTH', '25'), {
+        features: [subdivisionRow('Plymouth town', 'Plymouth', '25', '023', '54310')],
+      });
+
+      const result = await resolve('Plymouth, MA');
+
+      expect(result).toEqual({
+        name: 'Plymouth County',
+        geographyType: 'county',
+        stateFips: '25',
+        countyFips: '023',
+        fipsSummary: '023',
+        namesakes: {
+          kind: 'found',
+          subdivisions: [
+            { name: 'Plymouth town', countyFips: '023', countySubdivisionFips: '54310' },
+          ],
+        },
+      });
+      // One request past the county answer: the check for an active subdivision of that name.
+      expect(requestedLayers()).toEqual([
+        INCORPORATED_LAYER,
+        CDP_LAYER,
+        COUNTY_LAYER,
+        SUBDIVISION_LAYER,
+      ]);
+    });
+
+    it('names every active "Lake" subdivision of Michigan beside Lake County, charter township included', async () => {
+      route(COUNTY_LAYER, likeClause('LAKE', '26'), {
+        features: [countyRow('Lake', '26', '085'), countyRow('Clear Lake', '26', '999')],
+      });
+      const lakes: Array<[string, string, string]> = [
+        ['Lake township', '109', '44360'],
+        ['Lake charter township', '021', '44260'],
+        ['Lake township', '085', '44320'],
+        ['Lake township', '063', '44300'],
+        ['Lake township', '143', '44400'],
+        ['Lake township', '019', '44240'],
+        ['Lake township', '113', '44380'],
+      ];
+      route(SUBDIVISION_LAYER, subdivisionClause('LAKE', '26'), {
+        features: [
+          subdivisionRow('Clear Lake township', 'Clear Lake', '26', '001', '16000'),
+          ...lakes.map(([name, county, code]) => subdivisionRow(name, 'Lake', '26', county, code)),
+        ],
+      });
+
+      const result = await resolve('Lake, MI');
+
+      expect(result).toMatchObject({ geographyType: 'county', fipsSummary: '085' });
+      expect(result.namesakes).toEqual({
+        kind: 'found',
+        subdivisions: lakes.map(([name, countyFips, countySubdivisionFips]) => ({
+          name,
+          countyFips,
+          countySubdivisionFips,
+        })),
+      });
+    });
+
+    it('names both Union townships beside Union County, NJ', async () => {
+      route(COUNTY_LAYER, likeClause('UNION', '34'), {
+        features: [countyRow('Union', '34', '039')],
+      });
+      route(SUBDIVISION_LAYER, subdivisionClause('UNION', '34'), {
+        features: [
+          subdivisionRow('Union township', 'Union', '34', '019', '74420'),
+          subdivisionRow('Union township', 'Union', '34', '039', '74480'),
+          subdivisionRow('Union City city', 'Union City', '34', '017', '74630'),
+        ],
+      });
+
+      const result = await resolve('Union, NJ');
+
+      expect(result).toMatchObject({ geographyType: 'county', fipsSummary: '039' });
+      expect(result.namesakes).toEqual({
+        kind: 'found',
+        subdivisions: [
+          { name: 'Union township', countyFips: '019', countySubdivisionFips: '74420' },
+          { name: 'Union township', countyFips: '039', countySubdivisionFips: '74480' },
+        ],
+      });
+    });
+
+    it.each([
+      ['Queens, NY', 'QUEENS', 'Queens', '081', 'Queens borough', '60323'],
+      ['Bronx, NY', 'BRONX', 'Bronx', '005', 'Bronx borough', '08510'],
+    ])(
+      'leaves "%s" its county with no subdivision named — the borough has no government of its own',
+      async (name, term, basename, county, borough, code) => {
+        route(COUNTY_LAYER, likeClause(term, '36'), {
+          features: [countyRow(basename, '36', county)],
+        });
+        route(SUBDIVISION_LAYER, subdivisionClause(term, '36'), {
+          features: [subdivisionRow(borough, basename, '36', county, code, 'G')],
+        });
+
+        const result = await resolve(name);
+
+        expect(result).toMatchObject({ geographyType: 'county', fipsSummary: county });
+        expect(result).not.toHaveProperty('namesakes');
+      },
+    );
+
+    it('names nothing when the only same-named subdivision only contains the name', async () => {
+      route(COUNTY_LAYER, likeClause('ESSEX', '25'), {
+        features: [countyRow('Essex', '25', '009')],
+      });
+      route(SUBDIVISION_LAYER, subdivisionClause('ESSEX', '25'), {
+        features: [subdivisionRow('Essex Junction town', 'Essex Junction', '25', '009', '21850')],
+      });
+
+      const result = await resolve('Essex, MA');
+
+      expect(result).not.toHaveProperty('namesakes');
+    });
+
+    it.each([
+      ['Cherry Hill, NJ', 'CHERRY HILL', '34', 'Cherry Hill Mall CDP', 'Cherry Hill Mall', '12385'],
+      ['Greenwich, CT', 'GREENWICH', '09', 'Greenwich CDP', 'Greenwich', '33690'],
+    ])(
+      'answers "%s" at geography_type "place" with its CDP and names the town or township',
+      async (name, term, state, cdpName, cdpBase, cdpCode) => {
+        const [townName, county, code] =
+          state === '34'
+            ? ['Cherry Hill township', '007', '12280']
+            : ['Greenwich town', '190', '33620'];
+        route(CDP_LAYER, likeClause(term, state), {
+          features: [placeRow(cdpName, cdpBase, state, cdpCode)],
+        });
+        route(SUBDIVISION_LAYER, subdivisionClause(term, state), {
+          features: [subdivisionRow(townName, name.split(',')[0] ?? '', state, county, code)],
+        });
+
+        const result = await resolve(name, 'place');
+
+        expect(result).toMatchObject({
+          name: cdpName,
+          geographyType: 'place',
+          placeFips: cdpCode,
+          censusDesignatedPlace: true,
+          namesakes: {
+            kind: 'found',
+            subdivisions: [{ name: townName, countyFips: county, countySubdivisionFips: code }],
+          },
+        });
+      },
+    );
+
+    it.each([
+      ['an incorporated place at "place"', 'Hartford, CT', 'place' as const],
+      ['a CDP outside the twelve states', 'Choccolocco, AL', 'place' as const],
+      ['a county asked for by level', 'Plymouth, MA', 'county' as const],
+      ['a name that says "County"', 'Plymouth County, MA', undefined],
+    ])('does not check for a subdivision on %s', async (_label, name, type) => {
+      route(INCORPORATED_LAYER, likeClause('HARTFORD', '09'), {
+        features: [placeRow('Hartford city', 'Hartford', '09', '37000')],
+      });
+      route(CDP_LAYER, likeClause('CHOCCOLOCCO', '01'), {
+        features: [placeRow('Choccolocco CDP', 'Choccolocco', '01', '14728')],
+      });
+      route(COUNTY_LAYER, likeClause('PLYMOUTH', '25'), {
+        features: [countyRow('Plymouth', '25', '023')],
+      });
+      route(COUNTY_LAYER, likeClause('PLYMOUTH COUNTY', '25'), {
+        features: [countyRow('Plymouth', '25', '023')],
+      });
+
+      const result = await resolve(name, type);
+
+      expect(result).not.toHaveProperty('namesakes');
+      expect(requestedLayers()).not.toContain(SUBDIVISION_LAYER);
+    });
+
+    it('applies county_fips to the subdivision check', async () => {
+      route(COUNTY_LAYER, `${likeClause('PLYMOUTH', '25')} AND COUNTY='023'`, {
+        features: [countyRow('Plymouth', '25', '023')],
+      });
+      route(SUBDIVISION_LAYER, subdivisionClause('PLYMOUTH', '25', '023'), {
+        features: [subdivisionRow('Plymouth town', 'Plymouth', '25', '023', '54310')],
+      });
+
+      const result = await resolve('Plymouth, MA', undefined, '023');
+
+      expect(result.namesakes).toEqual({
+        kind: 'found',
+        subdivisions: [
+          { name: 'Plymouth town', countyFips: '023', countySubdivisionFips: '54310' },
+        ],
+      });
+      expect(whereClauses()).toEqual([
+        `${likeClause('PLYMOUTH', '25')} AND COUNTY='023'`,
+        subdivisionClause('PLYMOUTH', '25', '023'),
+      ]);
+    });
+
+    it('returns the county with the check marked unavailable when TIGERweb fails it', async () => {
+      route(COUNTY_LAYER, likeClause('PLYMOUTH', '25'), {
+        features: [countyRow('Plymouth', '25', '023')],
+      });
+      route(SUBDIVISION_LAYER, subdivisionClause('PLYMOUTH', '25'), {
+        error: { message: 'Unable to complete operation.' },
+      });
+
+      const result = await resolve('Plymouth, MA');
+
+      expect(result).toMatchObject({
+        geographyType: 'county',
+        fipsSummary: '023',
+        namesakes: { kind: 'unavailable' },
+      });
+    });
+
+    it('makes the check one attempt — an unreadable answer is not retried', async () => {
+      route(COUNTY_LAYER, likeClause('PLYMOUTH', '25'), {
+        features: [countyRow('Plymouth', '25', '023')],
+      });
+      const fetchStub = vi.mocked(globalThis.fetch);
+      const answer = fetchStub.getMockImplementation();
+      fetchStub.mockImplementation((url, init) => {
+        if (!String(url).includes(SUBDIVISION_LAYER)) return answer!(url, init);
+        requestedUrls.push(String(url));
+        // A proxy page in place of JSON — the kind of answer a retry exists for.
+        return Promise.resolve(
+          new Response('<!DOCTYPE html><html><body>Service unavailable</body></html>', {
+            status: 200,
+          }),
+        );
+      });
+
+      const result = await resolve('Plymouth, MA');
+
+      expect(result.namesakes).toEqual({ kind: 'unavailable' });
+      expect(requestedLayers().filter((layer) => layer === SUBDIVISION_LAYER)).toHaveLength(1);
+    });
+
+    it('lets a cancellation during the check fail the call rather than mark it unavailable', async () => {
+      route(COUNTY_LAYER, likeClause('PLYMOUTH', '25'), {
+        features: [countyRow('Plymouth', '25', '023')],
+      });
+      const controller = new AbortController();
+      const fetchStub = vi.mocked(globalThis.fetch);
+      const answer = fetchStub.getMockImplementation();
+      // The caller cancels while the check's request is in flight; the request dies with it.
+      fetchStub.mockImplementation((url, init) => {
+        if (!String(url).includes(SUBDIVISION_LAYER)) return answer!(url, init);
+        requestedUrls.push(String(url));
+        controller.abort();
+        return Promise.reject(new DOMException('This operation was aborted', 'AbortError'));
+      });
+
+      const error = await getGeographyService()
+        .resolveGeography(
+          { name: 'Plymouth, MA' },
+          createMockContext({ signal: controller.signal }),
+        )
+        .then(
+          () => undefined,
+          (err: unknown) => err,
+        );
+
+      expect(error).toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
+      expect(error).not.toMatchObject({ data: { reason: 'resolution_unavailable' } });
+    });
+  });
+});
+
+describe('GeographyService.resolveGeography — Connecticut counties before 2022', () => {
+  it.each([
+    ['Fairfield County, CT', 'Fairfield County', '001'],
+    ['Hartford County, CT', 'Hartford County', '003'],
+    ['Litchfield County, CT', 'Litchfield County', '005'],
+    ['Middlesex County, CT', 'Middlesex County', '007'],
+    ['New Haven County, CT', 'New Haven County', '009'],
+    ['New London County, CT', 'New London County', '011'],
+    ['Tolland County, CT', 'Tolland County', '013'],
+    ['Windham County, CT', 'Windham County', '015'],
+    ['fairfield county, connecticut', 'Fairfield County', '001'],
+    ['New  Haven County, Connecticut', 'New Haven County', '009'],
+  ])('resolves "%s" from the fixed table, with no TIGERweb request', async (name, county, code) => {
+    const result = await resolve(name);
+
+    expect(result).toEqual({
+      name: county,
+      geographyType: 'county',
+      stateFips: '09',
+      countyFips: code,
+      fipsSummary: code,
+      legacyCounty: true,
+    });
+    expect(requestedUrls).toHaveLength(0);
+  });
+
+  it('resolves "Fairfield, CT" at geography_type "county" from the table', async () => {
+    const result = await resolve('Fairfield, CT', 'county');
+
+    expect(result).toMatchObject({ countyFips: '001', fipsSummary: '001', legacyCounty: true });
+    expect(requestedUrls).toHaveLength(0);
+  });
+
+  it.each([
+    ['1', '001'],
+    ['001', '001'],
+  ])('resolves "Fairfield County, CT" inside county_fips %s', async (countyFips, code) => {
+    const result = await resolve('Fairfield County, CT', undefined, countyFips);
+
+    expect(result).toMatchObject({ fipsSummary: code, legacyCounty: true });
+  });
+
+  it.each(['Constructor County, CT', '__proto__ County, CT'])(
+    'reads "%s", a key every object carries, as no Connecticut county',
+    async (name) => {
+      const err = await resolve(name).catch((e: unknown) => e);
+
+      expect(err).toMatchObject({ data: { reason: 'no_match', attemptedTypes: ['county'] } });
+      expect(requestedUrls.length).toBeGreaterThan(0);
+    },
+  );
+
+  it('is no_match when county_fips names a different county', async () => {
+    const err = await resolve('Fairfield County, CT', undefined, '190').catch((e: unknown) => e);
+
+    expect(err).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'no_match', countyFips: '190' },
+    });
+  });
+
+  it('never answers a bare "Fairfield, CT" with the pre-2022 county', async () => {
+    route(CDP_LAYER, likeClause('FAIRFIELD', '09'), {
+      features: [placeRow('Fairfield University CDP', 'Fairfield University', '09', '26698')],
+    });
+    route(SUBDIVISION_LAYER, subdivisionClause('FAIRFIELD', '09'), {
+      features: [
+        subdivisionRow('New Fairfield town', 'New Fairfield', '09', '190', '50860'),
+        subdivisionRow('Fairfield town', 'Fairfield', '09', '120', '26620'),
+      ],
+    });
+
+    const result = await resolve('Fairfield, CT');
+
+    expect(result).toMatchObject({
+      name: 'Fairfield town',
+      geographyType: 'county subdivision',
+      countyFips: '120',
+      fipsSummary: '26620',
+    });
+    expect(result).not.toHaveProperty('legacyCounty');
+  });
+
+  it.each([
+    [
+      'Western Connecticut Planning Region, CT',
+      'WESTERN CONNECTICUT PLANNING REGION',
+      'Western Connecticut Planning Region',
+      '190',
+    ],
+    ['Capitol, CT', 'CAPITOL', 'Capitol Planning Region', '110'],
+  ])(
+    'keeps "%s" on its planning region, as TIGERweb has it',
+    async (name, term, regionName, code) => {
+      route(COUNTY_LAYER, likeClause(term, '09'), {
+        features: [
+          feature({
+            NAME: regionName,
+            BASENAME: regionName.replace(/ Planning Region$/, ''),
+            STATE: '09',
+            COUNTY: code,
+          }),
+        ],
+      });
+
+      const result = await resolve(name);
+
+      expect(result).toMatchObject({
+        name: regionName,
+        geographyType: 'county',
+        fipsSummary: code,
+      });
+      expect(result).not.toHaveProperty('legacyCounty');
+      expect(result).not.toHaveProperty('namesakes');
+    },
+  );
+
+  it('leaves a Fairfield County outside Connecticut to TIGERweb', async () => {
+    route(COUNTY_LAYER, likeClause('FAIRFIELD COUNTY', '39'), {
+      features: [countyRow('Fairfield', '39', '045')],
+    });
+
+    const result = await resolve('Fairfield County, OH');
+
+    expect(result).toEqual({
+      name: 'Fairfield County',
+      geographyType: 'county',
+      stateFips: '39',
+      countyFips: '045',
+      fipsSummary: '045',
+    });
+    expect(whereClauses()).toEqual([likeClause('FAIRFIELD COUNTY', '39')]);
+  });
+});
+
 describe('census_resolve_geography over the real GeographyService', () => {
   const COUNTIES = 'State_County/MapServer/1';
 
@@ -2800,5 +3687,781 @@ describe('census_resolve_geography over the real GeographyService', () => {
     });
     expect(textOf(result)).toContain('Bronx County (county 005)');
     expect(textOf(result)).not.toContain('08532');
+  });
+});
+
+describe('census_resolve_geography over the real GeographyService — subdivisions and Connecticut counties', () => {
+  const textOf = (result: { content: Array<{ type: string; text?: string }> }) =>
+    result.content.map((c) => c.text ?? '').join('\n');
+
+  const servePlymouth = () => {
+    route(COUNTY_LAYER, likeClause('PLYMOUTH', '25'), {
+      features: [countyRow('Plymouth', '25', '023')],
+    });
+    route(SUBDIVISION_LAYER, subdivisionClause('PLYMOUTH', '25'), {
+      features: [subdivisionRow('Plymouth town', 'Plymouth', '25', '023', '54310')],
+    });
+  };
+
+  it('returns a county subdivision with its code on both surfaces', async () => {
+    route(SUBDIVISION_LAYER, subdivisionClause('CHERRY HILL', '34'), {
+      features: [subdivisionRow('Cherry Hill township', 'Cherry Hill', '34', '007', '12280')],
+    });
+
+    const result = await runToolContract(censusResolveGeography, { name: 'Cherry Hill, NJ' });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toEqual({
+      name: 'Cherry Hill township',
+      geography_type: 'county subdivision',
+      state_fips: '34',
+      county_fips: '007',
+      county_subdivision_fips: '12280',
+      fips_summary: '12280',
+    });
+    const text = textOf(result);
+    expect(text).toContain('**Type:** county subdivision');
+    expect(text).toContain('**County subdivision FIPS:** `12280`');
+    expect(text).toContain(
+      '**County FIPS:** `007` — also use as `county_fips` in census_query_data for county subdivision queries',
+    );
+  });
+
+  it('names the town beside a county answer, as a notice on both surfaces', async () => {
+    servePlymouth();
+
+    const result = await runToolContract(censusResolveGeography, { name: 'Plymouth, MA' });
+
+    const notice =
+      'Plymouth town (county 023, county subdivision 54310) shares this name and has its own government: resolve it with geography_type "county subdivision".';
+    expect(result.structuredContent).toEqual({
+      name: 'Plymouth County',
+      geography_type: 'county',
+      state_fips: '25',
+      county_fips: '023',
+      fips_summary: '023',
+      notice,
+    });
+    expect(textOf(result)).toContain(notice);
+  });
+
+  it('says on both surfaces when the subdivision check could not run', async () => {
+    route(COUNTY_LAYER, likeClause('PLYMOUTH', '25'), {
+      features: [countyRow('Plymouth', '25', '023')],
+    });
+    route(SUBDIVISION_LAYER, subdivisionClause('PLYMOUTH', '25'), {
+      error: { message: 'Unable to complete operation.' },
+    });
+
+    const result = await runToolContract(censusResolveGeography, { name: 'Plymouth, MA' });
+
+    const notice =
+      'Whether a county subdivision with its own government shares this name could not be checked, because TIGERweb did not answer; geography_type "county subdivision" resolves one directly.';
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({ fips_summary: '023', notice });
+    expect(textOf(result)).toContain(notice);
+  });
+
+  it('discloses a pre-2022 Connecticut county as a notice on both surfaces', async () => {
+    const result = await runToolContract(censusResolveGeography, { name: 'Fairfield County, CT' });
+
+    const notice =
+      "Fairfield County (county 001) is one of Connecticut's eight counties before 2022: every dataset vintage through 2021, the 2020 Census included, publishes it, and vintages from 2022 publish the nine planning regions (counties 110–190) in its place.";
+    expect(result.structuredContent).toEqual({
+      name: 'Fairfield County',
+      geography_type: 'county',
+      state_fips: '09',
+      county_fips: '001',
+      fips_summary: '001',
+      notice,
+    });
+    expect(textOf(result)).toContain(notice);
+  });
+
+  it('hands over the county subdivision an address sits in, on both surfaces', async () => {
+    queue({
+      result: {
+        addressMatches: [
+          {
+            matchedAddress: '820 MERCER ST, CHERRY HILL, NJ, 08002',
+            geographies: {
+              'Census Tracts': [{ STATE: '34', COUNTY: '007', TRACT: '603301' }],
+              'County Subdivisions': [
+                { COUSUB: '12280', STATE: '34', COUNTY: '007', NAME: 'Cherry Hill township' },
+              ],
+            },
+          },
+        ],
+      },
+    });
+
+    const result = await runToolContract(censusResolveGeography, {
+      name: '820 Mercer St, Cherry Hill, NJ 08002',
+    });
+
+    expect(result.structuredContent).toEqual({
+      name: '820 MERCER ST, CHERRY HILL, NJ, 08002',
+      geography_type: 'tract',
+      state_fips: '34',
+      county_fips: '007',
+      tract_fips: '603301',
+      county_subdivision_fips: '12280',
+      fips_summary: '603301',
+      notice:
+        'Tract 603301 is a 2020 census tract: ACS 5-year vintages from 2020 and the 2020 Census files publish it and its block groups, while earlier vintages publish earlier tracts — 2010 tracts, or 2000 tracts on acs/acs5 2009 and dec/pl 2000 — where this code can be missing.',
+    });
+    expect(textOf(result)).toContain(
+      '**County subdivision FIPS:** `12280` — use as `geography_fips` at `geography_level` "county subdivision" in census_query_data, with the state and county',
+    );
+  });
+});
+
+describe('GeographyService — an upstream that fails every attempt is resolution_unavailable', () => {
+  const TIGERWEB_HOST = 'tigerweb.geo.census.gov';
+  const GEOCODER_HOST = 'geocoding.geo.census.gov';
+
+  /** A request the upstream accepts and never answers; it settles only when its signal aborts. */
+  const hang = (init?: RequestInit) =>
+    new Promise<Response>((_, reject) => {
+      if (init?.signal?.aborted) reject(init.signal.reason);
+      init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+    });
+
+  type Failure =
+    | '403'
+    | '404'
+    | '429'
+    | '500'
+    | '503'
+    | '504'
+    | 'network error'
+    | 'timeout'
+    | 'an HTML page'
+    | 'a body that is not JSON';
+  const fail = (failure: Failure, init?: RequestInit): Promise<Response> => {
+    switch (failure) {
+      case '403':
+      case '404':
+      case '429':
+      case '500':
+      case '503':
+      case '504':
+        return Promise.resolve(
+          new Response('<html><body>Upstream failure</body></html>', {
+            status: Number(failure),
+            headers: { 'content-type': 'text/html' },
+          }),
+        );
+      case 'network error':
+        return Promise.reject(new TypeError('fetch failed'));
+      case 'timeout':
+        return hang(init);
+      // A proxy or gateway page in place of the JSON asked for, with a 200.
+      case 'an HTML page':
+        return Promise.resolve(
+          new Response('<!DOCTYPE html><html><body>Service unavailable</body></html>', {
+            status: 200,
+            headers: { 'content-type': 'text/html' },
+          }),
+        );
+      case 'a body that is not JSON':
+        return Promise.resolve(
+          new Response('Service temporarily unavailable', {
+            status: 200,
+            headers: { 'content-type': 'text/plain' },
+          }),
+        );
+    }
+  };
+
+  /** Fail every request to `host`; answer the rest from the suite's routes. */
+  const failHost = (host: string, failure: Failure) => {
+    const fetchStub = vi.mocked(globalThis.fetch);
+    const answer = fetchStub.getMockImplementation();
+    fetchStub.mockImplementation((url, init) => {
+      if (new URL(String(url)).hostname !== host) return answer!(url, init);
+      requestedUrls.push(String(url));
+      return fail(failure, init);
+    });
+  };
+
+  /** How many times each distinct URL at `host` was requested — a place name asks two layers. */
+  const attemptsAt = (host: string) => {
+    const counts = new Map<string, number>();
+    for (const url of requestedUrls.filter((u) => new URL(u).hostname === host)) {
+      counts.set(url, (counts.get(url) ?? 0) + 1);
+    }
+    return [...new Set(counts.values())];
+  };
+
+  /** Run with retry backoffs and per-attempt timeouts on fake timers, past every one of them. */
+  const settle = async <T>(pending: Promise<T>) => {
+    const outcome = pending.then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error }),
+    );
+    await vi.advanceTimersByTimeAsync(300_000);
+    return outcome;
+  };
+
+  beforeEach(() => {
+    // Date moves with the timers: a resolution's upstream budget is measured against it.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const cases = [
+    ['TIGERweb', TIGERWEB_HOST, 'Seattle, WA'],
+    ['the Census Geocoder', GEOCODER_HOST, '400 Broad St, Seattle, WA 98109'],
+  ] as const;
+  const failures: Failure[] = ['500', '503', 'network error', 'timeout'];
+
+  it.each(
+    cases.flatMap(([source, host, name]) =>
+      failures.map((failure) => [source, failure, host, name] as const),
+    ),
+  )(
+    '%s failing with a %s on every attempt carries the declared reason and its recovery',
+    async (_source, failure, host, name) => {
+      failHost(host, failure);
+
+      const outcome = await settle(resolve(name));
+
+      expect(outcome).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          data: {
+            reason: 'resolution_unavailable',
+            retryable: true,
+            recovery: { hint: expect.stringMatching(/^Retry the request/) },
+          },
+        },
+      });
+      /**
+       * Every request gets one attempt and three retries, except a hung Census Geocoder: its fourth
+       * 15-second attempt cannot start inside the call's 50-second budget.
+       */
+      expect(attemptsAt(host)).toEqual([host === GEOCODER_HOST && failure === 'timeout' ? 3 : 4]);
+    },
+  );
+
+  it('names the upstream status as a field, never the upstream body', async () => {
+    failHost(TIGERWEB_HOST, '503');
+
+    const outcome = await settle(resolve('Seattle, WA'));
+
+    const error = (outcome as { error: { message: string; data: Record<string, unknown> } }).error;
+    expect(error.data).toMatchObject({ status: 503, retryAttempts: 4 });
+    expect(error.message).toBe('TIGERweb answered HTTP 503 on all 4 attempts.');
+    expect(JSON.stringify(error.data)).not.toContain('Upstream failure');
+  });
+
+  it.each([
+    ['network error', 'TIGERweb could not be reached on all 4 attempts.'],
+    ['timeout', 'TIGERweb did not answer within 10 s on all 4 attempts.'],
+  ] as const)('says what a TIGERweb %s on every attempt was', async (failure, message) => {
+    failHost(TIGERWEB_HOST, failure);
+
+    const outcome = await settle(resolve('Seattle, WA'));
+
+    expect(outcome).toMatchObject({ error: { message, data: { retryAttempts: 4 } } });
+  });
+
+  /** A 4xx refuses the request as sent, which a retry only repeats. */
+  it.each([
+    ['TIGERweb', '404', TIGERWEB_HOST, 'Seattle, WA', 'TIGERweb answered HTTP 404.'],
+    [
+      'the Census Geocoder',
+      '403',
+      GEOCODER_HOST,
+      '400 Broad St, Seattle, WA 98109',
+      'The Census Geocoder answered HTTP 403.',
+    ],
+  ] as const)(
+    '%s refusing a request with a %s is neither retried nor retryable',
+    async (_source, failure, host, name, message) => {
+      failHost(host, failure);
+
+      const outcome = await settle(resolve(name));
+
+      expect(outcome).toMatchObject({
+        error: {
+          message,
+          data: {
+            reason: 'resolution_unavailable',
+            status: Number(failure),
+            retryable: false,
+            recovery: {
+              hint: 'The request was refused rather than failing transiently, so retrying it unchanged gets the same status. Resolve the geography by another name or level, or pass FIPS codes already in hand straight to the data tools.',
+            },
+          },
+        },
+      });
+      expect(attemptsAt(host)).toEqual([1]);
+    },
+  );
+
+  it('keeps a TIGERweb 429 transient: retried, and retryable once its attempts run out', async () => {
+    failHost(TIGERWEB_HOST, '429');
+
+    const outcome = await settle(resolve('Seattle, WA'));
+
+    expect(outcome).toMatchObject({
+      error: {
+        message: 'TIGERweb answered HTTP 429 on all 4 attempts.',
+        data: {
+          reason: 'resolution_unavailable',
+          status: 429,
+          retryable: true,
+          recovery: {
+            hint: 'Retry the request; if it keeps failing, TIGERweb is temporarily unavailable.',
+          },
+        },
+      },
+    });
+    expect(attemptsAt(TIGERWEB_HOST)).toEqual([4]);
+  });
+
+  it.each([
+    [
+      'TIGERweb',
+      'an HTML page',
+      TIGERWEB_HOST,
+      'Seattle, WA',
+      'TIGERweb returned HTML instead of JSON.',
+    ],
+    [
+      'TIGERweb',
+      'a body that is not JSON',
+      TIGERWEB_HOST,
+      'Seattle, WA',
+      'TIGERweb response could not be parsed.',
+    ],
+    [
+      'the Census Geocoder',
+      'an HTML page',
+      GEOCODER_HOST,
+      '400 Broad St, Seattle, WA 98109',
+      'The Census Geocoder returned HTML instead of JSON.',
+    ],
+    [
+      'the Census Geocoder',
+      'a body that is not JSON',
+      GEOCODER_HOST,
+      '400 Broad St, Seattle, WA 98109',
+      'The Census Geocoder response could not be parsed.',
+    ],
+  ] as const)(
+    '%s answering %s on every attempt is resolution_unavailable',
+    async (_source, failure, host, name, said) => {
+      failHost(host, failure);
+
+      const outcome = await settle(resolve(name));
+
+      expect(outcome).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          message: expect.stringContaining(said),
+          data: { reason: 'resolution_unavailable' },
+        },
+      });
+      expect(attemptsAt(host)).toEqual([4]);
+    },
+  );
+
+  it('reaches both client surfaces with its recovery through census_resolve_geography', async () => {
+    failHost(GEOCODER_HOST, 'network error');
+
+    const outcome = await settle(
+      runToolContract(censusResolveGeography, { name: '400 Broad St, Seattle, WA 98109' }),
+    );
+    const result = (
+      outcome as {
+        value: {
+          isError?: boolean;
+          structuredContent?: unknown;
+          content: Array<{ type: string; text?: string }>;
+        };
+      }
+    ).value;
+
+    expect(result.isError).toBe(true);
+    const { error } = result.structuredContent as {
+      error: { message: string; data: { reason: string; recovery: { hint: string } } };
+    };
+    expect(error.data.reason).toBe('resolution_unavailable');
+    const text = result.content.map((c) => c.text ?? '').join('\n');
+    expect(text).toContain(error.message);
+    expect(text).toContain(`Recovery: ${error.data.recovery.hint}`);
+  });
+
+  it('keeps a caller cancellation a cancellation, not an unavailable upstream', async () => {
+    const controller = new AbortController();
+    const fetchStub = vi.mocked(globalThis.fetch);
+    fetchStub.mockImplementation((url, init) => {
+      requestedUrls.push(String(url));
+      controller.abort();
+      return hang(init);
+    });
+
+    const outcome = await settle(
+      getGeographyService().resolveGeography(
+        { name: 'Seattle, WA' },
+        createMockContext({ signal: controller.signal }),
+      ),
+    );
+
+    expect(outcome).toHaveProperty('error');
+    const error = (outcome as { error: { code: number; data?: Record<string, unknown> } }).error;
+    expect(error.code).toBe(JsonRpcErrorCode.RequestCancelled);
+    expect(error.data?.reason).toBeUndefined();
+    expect(attemptsAt(TIGERWEB_HOST)).toEqual([1]);
+  });
+
+  // A gateway timeout (504) answers a status, where a hang answers none.
+  it.each(['503', '504', 'timeout'] as const)(
+    'leaves the one-attempt subdivision check reporting a %s as unavailable',
+    async (failure) => {
+      route(COUNTY_LAYER, likeClause('PLYMOUTH', '25'), {
+        features: [countyRow('Plymouth', '25', '023')],
+      });
+      const fetchStub = vi.mocked(globalThis.fetch);
+      const answer = fetchStub.getMockImplementation();
+      fetchStub.mockImplementation((url, init) => {
+        if (!String(url).includes(SUBDIVISION_LAYER)) return answer!(url, init);
+        requestedUrls.push(String(url));
+        return fail(failure, init);
+      });
+
+      const outcome = await settle(resolve('Plymouth, MA'));
+
+      expect(outcome).toMatchObject({
+        value: { geographyType: 'county', fipsSummary: '023', namesakes: { kind: 'unavailable' } },
+      });
+      expect(requestedLayers().filter((layer) => layer === SUBDIVISION_LAYER)).toHaveLength(1);
+    },
+  );
+
+  // The check is advisory: the county is already the answer, so even a refusal only leaves the
+  // notice unchecked rather than failing a resolution that needs no subdivision request.
+  it.each(['403', '404', '429'] as const)(
+    'keeps the answer when TIGERweb refuses the subdivision check with a %s',
+    async (failure) => {
+      route(COUNTY_LAYER, likeClause('PLYMOUTH', '25'), {
+        features: [countyRow('Plymouth', '25', '023')],
+      });
+      const fetchStub = vi.mocked(globalThis.fetch);
+      const answer = fetchStub.getMockImplementation();
+      fetchStub.mockImplementation((url, init) => {
+        if (!String(url).includes(SUBDIVISION_LAYER)) return answer!(url, init);
+        requestedUrls.push(String(url));
+        return fail(failure, init);
+      });
+
+      const outcome = await settle(resolve('Plymouth, MA'));
+
+      expect(outcome).toMatchObject({
+        value: { geographyType: 'county', fipsSummary: '023', namesakes: { kind: 'unavailable' } },
+      });
+      expect(requestedLayers().filter((layer) => layer === SUBDIVISION_LAYER)).toHaveLength(1);
+    },
+  );
+
+  it('answers an address the Census Geocoder rejects as too long with its stated reason, unretried', async () => {
+    const fetchStub = vi.mocked(globalThis.fetch);
+    fetchStub.mockImplementation((url) => {
+      requestedUrls.push(String(url));
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            errors: ['Address cannot be empty and cannot exceed 100 characters'],
+            status: '400',
+          }),
+          { status: 400, headers: { 'content-type': 'application/json' } },
+        ),
+      );
+    });
+    const address = `1 ${'Long '.repeat(25)}St, Seattle, WA 98109`;
+
+    const outcome = await settle(resolve(address));
+
+    expect(outcome).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.ValidationError,
+        data: {
+          reason: 'address_rejected',
+          status: 400,
+          upstreamMessage: 'Address cannot be empty and cannot exceed 100 characters',
+          recovery: { hint: expect.stringContaining('shorter') },
+        },
+      },
+    });
+    expect(attemptsAt(GEOCODER_HOST)).toEqual([1]);
+  });
+
+  // resolution_unavailable is declared under ServiceUnavailable: a TIGERweb 404 is an unavailable
+  // service, never the NotFound that no_match carries.
+  it.each([
+    ['403', TIGERWEB_HOST, 'Seattle, WA'],
+    ['404', TIGERWEB_HOST, 'Seattle, WA'],
+    ['429', TIGERWEB_HOST, 'Seattle, WA'],
+    ['404', GEOCODER_HOST, '400 Broad St, Seattle, WA 98109'],
+  ] as const)(
+    'carries the declared ServiceUnavailable code for a %s from %s',
+    async (failure, host, name) => {
+      failHost(host, failure);
+
+      const outcome = await settle(resolve(name));
+
+      expect(outcome).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          data: { reason: 'resolution_unavailable', status: Number(failure) },
+        },
+      });
+    },
+  );
+
+  describe('one 50-second budget across every request a resolution chains', () => {
+    const BUDGET_MS = 50_000;
+
+    beforeEach(() => {
+      // Backoffs without jitter — 1 s, 2 s, 4 s — so a scripted chain lands where it is placed.
+      vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    });
+
+    afterEach(() => {
+      vi.mocked(Math.random).mockRestore();
+    });
+
+    /**
+     * Advance fake time by `ms` and report how `pending` settled within it — `undefined` while it
+     * is still running.
+     */
+    const within = async <T>(ms: number, pending: Promise<T>) => {
+      let outcome: { value: T } | { error: unknown } | undefined;
+      pending.then(
+        (value) => {
+          outcome = { value };
+        },
+        (error: unknown) => {
+          outcome = { error };
+        },
+      );
+      await vi.advanceTimersByTimeAsync(ms);
+      return outcome;
+    };
+
+    /** An answer whose body never ends: its stream errors only when the request's signal aborts. */
+    const stalledBody = (init?: RequestInit) =>
+      Promise.resolve(
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              init?.signal?.addEventListener('abort', () => controller.error(init.signal?.reason), {
+                once: true,
+              });
+            },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      );
+
+    /**
+     * Stall the first `hung(url)` attempts of each request — before its headers, or partway
+     * through its body — so each settles only when its signal aborts, and answer every later
+     * attempt from the suite's routes.
+     */
+    const hangFirstAttempts = (
+      hung: (url: string) => number,
+      stage: 'headers' | 'body' = 'headers',
+    ) => {
+      const fetchStub = vi.mocked(globalThis.fetch);
+      const answer = fetchStub.getMockImplementation();
+      const attempts = new Map<string, number>();
+      fetchStub.mockImplementation((url, init) => {
+        const attempt = (attempts.get(String(url)) ?? 0) + 1;
+        attempts.set(String(url), attempt);
+        if (attempt > hung(String(url))) return answer!(url, init);
+        requestedUrls.push(String(url));
+        return stage === 'headers' ? hang(init) : stalledBody(init);
+      });
+    };
+
+    it.each(['headers', 'body'] as const)(
+      'ends a TIGERweb answering only on its last retry, mid-chain, as resolution_unavailable — attempts stalled in their %s',
+      async (stage) => {
+        /**
+         * Place → county → county subdivision: each level answers after three stalled attempts,
+         * about 37 s, so the place level answers and the county level is still retrying when the
+         * budget runs out.
+         */
+        hangFirstAttempts(() => 3, stage);
+
+        const outcome = await within(BUDGET_MS, resolve('Nowhere, MA'));
+
+        expect(outcome).toMatchObject({
+          error: {
+            code: JsonRpcErrorCode.ServiceUnavailable,
+            message: "TIGERweb did not finish answering within the call's 50 s upstream budget.",
+            data: {
+              reason: 'resolution_unavailable',
+              retryable: true,
+              deadlineMs: BUDGET_MS,
+              callDeadlineExceeded: true,
+              recovery: {
+                hint: 'Retry the request; if it keeps failing, TIGERweb is temporarily unavailable.',
+              },
+            },
+          },
+        });
+        expect(new Set(requestedLayers())).toEqual(
+          new Set([INCORPORATED_LAYER, CDP_LAYER, COUNTY_LAYER]),
+        );
+        // Nothing the call started outlives it: no attempt still in flight, no backoff still armed.
+        expect(vi.getTimerCount()).toBe(0);
+      },
+    );
+
+    it('ends a hung Census Geocoder as resolution_unavailable inside the budget, on both client surfaces', async () => {
+      failHost(GEOCODER_HOST, 'timeout');
+
+      const outcome = await within(
+        BUDGET_MS,
+        runToolContract(censusResolveGeography, { name: '400 Broad St, Seattle, WA 98109' }),
+      );
+
+      expect(outcome).toMatchObject({ value: { isError: true } });
+      const result = (
+        outcome as {
+          value: { structuredContent?: unknown; content: Array<{ type: string; text?: string }> };
+        }
+      ).value;
+      const { error } = result.structuredContent as {
+        error: { message: string; data: { recovery: { hint: string } } };
+      };
+      expect(error).toMatchObject({
+        message:
+          "The Census Geocoder did not finish answering within the call's 50 s upstream budget.",
+        data: {
+          reason: 'resolution_unavailable',
+          retryable: true,
+          callDeadlineExceeded: true,
+          recovery: {
+            hint: 'Retry the request; if it keeps failing, the Census Geocoder is temporarily unavailable.',
+          },
+        },
+      });
+      const text = result.content.map((c) => c.text ?? '').join('\n');
+      expect(text).toContain(error.message);
+      expect(text).toContain(`Recovery: ${error.data.recovery.hint}`);
+      // Three 15-second attempts and their backoffs fit; a fourth could not finish inside it.
+      expect(attemptsAt(GEOCODER_HOST)).toEqual([3]);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('answers with the county and the check unavailable when the namesake check meets the end of the budget', async () => {
+      route(COUNTY_LAYER, likeClause('PLYMOUTH', '25'), {
+        features: [countyRow('Plymouth', '25', '023')],
+      });
+      /**
+       * The place level answers after three hung attempts (37 s) and the county level after one
+       * (48 s), leaving the check 2 s of a request that never answers.
+       */
+      hangFirstAttempts((url) =>
+        url.includes(SUBDIVISION_LAYER)
+          ? Number.POSITIVE_INFINITY
+          : url.includes(COUNTY_LAYER)
+            ? 1
+            : 3,
+      );
+
+      const outcome = await within(BUDGET_MS, resolve('Plymouth, MA'));
+
+      expect(outcome).toMatchObject({
+        value: { geographyType: 'county', fipsSummary: '023', namesakes: { kind: 'unavailable' } },
+      });
+      expect(requestedLayers().filter((layer) => layer === SUBDIVISION_LAYER)).toHaveLength(1);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('sends no namesake request once the budget is spent, and still answers with the county', async () => {
+      route(COUNTY_LAYER, likeClause('PLYMOUTH', '25'), {
+        features: [countyRow('Plymouth', '25', '023')],
+      });
+      const fetchStub = vi.mocked(globalThis.fetch);
+      const answer = fetchStub.getMockImplementation();
+      fetchStub.mockImplementation((url, init) => {
+        // The county answer arrives just as the budget runs out.
+        if (String(url).includes(COUNTY_LAYER)) vi.setSystemTime(Date.now() + BUDGET_MS);
+        return answer!(url, init);
+      });
+
+      const outcome = await within(0, resolve('Plymouth, MA'));
+
+      expect(outcome).toMatchObject({
+        value: { geographyType: 'county', fipsSummary: '023', namesakes: { kind: 'unavailable' } },
+      });
+      expect(requestedLayers()).not.toContain(SUBDIVISION_LAYER);
+    });
+
+    it('keeps a cancellation that lands as the budget runs out a cancellation', async () => {
+      const controller = new AbortController();
+      const fetchStub = vi.mocked(globalThis.fetch);
+      const answer = fetchStub.getMockImplementation();
+      fetchStub.mockImplementation((url, init) => {
+        // A request sent on a cancelled signal fails, as fetch fails it.
+        if (init?.signal?.aborted) return Promise.reject(init.signal.reason);
+        // The county level answers just as the budget runs out, and the caller cancels with it.
+        if (String(url).includes(COUNTY_LAYER)) {
+          vi.setSystemTime(Date.now() + BUDGET_MS);
+          controller.abort();
+        }
+        return answer!(url, init);
+      });
+
+      const outcome = await within(
+        0,
+        getGeographyService().resolveGeography(
+          { name: 'Nowhere, MA' },
+          createMockContext({ signal: controller.signal }),
+        ),
+      );
+
+      expect(outcome).toMatchObject({ error: { code: JsonRpcErrorCode.RequestCancelled } });
+      expect(
+        (outcome as { error: { data?: Record<string, unknown> } }).error.data?.reason,
+      ).toBeUndefined();
+    });
+
+    it('keeps a cancellation mid-chain a cancellation, with no later level asked and no budget waited out', async () => {
+      const controller = new AbortController();
+      const fetchStub = vi.mocked(globalThis.fetch);
+      const answer = fetchStub.getMockImplementation();
+      fetchStub.mockImplementation((url, init) => {
+        if (!String(url).includes(COUNTY_LAYER)) return answer!(url, init);
+        requestedUrls.push(String(url));
+        controller.abort();
+        return hang(init);
+      });
+
+      const outcome = await within(
+        0,
+        getGeographyService().resolveGeography(
+          { name: 'Nowhere, MA' },
+          createMockContext({ signal: controller.signal }),
+        ),
+      );
+
+      expect(outcome).toMatchObject({ error: { code: JsonRpcErrorCode.RequestCancelled } });
+      expect(
+        (outcome as { error: { data?: Record<string, unknown> } }).error.data?.reason,
+      ).toBeUndefined();
+      expect(requestedLayers()).toEqual([INCORPORATED_LAYER, CDP_LAYER, COUNTY_LAYER]);
+      expect(vi.getTimerCount()).toBe(0);
+    });
   });
 });

@@ -6,7 +6,7 @@
 import type { Context } from '@cyanheads/mcp-ts-core';
 import { McpError, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import { type RetryAttempt, type RetryOptions, withRetry } from '@cyanheads/mcp-ts-core/utils';
-import { censusDeadlineError } from './errors.js';
+import { censusDeadlineError, GROUP_DEADLINE_HINT } from './errors.js';
 
 const CALL_DEADLINE_MS = 50_000;
 
@@ -28,6 +28,8 @@ type Scope = {
   dataset: string;
   year: number;
   variables?: readonly string[];
+  /** A table the data query requested whole; asking for less of it is not fewer variables. */
+  group?: { readonly id: string };
   reason?: 'variables_unavailable';
 };
 
@@ -52,7 +54,9 @@ function callDeadlineError(
       elapsedMs: Date.now() - budget.startedAtMs,
       callDeadlineExceeded: true,
       recovery: {
-        hint: 'Retry the request once. If it persists, the Census API is temporarily unavailable; request a narrower geography or fewer variables per call.',
+        hint: scope.group
+          ? GROUP_DEADLINE_HINT
+          : 'Retry the request once. If it persists, the Census API is temporarily unavailable; request a narrower geography or fewer variables per call.',
       },
     },
     cause === undefined ? undefined : { cause },

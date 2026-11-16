@@ -13,6 +13,7 @@
 export const GEOGRAPHY_TYPES = [
   'state',
   'county',
+  'county subdivision',
   'place',
   'tract',
   'metropolitan statistical area/micropolitan statistical area',
@@ -24,6 +25,24 @@ export const GEOGRAPHY_TYPES = [
 
 /** Census geography level a name can resolve to — one or more TIGERweb layers each. */
 export type GeographyType = (typeof GEOGRAPHY_TYPES)[number];
+
+/** A county subdivision with its own government (TIGERweb `FUNCSTAT` `A`) named exactly as asked. */
+export interface NamesakeSubdivision {
+  /** 3-digit county FIPS code the subdivision lies in. */
+  countyFips: string;
+  /** 5-digit county subdivision FIPS code. */
+  countySubdivisionFips: string;
+  /** TIGERweb name — "Plymouth town", "Lake charter township". */
+  name: string;
+}
+
+/**
+ * What the check for a same-named governing county subdivision found, beside a county or CDP
+ * answer: the subdivisions, or that TIGERweb could not answer the check.
+ */
+export type NamesakeCheck =
+  | { kind: 'found'; subdivisions: NamesakeSubdivision[] }
+  | { kind: 'unavailable' };
 
 /** Resolved geography with FIPS identifiers. */
 export interface ResolvedGeography {
@@ -42,12 +61,28 @@ export interface ResolvedGeography {
   censusDesignatedPlace?: true;
   /** 3-digit county FIPS code (when applicable). */
   countyFips?: string;
+  /**
+   * 5-digit county subdivision FIPS code — the resolved subdivision itself, or for a street address
+   * the subdivision it sits in.
+   */
+  countySubdivisionFips?: string;
   /** Pre-formatted FIPS value ready to pass as geography_fips to census_query_data. */
   fipsSummary: string;
   /** Geography level the name resolved to. */
   geographyType: GeographyType;
+  /**
+   * The county is one of Connecticut's eight counties before 2022 (001–015), answered from a fixed
+   * table — current TIGERweb holds only the planning regions that replaced them.
+   */
+  legacyCounty?: true;
   /** Canonical name of the resolved geography. */
   name: string;
+  /**
+   * Governing county subdivisions named exactly the input, checked beside a county answer
+   * auto-detected in one of the twelve states where they are governments, or a CDP answer at the
+   * place level there. Absent when the check did not run or found none.
+   */
+  namesakes?: NamesakeCheck;
   /**
    * 5-digit place FIPS code — the resolved place itself, or for a street address the
    * incorporated place it sits in.
@@ -76,6 +111,10 @@ export interface TigerwebFeature {
     TRACT?: string;
     /** Consolidated city code — 5 digits, scoped to its state. */
     CONCITY?: string;
+    /** County subdivision code — 5 digits, scoped to its state. */
+    COUSUB?: string;
+    /** Functional status — `A` is an active general-purpose government, `G` a subordinate one. */
+    FUNCSTAT?: string;
     /** Nationally unique code on the CBSA and CSA layers — 5 digits for a CBSA, 3 for a CSA. */
     GEOID?: string;
     [key: string]: string | number | undefined;
@@ -117,6 +156,8 @@ export interface GeocoderMatch {
     }>;
     /** Incorporated places carry STATE and PLACE (no COUNTY or TRACT). */
     'Incorporated Places'?: Array<{ STATE: string; PLACE: string; NAME?: string }>;
+    /** Layer 22 — the county subdivision (town, township, or CCD) the address sits in. */
+    'County Subdivisions'?: Array<{ STATE: string; COUNTY: string; COUSUB: string; NAME?: string }>;
   };
   matchedAddress: string;
 }

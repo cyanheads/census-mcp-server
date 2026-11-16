@@ -7,6 +7,7 @@
 import { McpError, serviceUnavailable, unauthorized } from '@cyanheads/mcp-ts-core/errors';
 import { fetchWithTimeout, type RequestContext } from '@cyanheads/mcp-ts-core/utils';
 import { getDiscoveryConfig, getServerConfig } from '@/config/server-config.js';
+import type { CensusGroup } from '@/services/variable-cache/types.js';
 import {
   DATASET_AVAILABLE_YEARS,
   describeSiblingHolders,
@@ -123,6 +124,8 @@ export interface QueryColumns {
   defaultLabelColumns?: Record<string, string>;
   /** Flag column per measure, keyed by the measure's code (e.g. `{ RCPTOT: 'RCPTOT_F' }`). */
   flagColumns?: Record<string, string>;
+  /** A table requested whole, sent as one `group(<ID>)` item that returns all its columns. */
+  group?: CensusGroup;
   /** Label column per record dimension, keyed by dimension code; both are requested. */
   recordColumns?: Record<string, string>;
   /** The caller's variable codes. */
@@ -131,23 +134,63 @@ export interface QueryColumns {
   wildcardColumns?: WildcardColumn[];
 }
 
+/** The `get=` item that requests a whole table — the Census API matches the ID's case exactly. */
+function groupToken(group: CensusGroup): string {
+  return `group(${group.id})`;
+}
+
+/**
+ * The caller's codes a request names one by one: every one, less those a requested table already
+ * returns. The Census API answers such a code twice when it is also named, and naming it would
+ * spend a column of the limit on nothing.
+ */
+export function codesSentFor(columns: Pick<QueryColumns, 'group' | 'variables'>): string[] {
+  if (!columns.group) return columns.variables;
+  const returned = new Set(columns.group.columns);
+  return columns.variables.filter((code) => !returned.has(code));
+}
+
+/**
+ * The codes each row is keyed by, in order: the caller's, then each column of a requested table
+ * they do not already name, in the table's line order (`CensusGroup.columns`). A table's
+ * annotation columns — a code plus `A` (`B01001_001EA`, `P1_001NA`), whose sentinels the decoded
+ * value already explains — and the `GEO_ID` and `NAME` every table carries are left out unless
+ * the caller names them; every other column stays, the comparison profiles' significance columns
+ * (`CP03_2024to2019_062SS`) and the ACS margins of error included. `variable_labels` is built from
+ * the same list, so the rows and the map cover the same columns.
+ */
+export function rowCodesFor(columns: Pick<QueryColumns, 'group' | 'variables'>): string[] {
+  if (!columns.group) return columns.variables;
+  const returned = new Set(columns.group.columns);
+  const listed = new Set(columns.variables);
+  const annotation = (code: string) => code.endsWith('A') && returned.has(code.slice(0, -1));
+  return [
+    ...columns.variables,
+    ...columns.group.columns.filter(
+      (code) => !listed.has(code) && code !== 'GEO_ID' && code !== 'NAME' && !annotation(code),
+    ),
+  ];
+}
+
 /**
  * The `get=` list a query sends, in order. `queryData` builds its request from this and
  * `planQueryColumns` counts it, so the count cannot drift from what goes over the wire.
  *
  * Each column appears once. A caller can name a column the server adds anyway — `MONTH_DESC` on
  * `pep/charv`, a flag or label column — and sending it twice would spend a second slot of the
- * 50-column limit on nothing.
+ * 50-column limit on nothing. A requested table goes last as its `group(<ID>)` item, and a code it
+ * returns is not named again (`codesSentFor`).
  */
 export function getColumnsFor(columns: QueryColumns): string[] {
   return [
     ...new Set([
       'NAME',
-      ...columns.variables,
+      ...codesSentFor(columns),
       ...Object.values(columns.defaultLabelColumns ?? {}),
       ...Object.entries(columns.recordColumns ?? {}).flat(),
       ...(columns.wildcardColumns ?? []).flatMap((w) => (w.labelColumn ? [w.labelColumn] : [])),
       ...Object.values(columns.flagColumns ?? {}),
+      ...(columns.group ? [groupToken(columns.group)] : []),
     ]),
   ];
 }
@@ -183,12 +226,18 @@ export type ColumnPlan =
  * codes it can carry instead. Wildcard label columns and then flag columns are extras: they take
  * whatever room is left, in that order, and the ones that do not fit are named rather than sent.
  * Adding them never turns a query that fit into one the API rejects.
+ *
+ * A requested table's `group(<ID>)` item is not counted: the Census API returns every column of
+ * the table without charging any of them against the limit, so NAME and 49 codes still fit beside
+ * it.
  */
 export function planQueryColumns(columns: QueryColumns): ColumnPlan {
   const { wildcardColumns = [], flagColumns = {}, ...fixed } = columns;
-  const required = getColumnsFor(fixed);
+  const token = fixed.group && groupToken(fixed.group);
+  const counted = (list: QueryColumns) => getColumnsFor(list).filter((column) => column !== token);
+  const required = counted(fixed);
   if (required.length > GET_COLUMN_LIMIT) {
-    const addedColumns = getColumnsFor({ ...fixed, variables: [] });
+    const addedColumns = counted({ ...fixed, variables: [] });
     return {
       status: 'over_limit',
       columnCount: required.length,
@@ -238,17 +287,26 @@ export function planQueryColumns(columns: QueryColumns): ColumnPlan {
   };
 }
 
-/** Word a query that would exceed the column limit, naming the real per-call maximum and why. */
+/**
+ * Word a query that would exceed the column limit, naming the real per-call maximum and why.
+ * `requested` counts the codes the request names one by one (`codesSentFor`); beside a table
+ * (`group`), the codes it returns are not among them, and the wording says so.
+ */
 export function describeColumnLimit(
   requested: number,
   plan: { maxVariables: number; addedColumns: string[] },
+  group?: string,
 ): string {
   const added = plan.addedColumns.filter((column) => column !== 'NAME');
   const addedPart =
     added.length > 0
       ? `, plus the ${added.length} label and record column${added.length === 1 ? '' : 's'} added for this dataset (${added.join(', ')})`
       : '';
-  return `${requested} variable codes requested, but this query can carry at most ${plan.maxVariables}: the Census API accepts ${GET_COLUMN_LIMIT} columns per request, and every query also sends NAME${addedPart}.`;
+  const beside = group ? ` beside table ${group}` : '';
+  const uncounted = group
+    ? ' The table itself, and any code listed in variables that it returns, are not counted.'
+    : '';
+  return `${requested} variable codes requested${beside}, but this query can carry at most ${plan.maxVariables}: the Census API accepts ${GET_COLUMN_LIMIT} columns per request, and every query also sends NAME${addedPart}.${uncounted}`;
 }
 
 /**
@@ -326,13 +384,13 @@ export function observeRecordValues(
  * withheld, but carries no reason: that table is ACS's, and the other families withhold through
  * flag columns instead.
  */
-function readValue(rawValue: string | null, varCode: string, acs: boolean): CensusVariableValue {
+function readValue(rawValue: string | null, acs: boolean): CensusVariableValue {
   const text = rawValue?.trim() ?? '';
   const numValue = text === '' ? null : Number(text);
   const isNumber = numValue !== null && !Number.isNaN(numValue);
 
   if (acs && numValue === ACS_CONTROLLED_MOE) {
-    return { estimate: 0, label: varCode, suppressed: false };
+    return { estimate: 0, suppressed: false };
   }
 
   const suppressed = isNumber && numValue < -100_000_000;
@@ -340,7 +398,6 @@ function readValue(rawValue: string | null, varCode: string, acs: boolean): Cens
 
   return {
     estimate: suppressed || !isNumber ? null : numValue,
-    label: varCode,
     suppressed,
     ...(suppressionReason && { suppressionReason }),
     ...(!isNumber && text !== '' && { value: text }),
@@ -376,7 +433,6 @@ function applyFlag(
   }
   return {
     estimate: null,
-    label: value.label,
     suppressed: true,
     suppressionReason:
       known?.effect === 'ranges'
@@ -589,7 +645,7 @@ export class CensusApiService {
      * from applying one default to enumerating every category); both columns of each record
      * dimension (`MONTH`, `MONTH_DESC`), which name the record a row is without changing which
      * rows come back; the label column of each wildcarded dimension, whose code the API already
-     * echoes; and each measure's flag column.
+     * echoes; each measure's flag column; and `group(<ID>)` for a table requested whole.
      */
     const varList = getColumnsFor(params).join(',');
     const forClause = `${params.geographyLevel}:${params.geographyFips}`;
@@ -614,6 +670,7 @@ export class CensusApiService {
       dataset: params.dataset,
       year: params.year,
       variables: params.variables,
+      ...(params.group && { group: params.group.id }),
       geographyLevel: params.geographyLevel,
       geographyFips: params.geographyFips,
       predicates: predicateKeys,
@@ -993,17 +1050,21 @@ export class CensusApiService {
 
     // The Census API appends one column per geography level in the resolved hierarchy —
     // a county query returns state + county, a tract query state + county + tract. It also
-    // echoes back every predicate that was filtered on. Once every requested column and those
-    // echoed predicates are excluded, what remains is the geography hierarchy, and
-    // concatenating it in order composes the full GEOID.
+    // echoes back every predicate that was filtered on. Once every requested column, every column
+    // a requested table returns (its GEO_ID and NAME among them), and those echoed predicates are
+    // excluded, what remains is the geography hierarchy, and concatenating it in order composes
+    // the full GEOID.
     const nonGeoColumns = new Set([
       ...getColumnsFor(params),
+      ...(params.group?.columns ?? []),
       ...Object.keys(params.predicates ?? {}),
     ]);
     const geoColumnIdxs = headers.flatMap((header, idx) =>
       nonGeoColumns.has(header) ? [] : [idx],
     );
-    const variableIdxs = params.variables
+    // The caller's codes, then a requested table's columns.
+    const rowCodes = rowCodesFor(params);
+    const variableIdxs = rowCodes
       .map((code) => {
         const flagColumn = flagColumns[code];
         return [
@@ -1048,7 +1109,7 @@ export class CensusApiService {
       for (const [varCode, idx, flagIdx] of variableIdxs) {
         const rawValue = row[idx] ?? null;
         rawValues.set(varCode, rawValue);
-        const value = readValue(rawValue, varCode, acs);
+        const value = readValue(rawValue, acs);
         variables[varCode] = flagIdx >= 0 ? applyFlag(value, row[flagIdx]) : value;
       }
 
@@ -1056,7 +1117,7 @@ export class CensusApiService {
       // for that relationship — elsewhere an E-final code is just a code, so pairing two of
       // them would attach a margin of error to a value that has none.
       if (acs) {
-        for (const varCode of params.variables) {
+        for (const varCode of rowCodes) {
           if (!varCode.endsWith('E')) continue;
           const moeCode = `${varCode.slice(0, -1)}M`;
           const est = variables[varCode];

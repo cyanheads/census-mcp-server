@@ -200,6 +200,7 @@ describe('isAcsDataset', () => {
     'cbp',
     'ecnbasic',
     'nonemp',
+    'geoinfo',
   ])('treats %s as non-ACS', (dataset) => {
     expect(isAcsDataset(dataset)).toBe(false);
   });
@@ -715,6 +716,8 @@ describe('VariableCacheService.checkPredicates', () => {
     );
 
     expect(check.unset.map((p) => p.code)).toEqual(['LFO']);
+    // A supplied dimension is still one the dataset declares (#92).
+    expect(check.filterDimensions).toEqual(['LFO', 'NAICS2017']);
   });
 
   it('never reports GEOCOMP — every dataset declares it and its default is the whole geography', async () => {
@@ -726,6 +729,7 @@ describe('VariableCacheService.checkPredicates', () => {
     );
 
     expect(check.unset.map((p) => p.code)).not.toContain('GEOCOMP');
+    expect(check.filterDimensions).not.toContain('GEOCOMP');
   });
 
   it('leaves an ACS query with nothing to report — GEOCOMP is its only required entry', async () => {
@@ -737,6 +741,7 @@ describe('VariableCacheService.checkPredicates', () => {
     );
 
     expect(check.unset).toEqual([]);
+    expect(check.filterDimensions).toEqual([]);
   });
 
   it('reports pep/charv demographic dimensions, which default to an all-persons total', async () => {
@@ -1586,18 +1591,19 @@ describe('censusHttpError', () => {
  * `year` to a different vintage, so the defaults are pinned rather than recomputed by the test.
  */
 describe('dataset registries derived from DATASET_AVAILABLE_YEARS', () => {
-  it('defaults each dataset to the same vintage it always has', () => {
+  /** #91: the 2025 ACS 1-year vintages and nonemp 2024; #92: geoinfo's newest vintage. */
+  it('defaults each dataset to its newest published vintage', () => {
     expect(DATASET_LATEST_YEARS).toEqual({
       'acs/acs5': 2024,
       'acs/acs5/profile': 2024,
       'acs/acs5/subject': 2024,
-      'acs/acs1': 2024,
-      'acs/acs1/profile': 2024,
-      'acs/acs1/subject': 2024,
+      'acs/acs1': 2025,
+      'acs/acs1/profile': 2025,
+      'acs/acs1/subject': 2025,
       'acs/acs5/cprofile': 2024,
-      'acs/acs1/cprofile': 2024,
-      'acs/acsse': 2024,
-      'acs/acs1/spp': 2024,
+      'acs/acs1/cprofile': 2025,
+      'acs/acsse': 2025,
+      'acs/acs1/spp': 2025,
       'pep/charv': 2023,
       'dec/pl': 2020,
       'dec/dhc': 2020,
@@ -1607,7 +1613,8 @@ describe('dataset registries derived from DATASET_AVAILABLE_YEARS', () => {
       'dec/ddhcb': 2020,
       cbp: 2023,
       ecnbasic: 2022,
-      nonemp: 2023,
+      nonemp: 2024,
+      geoinfo: 2025,
     });
   });
 
@@ -1621,21 +1628,86 @@ describe('dataset registries derived from DATASET_AVAILABLE_YEARS', () => {
     ['dec/sdhc', [2020]],
     ['dec/ddhcb', [2020]],
     [
+      'acs/acs1',
+      [
+        2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019,
+        2021, 2022, 2023, 2024, 2025,
+      ],
+    ],
+    [
+      'acs/acs1/profile',
+      [
+        2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019,
+        2021, 2022, 2023, 2024, 2025,
+      ],
+    ],
+    [
       'acs/acs1/subject',
-      [2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024],
+      [2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024, 2025],
     ],
     ['acs/acs5/cprofile', [2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024]],
     [
       'acs/acs1/cprofile',
-      [2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024],
+      [2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024, 2025],
     ],
-    ['acs/acsse', [2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024]],
+    ['acs/acsse', [2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024, 2025]],
     [
       'acs/acs1/spp',
-      [2009, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024],
+      [2009, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024, 2025],
     ],
-  ])('serves %s for the vintages it can be queried for (#43, #52)', (dataset, years) => {
+    [
+      'nonemp',
+      [
+        1997, 1998, 1999, 2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2012, 2013, 2014, 2015,
+        2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024,
+      ],
+    ],
+    ['geoinfo', [2020, 2021, 2022, 2023, 2024, 2025]],
+  ])('serves %s for the vintages it can be queried for (#43, #52, #91, #92)', (dataset, years) => {
     expect(DATASET_AVAILABLE_YEARS[dataset]).toEqual(years);
+  });
+
+  /**
+   * Checked against api.census.gov/data/<year>.json on 2026-11-15: these vintages are published and
+   * answer the query shape every call here sends.
+   */
+  it.each([
+    ['acs/acs1', 2025],
+    ['acs/acs1/profile', 2025],
+    ['acs/acs1/subject', 2025],
+    ['acs/acs1/cprofile', 2025],
+    ['acs/acsse', 2025],
+    ['acs/acs1/spp', 2025],
+    ['nonemp', 2024],
+    ['geoinfo', 2020],
+    ['geoinfo', 2025],
+  ])('asks the Census API for %s %i (#91, #92)', async (dataset, year) => {
+    await service.checkPredicates({ dataset, year, supplied: [] }, createMockContext());
+
+    expect(requestedUrls).toEqual([
+      `https://api.census.gov/data/${year}/${dataset}/variables.json`,
+    ]);
+  });
+
+  /** Unpublished as of 2026-11-15 — `variables.json` answers 404 for each. */
+  it.each([
+    ['nonemp', 2025],
+    ['acs/acs5', 2025],
+    ['acs/acs5/profile', 2025],
+    ['acs/acs5/subject', 2025],
+    ['acs/acs5/cprofile', 2025],
+    ['cbp', 2024],
+    ['pep/charv', 2024],
+    ['geoinfo', 2019],
+    ['geoinfo', 2026],
+  ])('refuses %s %i before any request (#91, #92)', async (dataset, year) => {
+    await expect(
+      service.checkPredicates({ dataset, year, supplied: [] }, createMockContext()),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'year_not_available', dataset, year },
+    });
+    expect(requestedUrls).toEqual([]);
   });
 
   it('refuses the unreleased 2020 ACS1 subject tables before any request (#43)', async () => {
@@ -1812,9 +1884,12 @@ describe('record-row notices over a wildcarded dimension', () => {
     code: String(1000 + i),
     label: `Industry ${i}`,
   }));
+  /** The filter dimensions each dataset declares. */
+  const cbpDimensions = ['EMPSZES', 'LFO', 'NAICS2017'];
+  const charvDimensions = ['AGE', 'HISP', 'POPGROUP', 'SEX', 'YEAR'];
 
   it('describeRecordRows names the dimension and a bounded sample of its values', () => {
-    const text = describeRecordRows('cbp', 2023, 1552, { NAICS2017: naics });
+    const text = describeRecordRows('cbp', 2023, 1552, { NAICS2017: naics }, [], cbpDimensions);
 
     expect(text).toContain('NAICS2017');
     expect(text).toContain('"1000" (Industry 0)');
@@ -1824,7 +1899,7 @@ describe('record-row notices over a wildcarded dimension', () => {
   });
 
   it('describeAmbiguousRows names the dimension to pin the same way', () => {
-    const text = describeAmbiguousRows({ NAICS2017: naics });
+    const text = describeAmbiguousRows({ NAICS2017: naics }, cbpDimensions);
 
     expect(text).toContain('NAICS2017');
     expect(text).toContain('1,542 more');
@@ -1836,18 +1911,74 @@ describe('record-row notices over a wildcarded dimension', () => {
   });
 
   it('describeAmbiguousRows keeps only the steps when nothing in the response separates the rows', () => {
-    expect(describeAmbiguousRows({})).toBe(
+    expect(describeAmbiguousRows({}, cbpDimensions)).toBe(
       "Set the dataset's filter dimensions explicitly in predicates — census_list_predicate_values enumerates the codes each one accepts — or query one geography at a time with census_query_data.",
     );
   });
 
-  it('lists every value when there are only a few', () => {
-    const text = describeRecordRows('pep/charv', 2023, 2, {
+  /**
+   * geoinfo declares no filter dimension, and its 2020 vintage publishes a ZCTA once per
+   * delineation, so pointing at filter dimensions sends the caller to a dead end (#92).
+   */
+  it('describeAmbiguousRows names GEO_ID when the dataset declares no filter dimension', () => {
+    const text = describeAmbiguousRows({}, []);
+
+    expect(text).toBe(
+      'Only GEO_ID tells the rows apart, and no predicate picks one per geography. Query one geography at a time with census_query_data, adding GEO_ID to variables to label its rows and a GEO_ID predicate to pin one, or compare a vintage that publishes one row per geography.',
+    );
+    expect(text).not.toMatch(/filter dimension/);
+    expect(text).not.toContain('census_list_predicate_values');
+  });
+
+  it('describeRecordRows names GEO_ID when the dataset declares no filter dimension', () => {
+    const text = describeRecordRows('geoinfo', 2020, 2, {}, [], []);
+
+    expect(text).toBe(
+      'geoinfo (2020) returned 2 rows for a single geography, and only GEO_ID tells them apart: each is a separate record of it, and the dataset declares no dimension to pick one by. GEO_ID among the variables labels each row; pin the one you want with predicates {"GEO_ID": "<its GEO_ID>"}.',
+    );
+    expect(text).not.toMatch(/filter dimension/);
+    expect(text).not.toContain('census_list_predicate_values');
+  });
+
+  it('describeRecordRows keeps the filter-dimension steps on a dataset that declares one', () => {
+    expect(describeRecordRows('cbp', 2023, 2, {}, [], cbpDimensions)).toBe(
+      "cbp (2023) returned 2 rows for a single geography and nothing in the response separates them. Set the dataset's filter dimensions explicitly in predicates to pin one — census_list_predicate_values enumerates the codes each one accepts.",
+    );
+  });
+
+  /** A record column or a "*" breakdown explains the rows whatever the dataset declares. */
+  it('describeRecordRows and describeAmbiguousRows name an observed record column, with or without filter dimensions', () => {
+    const month = {
       MONTH: [
         { code: '4', label: 'April' },
         { code: '7', label: 'July' },
       ],
-    });
+    };
+    for (const dimensions of [[], charvDimensions]) {
+      expect(describeRecordRows('pep/charv', 2023, 2, month, [], dimensions)).toContain(
+        'MONTH separates them',
+      );
+      expect(describeAmbiguousRows(month, dimensions)).toMatch(/^Add the record you want/);
+      expect(
+        describeRecordRows('cbp', 2023, 1552, { NAICS2017: naics }, ['NAICS2017'], dimensions),
+      ).toContain('one row per category of NAICS2017');
+    }
+  });
+
+  it('lists every value when there are only a few', () => {
+    const text = describeRecordRows(
+      'pep/charv',
+      2023,
+      2,
+      {
+        MONTH: [
+          { code: '4', label: 'April' },
+          { code: '7', label: 'July' },
+        ],
+      },
+      [],
+      charvDimensions,
+    );
 
     expect(text).toContain('"4" (April) and "7" (July)');
     expect(text).not.toContain('more');
@@ -1859,7 +1990,14 @@ describe('record-row notices over a wildcarded dimension', () => {
    * the notice says the rows are its categories rather than telling the caller to pick one.
    */
   it('describeRecordRows words a wildcarded dimension as the breakdown predicates asked for', () => {
-    const text = describeRecordRows('cbp', 2023, 1552, { NAICS2017: naics }, ['NAICS2017']);
+    const text = describeRecordRows(
+      'cbp',
+      2023,
+      1552,
+      { NAICS2017: naics },
+      ['NAICS2017'],
+      cbpDimensions,
+    );
 
     expect(text).toContain('one row per category of NAICS2017');
     expect(text).toContain('predicates set it to "*"');
@@ -1875,9 +2013,10 @@ describe('record-row notices over a wildcarded dimension', () => {
   it('groups the thousands of a per-geography row count', () => {
     const split = { NAICS2017: naics };
     for (const text of [
-      describeRecordRows('cbp', 2023, 1552, split, ['NAICS2017']),
-      describeRecordRows('cbp', 2023, 1552, split),
-      describeRecordRows('cbp', 2023, 1552, {}),
+      describeRecordRows('cbp', 2023, 1552, split, ['NAICS2017'], cbpDimensions),
+      describeRecordRows('cbp', 2023, 1552, split, [], cbpDimensions),
+      describeRecordRows('cbp', 2023, 1552, {}, [], cbpDimensions),
+      describeRecordRows('geoinfo', 2020, 1552, {}, [], []),
     ]) {
       expect(text).toContain('1,552 rows');
       expect(text).not.toContain('1552');
@@ -1900,6 +2039,7 @@ describe('record-row notices over a wildcarded dimension', () => {
         ],
       },
       ['SEX'],
+      charvDimensions,
     );
 
     expect(text).toContain('one row per category of SEX');
@@ -4153,5 +4293,173 @@ describe('VariableCacheService.searchVariables — how many results the code mat
       codeMatches: 6,
     });
     await expect(search('income', 'acs/acs5')).resolves.toMatchObject({ codeMatches: 0 });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// #88 — a table requested whole
+// ---------------------------------------------------------------------------------------------
+
+describe('VariableCacheService.resolveGroup (#88)', () => {
+  /**
+   * A slice of acs/acs5 2024 variables.json in the file's own unsorted order. `GEO_ID` is filed
+   * under every table, `NAME` is its attribute, and `B01001A` shares `B01001` as a prefix only.
+   * The M codes are absent, as the file leaves them out; each is an attribute of its estimate.
+   */
+  const acsGroupsJson = {
+    variables: {
+      B01001_002E: {
+        label: 'Estimate!!Total:!!Male:',
+        concept: 'Sex by Age',
+        predicateType: 'int',
+        group: 'B01001',
+        attributes: 'B01001_002EA,B01001_002M,B01001_002MA',
+      },
+      GEO_ID: {
+        label: 'Geography',
+        predicateType: 'string',
+        group: 'B19013,B01001,B01001A',
+        attributes: 'NAME',
+      },
+      B01001A_001E: {
+        label: 'Estimate!!Total:',
+        concept: 'Sex by Age (White Alone)',
+        predicateType: 'int',
+        group: 'B01001A',
+        attributes: 'B01001A_001EA,B01001A_001M,B01001A_001MA',
+      },
+      B01001_001E: {
+        label: 'Estimate!!Total:',
+        concept: 'Sex by Age',
+        predicateType: 'int',
+        group: 'B01001',
+        attributes: 'B01001_001EA,B01001_001M,B01001_001MA',
+      },
+      STATE: { label: 'Geography', predicateType: 'string', group: 'N/A' },
+      for: { label: 'Census API FIPS', group: 'N/A' },
+    },
+  };
+
+  const notHeld = () =>
+    new Response(TOMCAT_404, { status: 404, headers: { 'content-type': 'text/html' } });
+
+  const resolve = (id: string, dataset = 'acs/acs5', year = 2024) =>
+    service.resolveGroup(id, dataset, year, createMockContext());
+
+  it('lays the table out in line order, each column followed by its attributes', async () => {
+    serve({ '/data/2024/acs/acs5/variables.json': acsGroupsJson });
+
+    await expect(resolve('B01001')).resolves.toEqual({
+      id: 'B01001',
+      columns: [
+        'B01001_001E',
+        'B01001_001EA',
+        'B01001_001M',
+        'B01001_001MA',
+        'B01001_002E',
+        'B01001_002EA',
+        'B01001_002M',
+        'B01001_002MA',
+        'GEO_ID',
+        'NAME',
+      ],
+    });
+  });
+
+  it('matches the ID regardless of case and space, and returns the dataset spelling', async () => {
+    serve({ '/data/2024/acs/acs5/variables.json': acsGroupsJson });
+
+    await expect(resolve('  b01001a ')).resolves.toEqual({
+      id: 'B01001A',
+      columns: ['B01001A_001E', 'B01001A_001EA', 'B01001A_001M', 'B01001A_001MA', 'GEO_ID', 'NAME'],
+    });
+    // A second lookup reads the cached variables.json.
+    await resolve('B01001');
+    expect(requestedUrls).toHaveLength(1);
+  });
+
+  /** api.census.gov `group(CP03)` lays each 2019 line's significance column beside it. */
+  it('places a comparison-profile significance column after the line it annotates', async () => {
+    serve({
+      '/data/2024/acs/acs5/cprofile/variables.json': {
+        variables: {
+          CP03_2024_001E: {
+            label: 'Estimate!!2024',
+            predicateType: 'int',
+            group: 'CP03',
+            attributes: 'CP03_2024_001EA',
+          },
+          CP03_2019_001E: {
+            label: 'Estimate!!2019',
+            predicateType: 'int',
+            group: 'CP03',
+            attributes: 'CP03_2019_001EA,CP03_2024to2019_001SS',
+          },
+          GEO_ID: {
+            label: 'Geography',
+            predicateType: 'string',
+            group: 'CP03',
+            attributes: 'NAME',
+          },
+        },
+      },
+    });
+
+    await expect(resolve('cp03', 'acs/acs5/cprofile')).resolves.toEqual({
+      id: 'CP03',
+      columns: [
+        'CP03_2019_001E',
+        'CP03_2019_001EA',
+        'CP03_2024to2019_001SS',
+        'CP03_2024_001E',
+        'CP03_2024_001EA',
+        'GEO_ID',
+        'NAME',
+      ],
+    });
+  });
+
+  it('names the sibling dataset that publishes a table the dataset does not', async () => {
+    serve({
+      '/data/2024/acs/acs5/variables.json': acsGroupsJson,
+      '/data/2024/acs/acs5/subject/groups/S1701.json': { variables: {} },
+    });
+
+    const error = (await resolve('s1701').catch((e: unknown) => e)) as McpError;
+
+    expect(error).toBeInstanceOf(McpErrorClass);
+    expect(error.code).toBe(JsonRpcErrorCode.NotFound);
+    expect(error.message).toBe('Table S1701 not found in acs/acs5 (2024).');
+    expect(error.data).toMatchObject({
+      reason: 'variable_not_found',
+      group: 'S1701',
+      recovery: { hint: 'S1701 is in acs/acs5/subject — query that dataset instead.' },
+    });
+    expect(error.literals).toEqual(['acs/acs5/subject']);
+    expect(requestedUrls.map((url) => new URL(url).pathname)).toEqual([
+      '/data/2024/acs/acs5/variables.json',
+      '/data/2024/acs/acs5/subject/groups/S1701.json',
+    ]);
+  });
+
+  it.each([
+    ['an unknown table', 'B99999', ['/data/2024/acs/acs1/groups/B99999.json']],
+    ['the table-less N/A', 'n/a', []],
+  ])('fails %s as variable_not_found, pointing at search', async (_label, id, probes) => {
+    serve({
+      '/data/2024/acs/acs5/variables.json': acsGroupsJson,
+      '/data/2024/acs/acs1/groups/B99999.json': notHeld(),
+    });
+
+    const error = (await resolve(id).catch((e: unknown) => e)) as McpError;
+
+    expect(error.data).toMatchObject({
+      reason: 'variable_not_found',
+      group: id.toUpperCase(),
+      recovery: {
+        hint: "Call census_search_variables with words from the table's subject: a table ID is the part of a variable code before its underscore (B01001 for B01001_001E).",
+      },
+    });
+    expect(requestedUrls.map((url) => new URL(url).pathname).slice(1)).toEqual(probes);
   });
 });

@@ -10,6 +10,7 @@ import { censusQueryData } from '@/mcp-server/tools/definitions/census-query-dat
 import { yearNotAvailable } from '@/services/census-api/errors.js';
 import { DATASET_AVAILABLE_YEARS } from '@/services/variable-cache/variable-cache-service.js';
 import { readNotice } from '../helpers/markdown-readback.js';
+import { readVariableLabels } from '../helpers/variable-labels-readback.js';
 
 vi.mock('@/services/census-api/census-api-service.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/services/census-api/census-api-service.js')>()),
@@ -49,6 +50,10 @@ const failureOf = async (
   return run().catch((e: unknown) => e);
 };
 
+/** Every text block of a tool result's content[], joined. */
+const textOf = (result: { content: Array<{ type: string; text?: string }> }) =>
+  result.content.map((block) => block.text ?? '').join('\n');
+
 const mockQueryData = vi.fn();
 const mockCheckGeography = vi.fn();
 const mockLookupVariables = vi.fn();
@@ -56,6 +61,7 @@ const mockCheckPredicates = vi.fn();
 const mockGetRecordDimensions = vi.fn();
 const mockValidateYear = vi.fn();
 const mockResolveSpellings = vi.fn();
+const mockResolveGroup = vi.fn();
 
 beforeEach(async () => {
   vi.clearAllMocks();
@@ -78,6 +84,7 @@ beforeEach(async () => {
     getRecordDimensions: mockGetRecordDimensions,
     validateYear: mockValidateYear,
     resolveSpellings: mockResolveSpellings,
+    resolveGroup: mockResolveGroup,
   } as never);
 
   // Default: the dataset spells every code in uppercase, as every non-comparison-profile one does.
@@ -95,12 +102,12 @@ beforeEach(async () => {
   });
 
   // Default: the dataset declares no filter dimensions, so nothing is unset or unknown.
-  mockCheckPredicates.mockResolvedValue({ unset: [], unknown: [] });
+  mockCheckPredicates.mockResolvedValue({ filterDimensions: [], unset: [], unknown: [] });
 
   // Default: the dataset publishes one row per geography, so nothing separates records.
   mockGetRecordDimensions.mockResolvedValue([]);
 
-  // Default: the variable cache has no entry for any requested code, so labels fall back.
+  // Default: the variable cache has no entry for any requested code, so none has a label.
   mockLookupVariables.mockResolvedValue(new Map());
 });
 
@@ -191,7 +198,7 @@ describe('censusQueryData', () => {
           geographyFips: String(code).padStart(3, '0'),
           geographyGeoid: `53${String(code).padStart(3, '0')}`,
           variables: {
-            B01003_001E: { estimate: code * 100, label: 'Population', suppressed: false },
+            B01003_001E: { estimate: code * 100, suppressed: false },
           },
         })),
       );
@@ -236,7 +243,7 @@ describe('censusQueryData', () => {
         geographyFips: '033',
         geographyGeoid: '53033',
         variables: {
-          B19013_001E: { estimate: 105000, label: 'B19013_001E', suppressed: false },
+          B19013_001E: { estimate: 105000, suppressed: false },
         },
       },
     ]);
@@ -266,7 +273,7 @@ describe('censusQueryData', () => {
         geographyFips: '033',
         geographyGeoid: '53033',
         variables: {
-          B19013_001E: { estimate: 105000, label: 'B19013_001E', suppressed: false },
+          B19013_001E: { estimate: 105000, suppressed: false },
         },
       },
     ]);
@@ -293,7 +300,7 @@ describe('censusQueryData', () => {
         geographyFips: '06',
         geographyGeoid: '06',
         variables: {
-          B01001_001E: { estimate: 39000000, label: 'B01001_001E', suppressed: false },
+          B01001_001E: { estimate: 39000000, suppressed: false },
         },
       },
     ]);
@@ -347,7 +354,7 @@ describe('censusQueryData', () => {
         geographyFips: '000100',
         geographyGeoid: '53033000100',
         variables: {
-          B19013_001E: { estimate: 98000, label: 'B19013_001E', suppressed: false },
+          B19013_001E: { estimate: 98000, suppressed: false },
         },
       },
     ]);
@@ -375,7 +382,7 @@ describe('censusQueryData', () => {
         geographyFips: '033',
         geographyGeoid: '53033',
         variables: {
-          B19013_001E: { estimate: 105000, label: 'B19013_001E', suppressed: false },
+          B19013_001E: { estimate: 105000, suppressed: false },
         },
       },
     ]);
@@ -552,7 +559,7 @@ describe('censusQueryData', () => {
         geographyName: 'Block Group 2; Census Tract 71.01; King County; Washington',
         geographyFips: '2',
         geographyGeoid: '530330071012',
-        variables: { B19013_001E: { estimate: 136034, label: 'B19013_001E', suppressed: false } },
+        variables: { B19013_001E: { estimate: 136034, suppressed: false } },
       },
     ]);
 
@@ -583,7 +590,7 @@ describe('censusQueryData', () => {
         geographyName: 'King County, Washington',
         geographyFips: '033',
         geographyGeoid: '53033',
-        variables: { B19013_001E: { estimate: 1, label: 'B19013_001E', suppressed: false } },
+        variables: { B19013_001E: { estimate: 1, suppressed: false } },
       },
     ]);
 
@@ -806,7 +813,7 @@ describe('censusQueryData', () => {
         geographyFips: '033',
         geographyGeoid: '53033',
         variables: {
-          B19013_001E: { estimate: 105000, label: 'B19013_001E', suppressed: false },
+          B19013_001E: { estimate: 105000, suppressed: false },
         },
       },
     ]);
@@ -833,7 +840,6 @@ describe('censusQueryData', () => {
         variables: {
           B19013_001E: {
             estimate: null,
-            label: 'B19013_001E',
             suppressed: true,
             suppressionReason: 'Estimate not computable: too few sample observations',
           },
@@ -863,7 +869,7 @@ describe('censusQueryData', () => {
         geographyName: 'King County, Washington',
         geographyFips: '033',
         geographyGeoid: '53033',
-        variables: { ESTAB: { estimate: 577, label: 'ESTAB', suppressed: false } },
+        variables: { ESTAB: { estimate: 577, suppressed: false } },
       },
     ]);
 
@@ -894,7 +900,7 @@ describe('censusQueryData', () => {
         geographyName: 'California',
         geographyFips: '06',
         geographyGeoid: '06',
-        variables: { B01001_001E: { estimate: 39000000, label: 'B01001_001E', suppressed: false } },
+        variables: { B01001_001E: { estimate: 39000000, suppressed: false } },
       },
     ]);
 
@@ -927,7 +933,7 @@ describe('censusQueryData', () => {
         geographyName: 'King County, Washington',
         geographyFips: '033',
         geographyGeoid: '53033',
-        variables: { ESTAB: { estimate: 70376, label: 'ESTAB', suppressed: false } },
+        variables: { ESTAB: { estimate: 70376, suppressed: false } },
       },
     ]);
 
@@ -953,7 +959,7 @@ describe('censusQueryData', () => {
         geographyName: 'King County, Washington',
         geographyFips: '033',
         geographyGeoid: '53033',
-        variables: { ESTAB: { estimate: 577, label: 'ESTAB', suppressed: false } },
+        variables: { ESTAB: { estimate: 577, suppressed: false } },
       },
     ]);
 
@@ -1053,7 +1059,7 @@ describe('censusQueryData', () => {
         geographyName: 'Garland County, Arkansas',
         geographyFips: '051',
         geographyGeoid: '05051',
-        variables: { B19013_001E: { estimate: 55409, label: 'B19013_001E', suppressed: false } },
+        variables: { B19013_001E: { estimate: 55409, suppressed: false } },
       },
     ]);
 
@@ -1079,7 +1085,7 @@ describe('censusQueryData', () => {
         geographyName: 'Census Tract 1, Garland County, Arkansas',
         geographyFips: '000100',
         geographyGeoid: '05051000100',
-        variables: { B19013_001E: { estimate: 48000, label: 'B19013_001E', suppressed: false } },
+        variables: { B19013_001E: { estimate: 48000, suppressed: false } },
       },
     ]);
 
@@ -1105,7 +1111,7 @@ describe('censusQueryData', () => {
         geographyName: 'California',
         geographyFips: '06',
         geographyGeoid: '06',
-        variables: { B01001_001E: { estimate: 39000000, label: 'B01001_001E', suppressed: false } },
+        variables: { B01001_001E: { estimate: 39000000, suppressed: false } },
       },
     ]);
 
@@ -1132,7 +1138,7 @@ describe('censusQueryData', () => {
         geographyName: 'Block Group 1; Census Tract 9501; Adams County; Washington',
         geographyFips: '1',
         geographyGeoid: '5300195010011',
-        variables: { B01003_001E: { estimate: 832, label: 'B01003_001E', suppressed: false } },
+        variables: { B01003_001E: { estimate: 832, suppressed: false } },
       },
     ]);
 
@@ -1182,7 +1188,7 @@ describe('censusQueryData', () => {
         geographyName: 'Somewhere',
         geographyFips: '51',
         geographyGeoid: '0551',
-        variables: { B19013_001E: { estimate: 1, label: 'B19013_001E', suppressed: false } },
+        variables: { B19013_001E: { estimate: 1, suppressed: false } },
       },
     ]);
 
@@ -1231,7 +1237,7 @@ describe('censusQueryData', () => {
         geographyName: 'California',
         geographyFips: '06',
         geographyGeoid: '06',
-        variables: { T01001_001N: { estimate: 9653100, label: 'T01001_001N', suppressed: false } },
+        variables: { T01001_001N: { estimate: 9653100, suppressed: false } },
         appliedFilters: { POPGROUP: 'European alone' },
       },
     ]);
@@ -1263,7 +1269,7 @@ describe('censusQueryData', () => {
         geographyName: 'Washington',
         geographyFips: '53',
         geographyGeoid: '53',
-        variables: { POP: { estimate: 7705267, label: 'POP', suppressed: false } },
+        variables: { POP: { estimate: 7705267, suppressed: false } },
       },
     ]);
 
@@ -1281,13 +1287,14 @@ describe('censusQueryData', () => {
 
   it('format shows the applied filter defaults beside the value', () => {
     const output = {
+      variable_labels: { T01001_001N: 'Total population' },
       rows: [
         {
           geography_name: 'California',
           geography_fips: '06',
           geography_geoid: '06',
           variables: {
-            T01001_001N: { estimate: 9653100, label: 'Total population', suppressed: false },
+            T01001_001N: { estimate: 9653100, suppressed: false },
           },
           applied_filters: { POPGROUP: 'European alone' },
         },
@@ -1300,6 +1307,7 @@ describe('censusQueryData', () => {
 
   it('formats output with geography names, FIPS, and variable values', () => {
     const output = {
+      variable_labels: { B19013_001E: 'Median household income' },
       rows: [
         {
           geography_name: 'King County, Washington',
@@ -1308,7 +1316,6 @@ describe('censusQueryData', () => {
           variables: {
             B19013_001E: {
               estimate: 105000,
-              label: 'Median household income',
               suppressed: false,
             },
           },
@@ -1326,6 +1333,7 @@ describe('censusQueryData', () => {
 
   it('format shows suppressed label when estimate is suppressed', () => {
     const output = {
+      variable_labels: { B19013_001E: 'Median household income' },
       rows: [
         {
           geography_name: 'Tiny Town',
@@ -1334,7 +1342,6 @@ describe('censusQueryData', () => {
           variables: {
             B19013_001E: {
               estimate: null,
-              label: 'Median household income',
               suppressed: true,
               suppression_reason: 'Cannot be displayed: too few sample cases in this geography',
             },
@@ -1416,10 +1423,9 @@ describe('censusQueryData', () => {
         geographyFips: '033',
         geographyGeoid: '53033',
         variables: {
-          B19013_001E: { estimate: 122148, label: 'B19013_001E', suppressed: false },
+          B19013_001E: { estimate: 122148, suppressed: false },
           GEO_ID: {
             estimate: null,
-            label: 'GEO_ID',
             suppressed: false,
             value: '0500000US53033',
           },
@@ -1449,6 +1455,7 @@ describe('censusQueryData', () => {
 
   it('format renders a text value rather than the N/A a missing one gets', () => {
     const output = {
+      variable_labels: { GEO_ID: 'Geography', B19013_001M: 'Margin of error' },
       rows: [
         {
           geography_name: 'King County, Washington',
@@ -1457,11 +1464,10 @@ describe('censusQueryData', () => {
           variables: {
             GEO_ID: {
               estimate: null,
-              label: 'Geography',
               suppressed: false,
               value: '0500000US53033',
             },
-            B19013_001M: { estimate: null, label: 'Margin of error', suppressed: false },
+            B19013_001M: { estimate: null, suppressed: false },
           },
         },
       ],
@@ -1485,7 +1491,6 @@ describe('censusQueryData', () => {
           B19013_001E: {
             estimate: 75000,
             moe: 150,
-            label: 'Median income',
             suppressed: false,
           },
         },
@@ -1510,7 +1515,7 @@ describe('censusQueryData', () => {
         geographyFips: '01',
         geographyGeoid: '01',
         variables: {
-          B01001_001E: { estimate: 4900000, label: 'Total', suppressed: false },
+          B01001_001E: { estimate: 4900000, suppressed: false },
         },
       },
     ]);
@@ -1528,28 +1533,156 @@ describe('censusQueryData', () => {
     );
   });
 
-  it('falls back to the service label for a code the variable cache has no entry for', async () => {
+  /** A row used to label such a code with the code itself, a label that says nothing. */
+  it('gives a code the variable cache has no entry for no label at all', async () => {
     mockQueryData.mockResolvedValue([
       {
         geographyName: 'Oregon',
         geographyFips: '41',
         geographyGeoid: '41',
         variables: {
-          B01001_001E: { estimate: 4200000, label: 'Total population', suppressed: false },
+          B01001_001E: { estimate: 4200000, suppressed: false },
         },
       },
     ]);
 
-    const ctx = createMockContext({ errors: censusQueryData.errors });
-    const input = censusQueryData.input.parse({
+    const result = await runToolContract(censusQueryData, {
       variables: ['B01001_001E'],
       geography_level: 'state',
       geography_fips: '41',
     });
-    const result = await censusQueryData.handler(input, ctx);
-    // Falls back to api-provided label
-    const vars = result.rows[0]?.variables as Record<string, { label: string }>;
-    expect(vars.B01001_001E?.label).toBe('Total population');
+    const data = result.structuredContent as {
+      variable_labels: Record<string, string>;
+      rows: Array<{ variables: Record<string, object> }>;
+    };
+    expect(data.variable_labels).toEqual({});
+    expect(data.rows[0]?.variables.B01001_001E).not.toHaveProperty('label');
+    expect(readVariableLabels(textOf(result))).toBeUndefined();
+  });
+
+  /**
+   * Each row used to repeat every variable's label, so on a multi-row result the labels outweighed
+   * the data. `B19013_001EA` keys row values, but variables.json lists it only inside another entry.
+   */
+  it('states each label once in variable_labels and the legend, and on no row', async () => {
+    const labels = {
+      B19013_001E: 'Estimate!!Median household income in the past 12 months',
+      B19013_001M: 'Margin of Error!!Median household income in the past 12 months',
+    };
+    mockLookupVariables.mockResolvedValue(
+      new Map(
+        Object.entries(labels).map(([code, label]) => [
+          code,
+          { code, label, predicateType: 'int' },
+        ]),
+      ),
+    );
+    mockQueryData.mockResolvedValue(
+      [
+        ['King County, Washington', '033', 122148, 1808],
+        ['Pierce County, Washington', '053', 98321, 1525],
+      ].map(([name, fips, estimate, moe]) => ({
+        geographyName: name,
+        geographyFips: fips,
+        geographyGeoid: `53${fips}`,
+        variables: {
+          B19013_001E: { estimate, moe, suppressed: false },
+          B19013_001M: { estimate: moe, suppressed: false },
+          B19013_001EA: { estimate: null, suppressed: false },
+        },
+      })),
+    );
+
+    const result = await runToolContract(censusQueryData, {
+      variables: ['B19013_001E', 'B19013_001M', 'B19013_001EA'],
+      geography_level: 'county',
+      geography_fips: '*',
+      parent_fips: '53',
+    });
+    const data = result.structuredContent as {
+      variable_labels: Record<string, string>;
+      rows: Array<{ variables: Record<string, object> }>;
+    };
+
+    expect(data.variable_labels).toEqual(labels);
+    expect(Object.keys(data.variable_labels)).toEqual(['B19013_001E', 'B19013_001M']);
+    expect(data.rows).toHaveLength(2);
+    for (const row of data.rows) {
+      expect(Object.keys(row.variables)).toEqual(['B19013_001E', 'B19013_001M', 'B19013_001EA']);
+      for (const entry of Object.values(row.variables)) expect(entry).not.toHaveProperty('label');
+    }
+    const text = textOf(result);
+    expect(readVariableLabels(text)).toEqual(labels);
+    for (const label of Object.values(labels)) {
+      expect(JSON.stringify(result.structuredContent).split(label)).toHaveLength(2);
+      expect(text.split(label)).toHaveLength(2);
+    }
+  });
+
+  it.each([0, 1, 2, 3, 9])(
+    'carries the same variable_labels on every page, offset %i included',
+    async (offset) => {
+      mockLookupVariables.mockResolvedValue(
+        new Map([
+          ['B01003_001E', { code: 'B01003_001E', label: 'Estimate!!Total', predicateType: 'int' }],
+        ]),
+      );
+      mockQueryData.mockResolvedValue(
+        ['001', '003', '005'].map((fips) => ({
+          geographyName: `County ${fips}`,
+          geographyFips: fips,
+          geographyGeoid: `53${fips}`,
+          variables: { B01003_001E: { estimate: Number(fips), suppressed: false } },
+        })),
+      );
+
+      const result = await runToolContract(censusQueryData, {
+        variables: ['B01003_001E'],
+        geography_level: 'county',
+        geography_fips: '*',
+        parent_fips: '53',
+        limit: 1,
+        offset,
+      });
+      const data = result.structuredContent as {
+        variable_labels: Record<string, string>;
+        rows: unknown[];
+      };
+
+      expect(data.rows).toHaveLength(offset < 3 ? 1 : 0);
+      expect(data.variable_labels).toEqual({ B01003_001E: 'Estimate!!Total' });
+      expect(readVariableLabels(textOf(result))).toEqual({ B01003_001E: 'Estimate!!Total' });
+    },
+  );
+
+  /** A bare toLocaleString() stopped at three decimals: a Gini index read 0.469 ± 0.002. */
+  it('renders every digit structuredContent carries in content[]', async () => {
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'Washington',
+        geographyFips: '53',
+        geographyGeoid: '53',
+        variables: {
+          B19083_001E: { estimate: 0.4691, moe: 0.0018, suppressed: false },
+          B19083_001M: { estimate: 0.0018, suppressed: false },
+        },
+      },
+    ]);
+
+    const result = await runToolContract(censusQueryData, {
+      variables: ['B19083_001E', 'B19083_001M'],
+      geography_level: 'state',
+      geography_fips: '53',
+    });
+    const data = result.structuredContent as {
+      rows: Array<{ variables: Record<string, { estimate: number; moe?: number }> }>;
+    };
+
+    expect(data.rows[0]?.variables.B19083_001E).toMatchObject({ estimate: 0.4691, moe: 0.0018 });
+    expect(data.rows[0]?.variables.B19083_001M).toMatchObject({ estimate: 0.0018 });
+    const text = textOf(result);
+    expect(text).toContain('- **B19083_001E:** 0.4691 ± 0.0018\n');
+    expect(text).toContain('- **B19083_001M:** 0.0018\n');
   });
 
   it('throws upstream_error when api service rejects', async () => {
@@ -1573,6 +1706,7 @@ describe('censusQueryData', () => {
 
   it('format shows moe alongside estimate when present', () => {
     const output = {
+      variable_labels: { B19013_001E: 'Median income' },
       rows: [
         {
           geography_name: 'Oregon',
@@ -1582,7 +1716,6 @@ describe('censusQueryData', () => {
             B19013_001E: {
               estimate: 75000,
               moe: 300,
-              label: 'Median income',
               suppressed: false,
             },
           },
@@ -1597,6 +1730,7 @@ describe('censusQueryData', () => {
 
   it('format output never contains API key or secrets', () => {
     const output = {
+      variable_labels: { B19013_001E: 'Median income' },
       rows: [
         {
           geography_name: 'Oregon',
@@ -1605,7 +1739,6 @@ describe('censusQueryData', () => {
           variables: {
             B19013_001E: {
               estimate: 75000,
-              label: 'Median income',
               suppressed: false,
             },
           },
@@ -1648,7 +1781,7 @@ describe('censusQueryData', () => {
         variables: Object.fromEntries(
           Array.from({ length: 49 }, (_, i) => [
             `B${String(i).padStart(7, '0')}E`,
-            { estimate: i, label: `Var ${i}`, suppressed: false },
+            { estimate: i, suppressed: false },
           ]),
         ),
       },
@@ -1667,13 +1800,14 @@ describe('censusQueryData', () => {
 
   it('format handles multiple rows correctly', () => {
     const output = {
+      variable_labels: { B19013_001E: 'Median income' },
       rows: [
         {
           geography_name: 'King County',
           geography_fips: '033',
           geography_geoid: '53033',
           variables: {
-            B19013_001E: { estimate: 105000, label: 'Median income', suppressed: false },
+            B19013_001E: { estimate: 105000, suppressed: false },
           },
         },
         {
@@ -1681,7 +1815,7 @@ describe('censusQueryData', () => {
           geography_fips: '053',
           geography_geoid: '53053',
           variables: {
-            B19013_001E: { estimate: 72000, label: 'Median income', suppressed: false },
+            B19013_001E: { estimate: 72000, suppressed: false },
           },
         },
       ],
@@ -1704,7 +1838,7 @@ describe('censusQueryData — datasets that publish several records per geograph
       geographyName: 'Washington',
       geographyFips: '53',
       geographyGeoid: '53',
-      variables: { POP: { estimate: 7705267, label: 'POP', suppressed: false } },
+      variables: { POP: { estimate: 7705267, suppressed: false } },
       appliedFilters: { POPGROUP: 'Total population' },
       record: { MONTH: { code: '4', label: 'April' } },
     },
@@ -1712,7 +1846,7 @@ describe('censusQueryData — datasets that publish several records per geograph
       geographyName: 'Washington',
       geographyFips: '53',
       geographyGeoid: '53',
-      variables: { POP: { estimate: 7724566, label: 'POP', suppressed: false } },
+      variables: { POP: { estimate: 7724566, suppressed: false } },
       appliedFilters: { POPGROUP: 'Total population' },
       record: { MONTH: { code: '7', label: 'July' } },
     },
@@ -1781,6 +1915,7 @@ describe('censusQueryData — datasets that publish several records per geograph
    */
   it('format separates the two rows in the rendered text', () => {
     const blocks = censusQueryData.format!({
+      variable_labels: { POP: 'Total population' },
       rows: charvRows.map((row) => ({
         geography_name: row.geographyName,
         geography_fips: row.geographyFips,
@@ -1794,5 +1929,227 @@ describe('censusQueryData — datasets that publish several records per geograph
 
     expect(text).toContain('Washington — MONTH 4 (April)');
     expect(text).toContain('Washington — MONTH 7 (July)');
+  });
+});
+
+describe('censusQueryData — a whole table through group (#88)', () => {
+  /** Two lines of B01001 as the variable cache lays out `group(B01001)`. */
+  const b01001 = {
+    id: 'B01001',
+    columns: [
+      'B01001_001E',
+      'B01001_001EA',
+      'B01001_001M',
+      'B01001_001MA',
+      'B01001_002E',
+      'B01001_002EA',
+      'B01001_002M',
+      'B01001_002MA',
+      'GEO_ID',
+      'NAME',
+    ],
+  };
+  const labels = {
+    B19013_001E: 'Estimate!!Median household income',
+    B01001_001E: 'Estimate!!Total:',
+    B01001_001M: 'Margin of Error!!Total:',
+    B01001_002E: 'Estimate!!Total:!!Male:',
+    B01001_002M: 'Margin of Error!!Total:!!Male:',
+  };
+  const king = {
+    geographyName: 'King County, Washington',
+    geographyFips: '033',
+    geographyGeoid: '53033',
+    variables: {
+      B19013_001E: { estimate: 122148, suppressed: false },
+      B01001_001E: { estimate: 2287171, moe: 0, suppressed: false },
+      B01001_001M: { estimate: 0, suppressed: false },
+      B01001_002E: { estimate: 1140843, moe: 1234, suppressed: false },
+      B01001_002M: { estimate: 1234, suppressed: false },
+    },
+  };
+  const atKing = { geography_level: 'county', geography_fips: '033', parent_fips: '53' };
+
+  beforeEach(() => {
+    mockResolveGroup.mockResolvedValue(b01001);
+    mockLookupVariables.mockImplementation(
+      async (codes: string[]) =>
+        new Map(
+          codes.flatMap((code) => {
+            const label = labels[code as keyof typeof labels];
+            return label ? [[code, { code, label, predicateType: 'int' }]] : [];
+          }),
+        ),
+    );
+    mockQueryData.mockResolvedValue([king]);
+  });
+
+  it('resolves the table, sends it beside the codes, and labels every column it keys', async () => {
+    const result = await runToolContract(censusQueryData, {
+      ...atKing,
+      variables: ['B19013_001E', 'B01001_001E'],
+      group: ' b01001 ',
+    });
+
+    expect(mockResolveGroup).toHaveBeenCalledWith('B01001', 'acs/acs5', 2024, expect.anything());
+    expect(mockQueryData).toHaveBeenCalledWith(
+      expect.objectContaining({ variables: ['B19013_001E', 'B01001_001E'], group: b01001 }),
+      expect.anything(),
+    );
+    const data = result.structuredContent as {
+      variable_labels: Record<string, string>;
+      rows: Array<{ variables: Record<string, unknown> }>;
+    };
+    expect(Object.keys(data.variable_labels)).toEqual([
+      'B19013_001E',
+      'B01001_001E',
+      'B01001_001M',
+      'B01001_002E',
+      'B01001_002M',
+    ]);
+    expect(data.variable_labels).toEqual(labels);
+    expect(readVariableLabels(textOf(result))).toEqual(labels);
+    const text = textOf(result);
+    expect(text).toContain('**B01001_002E:** 1,140,843 ± 1,234');
+    expect(text).toContain('**B01001_002M:** 1,234');
+  });
+
+  /** Sent as a code, `group(B01001)` went out uppercased as `GROUP(B01001)`, which answers 204. */
+  it('reads a group(<ID>) entry of variables, in any case, as the group input', async () => {
+    await runToolContract(censusQueryData, { ...atKing, variables: ['Group( b01001 )'] });
+
+    expect(mockResolveGroup).toHaveBeenCalledWith('B01001', 'acs/acs5', 2024, expect.anything());
+    expect(mockQueryData).toHaveBeenCalledWith(
+      expect.objectContaining({ variables: [], group: b01001 }),
+      expect.anything(),
+    );
+  });
+
+  it('accepts the same table named both ways', async () => {
+    const result = await runToolContract(censusQueryData, {
+      ...atKing,
+      variables: ['group(B01001)'],
+      group: 'b01001',
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(mockResolveGroup).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['group and an entry', { variables: ['group(B19013)'], group: 'B01001' }],
+    ['two entries', { variables: ['group(B01001)', 'B01003_001E', 'group(b19013)'] }],
+  ])('refuses two tables, %s, before any request', async (_label, tables) => {
+    const result = await runToolContract(censusQueryData, { ...atKing, ...tables });
+
+    expect(result.isError).toBe(true);
+    const error = (
+      result.structuredContent as {
+        error: { code: number; message: string; data: Record<string, unknown> };
+      }
+    ).error;
+    expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
+    expect(error.data.reason).toBe('multiple_groups');
+    expect(error.data.groups).toEqual(['B01001', 'B19013']);
+    expect(error.message).toBe(
+      'B01001 and B19013 are 2 different tables, and the Census API returns one table per request.',
+    );
+    expect(textOf(result)).toContain('Keep B01001 in group and query B19013 in a second call');
+    expect(mockCheckGeography).not.toHaveBeenCalled();
+    expect(mockQueryData).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['neither', {}],
+    ['a blank group and blank codes', { variables: ['  '], group: ' ' }],
+    ['an empty group() entry', { variables: ['group()'] }],
+  ])('requires a code or a table — %s', async (_label, given) => {
+    const result = await runToolContract(censusQueryData, { ...atKing, ...given });
+
+    expect(result.isError).toBe(true);
+    const error = (
+      result.structuredContent as { error: { code: number; data: Record<string, unknown> } }
+    ).error;
+    expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
+    expect(error.data.reason).toBe('variables_or_group_required');
+    expect(mockCheckGeography).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      'filter dimensions',
+      { filterDimensions: ['EMPSZES', 'LFO', 'NAICS2017'], unset: [], unknown: [] },
+      [],
+      'EMPSZES, LFO, NAICS2017',
+    ],
+    [
+      'a record dimension',
+      { filterDimensions: [], unset: [], unknown: [] },
+      [{ code: 'MONTH', label: 'Vintage Month', labelAttribute: 'MONTH_DESC' }],
+      'MONTH',
+    ],
+  ])(
+    'refuses group on a dataset with %s before the data request',
+    async (_label, predicateCheck, recordDimensions, named) => {
+      mockCheckPredicates.mockResolvedValue(predicateCheck);
+      mockGetRecordDimensions.mockResolvedValue(recordDimensions);
+
+      const result = await runToolContract(censusQueryData, {
+        ...atKing,
+        dataset: 'cbp',
+        group: 'cb2300cbp',
+      });
+
+      expect(result.isError).toBe(true);
+      const error = (
+        result.structuredContent as {
+          error: { code: number; message: string; data: Record<string, unknown> };
+        }
+      ).error;
+      expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
+      expect(error.data.reason).toBe('group_not_supported');
+      expect(error.message).toContain(`carry the ${named} dimension`);
+      expect(error.data.recovery).toEqual({
+        hint: 'List the codes you need from CB2300CBP in variables instead (census_search_variables with CB2300CBP as the query returns them), and pick a category in predicates where the default is not the one wanted.',
+      });
+      // The table ID is a value to send back, so content[] carries it as a code span.
+      expect(textOf(result)).toContain(
+        'Recovery: List the codes you need from `CB2300CBP` in variables instead (census_search_variables with `CB2300CBP` as the query returns them)',
+      );
+      expect(mockResolveGroup).not.toHaveBeenCalled();
+      expect(mockQueryData).not.toHaveBeenCalled();
+    },
+  );
+
+  it('fits 49 codes beside the table and refuses the 50th before the data request', async () => {
+    const codes = (n: number) =>
+      Array.from({ length: n }, (_, i) => `B19001_${String(i + 1).padStart(3, '0')}E`);
+
+    const fits = await runToolContract(censusQueryData, {
+      ...atKing,
+      variables: codes(49),
+      group: 'B01001',
+    });
+    expect(fits.isError).toBeFalsy();
+
+    mockQueryData.mockClear();
+    const over = await runToolContract(censusQueryData, {
+      ...atKing,
+      variables: [...codes(50), 'B01001_002M'],
+      group: 'B01001',
+    });
+    const error = (
+      over.structuredContent as { error: { data: Record<string, unknown>; message: string } }
+    ).error;
+    expect(error.data).toMatchObject({
+      reason: 'too_many_variables',
+      requested: 50,
+      maxVariables: 49,
+      recovery: {
+        hint: 'Keep at most 49 codes beside the table and query the rest in a second call.',
+      },
+    });
+    expect(error.message).toContain('50 variable codes requested beside table B01001');
+    expect(mockQueryData).not.toHaveBeenCalled();
   });
 });

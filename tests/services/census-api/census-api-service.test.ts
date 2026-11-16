@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getServerConfig } from '@/config/server-config.js';
 import {
   CensusApiService,
+  codesSentFor,
   describeColumnBudget,
   describeColumnLimit,
   getCensusApiService,
@@ -20,9 +21,11 @@ import {
   observeRecordValues,
   padFips,
   planQueryColumns,
+  rowCodesFor,
 } from '@/services/census-api/census-api-service.js';
 import { censusCallContext } from '@/services/census-api/census-request.js';
 import type { SuppliedParent } from '@/services/census-api/types.js';
+import type { CensusGroup } from '@/services/variable-cache/types.js';
 import {
   initVariableCacheService,
   VariableCacheService,
@@ -356,7 +359,6 @@ describe('CensusApiService.parseResponse — text values', () => {
 
     expect(rows[0]?.variables.GEO_ID).toEqual({
       estimate: null,
-      label: 'GEO_ID',
       suppressed: false,
       value: '0500000US53033',
     });
@@ -1831,6 +1833,72 @@ describe('Census upstream budgets and transport errors (#79)', () => {
       expect(vi.getTimerCount()).toBe(0);
     },
   );
+
+  /**
+   * The call's budget runs out inside the data request once earlier stages have spent part of it,
+   * or before the request when they spent all of it. A query that requested a whole table is told
+   * the two ways to ask for less of it (#88); any other data query keeps its wording.
+   */
+  const VARIABLES_HINT =
+    'Retry the request once. If it persists, the Census API is temporarily unavailable; request a narrower geography or fewer variables per call.';
+  const GROUP_HINT =
+    'Retry the request once. If it fails the same way, request a narrower geography, or list only the codes you need from the table in variables in place of group: a response too large to arrive within one attempt fails on every retry. Otherwise the Census API is temporarily unavailable for this dataset and year.';
+  const table: CensusGroup = {
+    id: 'B01001',
+    columns: ['B01001_001E', 'B01001_001EA', 'B01001_001M', 'B01001_001MA', 'GEO_ID', 'NAME'],
+  };
+
+  it.each([
+    ['codes, spent inside the data request (characterization)', undefined, 20_000, VARIABLES_HINT],
+    ['a table, spent inside the data request', table, 20_000, GROUP_HINT],
+    ['a table, spent before the data request', table, 50_000, GROUP_HINT],
+  ] as const)(
+    'a data query for %s names its own way to ask for less',
+    async (_label, group, spentMs, hint) => {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn((url: string | URL, init?: RequestInit) => {
+          requestedUrls.push(String(url));
+          return new Promise<Response>((_, reject) => {
+            init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), {
+              once: true,
+            });
+          });
+        }),
+      );
+      const ctx = censusCallContext(createMockContext());
+      // The geography and variable stages before the data request spent this much of the 50 s.
+      vi.advanceTimersByTime(spentMs);
+
+      const pending = service
+        .queryData(
+          {
+            variables: ['B19013_001E'],
+            ...(group && { group }),
+            geographyLevel: 'county',
+            geographyFips: '*',
+            dataset: 'acs/acs5',
+            year: 2024,
+          },
+          ctx,
+        )
+        .catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(50_000 - spentMs);
+      const error = (await pending) as McpError;
+
+      expect(error.message).toBe(
+        "The Census API did not finish answering for acs/acs5 (2024) within the call's 50 s upstream budget.",
+      );
+      expect(error.data).toMatchObject({
+        reason: 'upstream_error',
+        retryable: true,
+        callDeadlineExceeded: true,
+        recovery: { hint },
+      });
+      expect(requestedUrls.length > 0).toBe(spentMs < 50_000);
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
 });
 
 describe('padFips', () => {
@@ -2064,7 +2132,6 @@ describe('CensusApiService.parseResponse — ACS sentinel values', () => {
     expect(rows[0]?.variables.B19013_001E).toEqual({
       estimate: 69577,
       moe: 14341,
-      label: 'B19013_001E',
       suppressed: false,
     });
   });
@@ -2493,7 +2560,7 @@ describe('CensusApiService.queryData — wildcarded dimensions', () => {
     ]);
     expect(rows.map((r) => r.geographyGeoid)).toEqual(['53033', '53033', '53033']);
     expect(rows[1]?.variables).toEqual({
-      ESTAB: { estimate: 177, label: 'ESTAB', suppressed: false },
+      ESTAB: { estimate: 177, suppressed: false },
     });
     // Only the label column is requested; the code arrives as the predicate echo.
     expect(getColumns()).toEqual(['NAME', 'ESTAB', 'NAICS2017_LABEL']);
@@ -2715,5 +2782,336 @@ describe('column-limit wording', () => {
 
   it('says nothing when every optional column fit', () => {
     expect(describeColumnBudget({ uncheckedFlags: [], unlabelledWildcards: [] })).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// #88 — a whole table through group(<ID>)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Two lines of acs/acs5 B01001 laid out as `group(B01001)` returns them (api.census.gov, 2024): each
+ * estimate followed by its annotation, margin of error, and the margin's annotation, then the
+ * table's GEO_ID and NAME.
+ */
+const b01001: CensusGroup = {
+  id: 'B01001',
+  columns: [
+    'B01001_001E',
+    'B01001_001EA',
+    'B01001_001M',
+    'B01001_001MA',
+    'B01001_002E',
+    'B01001_002EA',
+    'B01001_002M',
+    'B01001_002MA',
+    'GEO_ID',
+    'NAME',
+  ],
+};
+
+describe('rowCodesFor — the columns a group query keys its rows by', () => {
+  it('is the caller codes alone without a group', () => {
+    expect(rowCodesFor({ variables: ['B19013_001E', 'GEO_ID'] })).toEqual([
+      'B19013_001E',
+      'GEO_ID',
+    ]);
+  });
+
+  it('puts the caller codes first, then the table in line order, without repeating one', () => {
+    expect(rowCodesFor({ variables: ['B19013_001E', 'B01001_001E'], group: b01001 })).toEqual([
+      'B19013_001E',
+      'B01001_001E',
+      'B01001_001M',
+      'B01001_002E',
+      'B01001_002M',
+    ]);
+  });
+
+  it('keys the table GEO_ID, NAME, and an annotation only when the caller lists them', () => {
+    expect(rowCodesFor({ variables: [], group: b01001 })).toEqual([
+      'B01001_001E',
+      'B01001_001M',
+      'B01001_002E',
+      'B01001_002M',
+    ]);
+    expect(
+      rowCodesFor({ variables: ['GEO_ID', 'B01001_002EA'], group: b01001 }).slice(0, 2),
+    ).toEqual(['GEO_ID', 'B01001_002EA']);
+  });
+
+  /** Column families from api.census.gov group() headers (2024 ACS, 2020 dec/pl). */
+  it.each([
+    [
+      'profile: E, M, PE, PM kept',
+      ['DP05_0001E', 'DP05_0001EA', 'DP05_0001M', 'DP05_0001MA', 'DP05_0001PE', 'DP05_0001PEA'],
+      ['DP05_0001E', 'DP05_0001M', 'DP05_0001PE'],
+    ],
+    [
+      'comparison profile: significance kept beside estimates without margins',
+      [
+        'CP03_2019_001E',
+        'CP03_2019_001EA',
+        'CP03_2024to2019_001SS',
+        'CP03_2024_001E',
+        'CP03_2024_001EA',
+        'GEO_ID',
+        'NAME',
+      ],
+      ['CP03_2019_001E', 'CP03_2024to2019_001SS', 'CP03_2024_001E'],
+    ],
+    [
+      'decennial: N kept, NA dropped',
+      ['GEO_ID', 'NAME', 'P1_001N', 'P1_001NA', 'P1_002N', 'P1_002NA'],
+      ['P1_001N', 'P1_002N'],
+    ],
+    [
+      'an older vintage: an errata column is no annotation',
+      ['GEO_ID', 'NAME', 'P001001', 'P001001ERR', 'P001002'],
+      ['P001001', 'P001001ERR', 'P001002'],
+    ],
+  ])('%s', (_label, columns, expected) => {
+    expect(rowCodesFor({ variables: [], group: { id: 'T', columns } })).toEqual(expected);
+  });
+});
+
+describe('the get= list of a group query', () => {
+  const codes = (n: number) =>
+    Array.from({ length: n }, (_, i) => `B19001_${String(i + 1).padStart(3, '0')}E`);
+
+  it('sends group(<ID>) last and a listed code the table returns only through the table', () => {
+    expect(getColumnsFor({ variables: ['B19013_001E', 'B01001_001E'], group: b01001 })).toEqual([
+      'NAME',
+      'B19013_001E',
+      'group(B01001)',
+    ]);
+    expect(codesSentFor({ variables: ['B19013_001E', 'B01001_001E'], group: b01001 })).toEqual([
+      'B19013_001E',
+    ]);
+  });
+
+  /** api.census.gov: NAME + group(B01001) + 49 codes answers 200; + 50 codes, a 400. */
+  it('does not count the group, so NAME and 49 codes still fit beside it', () => {
+    expect(planQueryColumns({ variables: codes(49), group: b01001 })).toMatchObject({
+      status: 'ok',
+    });
+    expect(planQueryColumns({ variables: codes(50), group: b01001 })).toEqual({
+      status: 'over_limit',
+      columnCount: 51,
+      maxVariables: 49,
+      addedColumns: ['NAME'],
+    });
+  });
+
+  it('does not count a listed code the table returns', () => {
+    expect(
+      planQueryColumns({ variables: [...codes(49), 'B01001_002M'], group: b01001 }),
+    ).toMatchObject({ status: 'ok' });
+  });
+
+  it('says beside which table the codes were counted', () => {
+    expect(describeColumnLimit(50, { maxVariables: 49, addedColumns: ['NAME'] }, 'B01001')).toBe(
+      '50 variable codes requested beside table B01001, but this query can carry at most 49: the Census API accepts 50 columns per request, and every query also sends NAME. The table itself, and any code listed in variables that it returns, are not counted.',
+    );
+  });
+});
+
+describe('CensusApiService.queryData — a group query', () => {
+  /** What api.census.gov answers `get=NAME,B19013_001E,group(B01001)` with for King County. */
+  const kingCounty = [
+    ['NAME', 'B19013_001E', ...b01001.columns, 'state', 'county'],
+    [
+      'King County, Washington',
+      '122148',
+      '2287171',
+      null,
+      '-555555555',
+      '-555555555',
+      '1140843',
+      null,
+      '1234',
+      null,
+      '0500000US53033',
+      'King County, Washington',
+      '53',
+      '033',
+    ],
+  ];
+
+  const queryKing = (variables: string[]) =>
+    service.queryData(
+      {
+        variables,
+        group: b01001,
+        geographyLevel: 'county',
+        geographyFips: '033',
+        parentFips: '53',
+        dataset: 'acs/acs5',
+        year: 2024,
+      },
+      createMockContext(),
+    );
+
+  it('keeps every column of the table out of the GEOID', async () => {
+    queue(kingCounty);
+    const [row] = await queryKing(['B19013_001E', 'B01001_001E']);
+
+    expect(row?.geographyGeoid).toBe('53033');
+    expect(row?.geographyFips).toBe('033');
+    expect(row?.geographyName).toBe('King County, Washington');
+  });
+
+  it('keys the caller codes, then the table, decoded and paired as listed codes are', async () => {
+    queue(kingCounty);
+    const [row] = await queryKing(['B19013_001E', 'B01001_001E']);
+
+    expect(getColumns()).toEqual(['NAME', 'B19013_001E', 'group(B01001)']);
+    expect(Object.keys(row?.variables ?? {})).toEqual([
+      'B19013_001E',
+      'B01001_001E',
+      'B01001_001M',
+      'B01001_002E',
+      'B01001_002M',
+    ]);
+    expect(row?.variables.B01001_001E).toEqual({ estimate: 2287171, moe: 0, suppressed: false });
+    expect(row?.variables.B01001_002E).toEqual({ estimate: 1140843, moe: 1234, suppressed: false });
+    expect(row?.variables.B19013_001E).toEqual({ estimate: 122148, suppressed: false });
+  });
+
+  it('reads a table GEO_ID the caller lists from the table, without sending it twice', async () => {
+    queue([
+      ['NAME', ...b01001.columns, 'state', 'county'],
+      [
+        'King County, Washington',
+        '2287171',
+        null,
+        '-555555555',
+        null,
+        '1140843',
+        null,
+        '1234',
+        null,
+        '0500000US53033',
+        'King County, Washington',
+        '53',
+        '033',
+      ],
+    ]);
+    const [row] = await queryKing(['GEO_ID']);
+
+    expect(getColumns()).toEqual(['NAME', 'group(B01001)']);
+    expect(Object.keys(row?.variables ?? {})[0]).toBe('GEO_ID');
+    expect(row?.variables.GEO_ID).toEqual({
+      estimate: null,
+      suppressed: false,
+      value: '0500000US53033',
+    });
+    expect(row?.geographyGeoid).toBe('53033');
+  });
+
+  it('composes a tract GEOID from the geography columns alone', async () => {
+    queue([
+      ['NAME', ...b01001.columns, 'state', 'county', 'tract'],
+      [
+        'Census Tract 1.01',
+        '5000',
+        null,
+        '300',
+        null,
+        '2500',
+        null,
+        '200',
+        null,
+        '1400000US53033000101',
+        'Census Tract 1.01',
+        '53',
+        '033',
+        '000101',
+      ],
+    ]);
+    const [row] = await service.queryData(
+      {
+        variables: [],
+        group: b01001,
+        geographyLevel: 'tract',
+        geographyFips: '000101',
+        parentFips: '53',
+        countyFips: '033',
+        dataset: 'acs/acs5',
+        year: 2024,
+      },
+      createMockContext(),
+    );
+
+    expect(row?.geographyGeoid).toBe('53033000101');
+  });
+
+  it('does not pair margins outside ACS', async () => {
+    queue([
+      ['NAME', 'GEO_ID', 'NAME', 'P1_001N', 'P1_001NA', 'state'],
+      ['Washington', '0400000US53', 'Washington', '7705281', null, '53'],
+    ]);
+    const [row] = await service.queryData(
+      {
+        variables: [],
+        group: { id: 'P1', columns: ['GEO_ID', 'NAME', 'P1_001N', 'P1_001NA'] },
+        geographyLevel: 'state',
+        geographyFips: '53',
+        dataset: 'dec/pl',
+        year: 2020,
+      },
+      createMockContext(),
+    );
+
+    expect(row?.variables).toEqual({ P1_001N: { estimate: 7705281, suppressed: false } });
+    expect(row?.geographyGeoid).toBe('53');
+  });
+
+  describe('a spent data deadline', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+      vi.stubGlobal(
+        'fetch',
+        vi.fn((url: string | URL, init?: RequestInit) => {
+          requestedUrls.push(String(url));
+          return new Promise<Response>((_, reject) => {
+            init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), {
+              once: true,
+            });
+          });
+        }),
+      );
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('names a narrower geography or the needed codes as the way to ask for less', async () => {
+      const settled = service
+        .queryData(
+          {
+            variables: [],
+            group: b01001,
+            geographyLevel: 'county',
+            geographyFips: '*',
+            dataset: 'acs/acs5',
+            year: 2024,
+          },
+          createMockContext(),
+        )
+        .catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(40_000);
+      const error = (await settled) as McpError;
+
+      expect(error.data).toMatchObject({
+        reason: 'upstream_error',
+        retryable: true,
+        recovery: {
+          hint: 'Retry the request once. If it fails the same way, request a narrower geography, or list only the codes you need from the table in variables in place of group: a response too large to arrive within one attempt fails on every retry. Otherwise the Census API is temporarily unavailable for this dataset and year.',
+        },
+      });
+      expect(vi.getTimerCount()).toBe(0);
+    });
   });
 });

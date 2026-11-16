@@ -52,7 +52,7 @@ export const censusGetVariable = tool('census_get_variable', {
               .string()
               .optional()
               .describe(
-                'Universe of the variable\'s table (e.g., "Households", "Population 25 years and over"). Absent when the table publishes none — the ACS subject, profile, and selected population profile tables, dec/dp, the business datasets, pep/charv, and every ACS and dec/pl vintage before 2020 publish none — and for a column that belongs to no single table. Also absent when the universe lookup failed, which the notice names along with the affected codes; retrying can return it.',
+                'Universe of the variable\'s table (e.g., "Households", "Population 25 years and over"). Absent when the table publishes none — the ACS subject, profile, and selected population profile tables, dec/dp, the business datasets, pep/charv, geoinfo, and every ACS and dec/pl vintage before 2020 publish none — and for a column that belongs to no single table. Also absent when the universe lookup failed, which the notice names along with the affected codes; retrying can return it.',
               ),
             attribute_of: z
               .string()

@@ -1,15 +1,15 @@
 ---
 name: census-guide
-description: "Census Bureau data through the census_* tools: choose the dataset and vintage a question needs, find variable codes for lay concepts (rent burden, poverty rate), reach geographies census_resolve_geography cannot name (New England towns, tribal areas), and read ACS margins of error before ranking places, comparing a tract with its county, or comparing years. Use before answering from census_query_data or census_compare_geographies numbers."
+description: "Census Bureau data through the census_* tools: choose the dataset and vintage a question needs, find variable codes for lay concepts (rent burden, poverty rate), reach geographies census_resolve_geography cannot name (tribal areas, school districts, congressional districts), and read ACS margins of error before ranking places, comparing a tract with its county, or comparing years. Use before answering from census_query_data or census_compare_geographies numbers."
 license: Apache-2.0
 metadata:
   author: cyanheads
-  version: "1.1"
+  version: "1.2"
 ---
 
 ## Scope
 
-The census_* tools read the Census Bureau Data API: the American Community Survey (ACS) 1-year and 5-year families, the Population Estimates Program's 2023 vintage, the 2000, 2010, and 2020 decennial files, and the business datasets (County Business Patterns, Economic Census, Nonemployer Statistics). Census microdata (PUMS) and the Island Areas files are not served.
+The census_* tools read the Census Bureau Data API: the American Community Survey (ACS) 1-year and 5-year families, the Population Estimates Program's 2023 vintage, the 2000, 2010, and 2020 decennial files, the business datasets (County Business Patterns, Economic Census, Nonemployer Statistics), and geoinfo, the land and water area of every geography level. Census microdata (PUMS) and the Island Areas files are not served.
 
 Dataset discovery, variable search and lookup, geography resolution, and geography listing need no key. census_query_data and census_compare_geographies read the data API, which needs a CENSUS_API_KEY configured on the server. So does census_list_predicate_values for a dimension it enumerates against the data endpoint; one answered from the dataset dictionary (NAICS, POPGROUP) needs no key, though without one its codes come back unchecked against the rows the dataset publishes, and the notice says so. A key error is fixed in the server's configuration, not by retrying the call.
 
@@ -18,9 +18,9 @@ Dataset discovery, variable search and lookup, geography resolution, and geograp
 | Identifier | Where it comes from |
 |:-----------|:--------------------|
 | Dataset code and vintage | census_list_datasets. Its available years are the only years the other tools accept. |
-| Variable code | Search census_search_variables with a table ID (B25070, S1701) to get the whole table in code order, then confirm the exact code with census_get_variable in every vintage the query will use. Search matches whole words, so use the Census wording in the vocabulary table below rather than a lay term. |
-| FIPS for state, county, place, tract, ZCTA, metro/micro area, combined statistical area, consolidated city, economic place | census_resolve_geography. |
-| Code for any other level (county subdivision, American Indian area, congressional district, school district, urban area, and the rest) | No resolver. Enumerate it: see "Levels the resolver cannot name" below. |
+| Variable code | Search census_search_variables with a table ID (B25070, S1701) to get the whole table in code order, then confirm the exact code with census_get_variable in every vintage the query will use. Search matches whole words, so use the Census wording in the vocabulary table below rather than a lay term. To pull every column of one table in a single call, pass its ID (the table ID search returns) as census_query_data's group instead of listing codes; see "A whole table" below. |
+| FIPS for state, county, county subdivision (town, township), place, tract, ZCTA, metro/micro area, combined statistical area, consolidated city, economic place | census_resolve_geography. |
+| Code for any other level (American Indian area, congressional district, school district, urban area, and the rest) | No resolver. Enumerate it: see "Levels the resolver cannot name" below. |
 
 ## Gates
 
@@ -43,8 +43,8 @@ Dataset discovery, variable search and lookup, geography resolution, and geograp
 - ACS dollar values are in the inflation-adjusted dollars the label names ("in 2024 inflation-adjusted dollars"). Before comparing dollars across vintages outside the comparison profiles, adjust the earlier figure with the CPI-U-RS ratio of the two years.
 
 **Boundaries change between vintages.**
-- Connecticut's county level is nine planning regions (county codes 110–190) from the 2022 ACS vintage onward, replacing the old counties. Connecticut county figures do not line up across that break.
-- ACS vintages from 2020 onward, and the 2020 decennial files, use 2020 census tracts. Do not compare a tract across that break by its code: the 2010-based tracts of 2019 and earlier vintages were redrawn.
+- Connecticut's county level is the eight old counties (001–015) in every vintage through 2021, the 2020 decennial files included, and nine planning regions (110–190) from the 2022 vintage onward. Connecticut county figures do not line up across that break. census_resolve_geography answers "Fairfield County, CT" with old county 001 and a notice; for a vintage from 2022, name the planning region ("Western Connecticut Planning Region, CT"). Connecticut tracts and towns keep their codes across the 2022 change and only change county: a town or tract resolves under its planning region, so for a vintage through 2021 list them with geography_fips "*", county_fips "*", and parent_fips "09" (towns at geography_level "county subdivision") and read each under the old county it carries there, instead of passing the resolver's county_fips. A Connecticut county code in the wrong scheme for the vintage comes back empty with a hint naming the scheme that vintage publishes.
+- ACS vintages from 2020 onward, and the 2020 decennial files, use 2020 census tracts, which are the tracts census_resolve_geography returns. Earlier vintages use 2010 tracts (2000 tracts for acs/acs5 2009 and dec/pl 2000), redrawn since, so do not compare a tract across that break by its code, and expect a resolved tract code to be missing in an earlier vintage. To find a tract there, list the county's tracts with geography_fips "*" at geography_level "tract" and the same parent_fips and county_fips.
 
 **Before ranking an enumerated level, drop placeholder rows.** County subdivision listings include rows named "County subdivisions not defined", with code 00000 and a population of 0. They distort a ranking unless removed, and an ascending sort puts them first.
 
@@ -54,13 +54,25 @@ Dataset discovery, variable search and lookup, geography resolution, and geograp
 
 For "this tract against its county and state", call census_query_data three times with the same dataset, year, and E and M codes: the tract (with its state, county, and tract codes from census_resolve_geography), then the county, then the state. census_compare_geographies ranks within one level only. Apply the difference test to each pair.
 
+### Towns and townships
+
+In CT, ME, MA, MI, MN, NH, NJ, NY, PA, RI, VT, and WI, put the state after the name ("Cherry Hill, NJ") and census_resolve_geography returns the town or township as a county subdivision: query it at geography_level "county subdivision" with county_subdivision_fips as geography_fips, state_fips as parent_fips, and county_fips. An exact county name still wins ("Plymouth, MA" is Plymouth County); its notice names the town of that name, and geography_type "county subdivision" resolves the town directly. A name shared across counties ("Springfield, PA") comes back ambiguous: re-call with county_fips. In any other state a county subdivision is a statistical division and is never picked automatically, so set geography_type "county subdivision" to resolve one.
+
 ### Levels the resolver cannot name
 
 1. Call census_list_geographies for the dataset and year to get the level's exact name and the parents it requires.
 2. Call census_query_data at that level with geography_fips `"*"`, requesting `GEO_ID`, and supply the parents the level still requires. With `"*"` some levels need fewer parents than a single code does: on the 2020 decennial files county subdivision needs only the state, and the national American Indian area/Alaska Native area/Hawaiian home land level needs none.
 3. Pick the row by its geography name, then carry its code and the same parents into the real query, or pass its GEOID to census_compare_geographies.
 
-New England towns are county subdivisions ("Brookline town, Norfolk County, Massachusetts"), not places. To rank every town in a state, call census_compare_geographies at county subdivision within the state, after dropping the placeholder rows.
+Towns in the states above are county subdivisions ("Brookline town, Norfolk County, Massachusetts"), not places. To rank every town in a state, call census_compare_geographies at county subdivision within the state, after dropping the placeholder rows.
+
+### Density and other per-area measures
+
+No count dataset publishes area. Read it from geoinfo (2020 onward; AREALAND_SQMI is land area in square miles): query the count and AREALAND_SQMI at the same level and codes, pass the same explicit year to both calls since defaults differ by dataset, and divide. The recipe is in census_list_datasets under geoinfo. Areas sit on 2020 tracts; a tract count from 2019 or earlier is on 2010 tracts, so a GEOID join drops every tract the 2020 Census redrew and pairs the codes it kept with 2020 areas. A water-only tract has 0 land area. Where geoinfo returns several rows for one geography (ZCTAs, urban areas, and districts in 2020), request GEO_ID and pin one with predicates {"GEO_ID": "<id>"}.
+
+### A whole table
+
+When the answer needs every line of one table (sex by age B01001, a full DP05 profile), call census_query_data with group set to the table ID instead of listing codes, which stops at 49 per call. It comes back in one row per geography: any codes you also list first, then the table's columns with each estimate beside its margin; annotation columns are dropped, and comparison-profile SS columns stay. variable_labels names every column. One table per call, and not on the business datasets, pep/charv, dec/ddhca, dec/ddhcb, or acs/acs1/spp: there, list the codes and set predicates. Keep the geography narrow, since a wide table over every county can run past the data request's time limit; if it does, list only the codes you need in variables.
 
 ### Derived measures
 

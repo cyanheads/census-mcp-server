@@ -1702,6 +1702,66 @@ describe('the comparison profiles publish no margins of error (#52)', () => {
   });
 });
 
+/**
+ * The 2025 acs/acs1/cprofile vintage covers 2021–2025 (api.census.gov, 2026-11-15): with no `year`
+ * a lookup now reads it, and a 2020 column, which the 2021–2024 vintages carry, is unknown there.
+ */
+describe('acs/acs1/cprofile defaults to its 2025 vintage (#91)', () => {
+  const label = (year: number) =>
+    `${year} Estimate!!INCOME AND BENEFITS (IN 2025 INFLATION-ADJUSTED DOLLARS)!!Total households!!Median household income (dollars)`;
+  const serveCprofile2025 = () => {
+    routes['/data/2025/acs/acs1/cprofile/variables.json'] = {
+      variables: Object.fromEntries(
+        [2025, 2024, 2021].map((year) => [
+          `CP03_${year}_062E`,
+          {
+            label: label(year),
+            concept: 'Comparative Economic Characteristics',
+            predicateType: 'int',
+            group: 'CP03',
+            attributes: `CP03_${year}_062EA,CP03_2025to${year}_062SS`,
+          },
+        ]),
+      ),
+    };
+    routes['/data/2025/acs/acs1/cprofile/groups.json'] = {
+      groups: [{ name: 'CP03', description: 'Comparative Economic Characteristics' }],
+    };
+  };
+
+  it('census_get_variable reads the 2025 vintage when no year is given, on both surfaces', async () => {
+    serveCprofile2025();
+
+    const result = await runToolContract(censusGetVariable, {
+      variables: ['CP03_2025_062E'],
+      dataset: 'acs/acs1/cprofile',
+    });
+
+    expect(structured(result)).toMatchObject({ dataset: 'acs/acs1/cprofile', year: 2025 });
+    expect(structured(result).variables[0]).toMatchObject({
+      variable_code: 'CP03_2025_062E',
+      label: label(2025),
+    });
+    expect(textOf(result)).toContain('## Variable Metadata — acs/acs1/cprofile (2025)');
+    expect(calls.map((u) => u.pathname)).toContain('/data/2025/acs/acs1/cprofile/variables.json');
+  });
+
+  it('census_get_variable refuses a 2020 column the 2025 vintage does not publish', async () => {
+    serveCprofile2025();
+
+    const result = await runToolContract(censusGetVariable, {
+      variables: ['CP03_2020_062E'],
+      dataset: 'acs/acs1/cprofile',
+    });
+
+    expect(structured(result).error?.data).toMatchObject({
+      reason: 'variable_not_found',
+      missingCodes: ['CP03_2020_062E'],
+      year: 2025,
+    });
+  });
+});
+
 describe('census_list_predicate_values code normalization (#50)', () => {
   const serveCbp = () => {
     routes['/data/2023/cbp/variables.json'] = {

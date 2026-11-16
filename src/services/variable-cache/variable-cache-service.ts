@@ -19,6 +19,7 @@ import {
 } from '@/services/census-api/census-request.js';
 import { censusHttpError, yearNotAvailable } from '@/services/census-api/errors.js';
 import type {
+  CensusGroup,
   CensusVariable,
   PredicateCheck,
   RawGroupsJson,
@@ -69,22 +70,22 @@ export const DATASET_AVAILABLE_YEARS: Record<string, number[]> = {
   ],
   'acs/acs1': [
     2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2021,
-    2022, 2023, 2024,
+    2022, 2023, 2024, 2025,
   ],
   'acs/acs1/profile': [
     2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2021,
-    2022, 2023, 2024,
+    2022, 2023, 2024, 2025,
   ],
   'acs/acs1/subject': [
-    2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024,
+    2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024, 2025,
   ],
   'acs/acs5/cprofile': [2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024],
   'acs/acs1/cprofile': [
-    2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024,
+    2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024, 2025,
   ],
-  'acs/acsse': [2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024],
+  'acs/acsse': [2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024, 2025],
   'acs/acs1/spp': [
-    2009, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024,
+    2009, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024, 2025,
   ],
   'pep/charv': [2023],
   'dec/pl': [2000, 2010, 2020],
@@ -97,8 +98,9 @@ export const DATASET_AVAILABLE_YEARS: Record<string, number[]> = {
   ecnbasic: [2012, 2017, 2022],
   nonemp: [
     1997, 1998, 1999, 2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2012, 2013, 2014, 2015, 2016,
-    2017, 2018, 2019, 2020, 2021, 2022, 2023,
+    2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024,
   ],
+  geoinfo: [2020, 2021, 2022, 2023, 2024, 2025],
 };
 
 /** Known dataset codes for validation. */
@@ -440,13 +442,19 @@ function splittingRecordColumns(
  *
  * A dimension the caller set to `"*"` splits the rows too, but that split is the breakdown the
  * caller asked for, so it is worded as one row per category rather than as a choice to make.
+ *
+ * Rows nothing in the response separates are pinned by a filter dimension when the dataset declares
+ * one. One that declares none (`filterDimensions` empty) has no predicate to pick a record by, and
+ * its rows differ only in `GEO_ID` — `geoinfo` 2020 publishes a ZCTA once per delineation,
+ * `8600000US98101` and `860Z200US98101` — so the warning names that column instead.
  */
 export function describeRecordRows(
   dataset: string,
   year: number,
   rowsPerGeography: number,
   observed: Record<string, Array<{ code: string; label: string }>>,
-  wildcards: readonly string[] = [],
+  wildcards: readonly string[],
+  filterDimensions: readonly string[],
 ): string {
   const rows = rowsPerGeography.toLocaleString('en-US');
   const breakdowns = Object.entries(observed).filter(([code]) => wildcards.includes(code));
@@ -463,10 +471,10 @@ export function describeRecordRows(
           .join('; ')}.`
       : undefined;
   if (!splitting) {
-    return (
-      breakdown ??
-      `${dataset} (${year}) returned ${rows} rows for a single geography and nothing in the response separates them. Set the dataset's filter dimensions explicitly in predicates to pin one — census_list_predicate_values enumerates the codes each one accepts.`
-    );
+    if (breakdown) return breakdown;
+    return filterDimensions.length > 0
+      ? `${dataset} (${year}) returned ${rows} rows for a single geography and nothing in the response separates them. Set the dataset's filter dimensions explicitly in predicates to pin one — census_list_predicate_values enumerates the codes each one accepts.`
+      : `${dataset} (${year}) returned ${rows} rows for a single geography, and only GEO_ID tells them apart: each is a separate record of it, and the dataset declares no dimension to pick one by. GEO_ID among the variables labels each row; pin the one you want with predicates {"GEO_ID": "<its GEO_ID>"}.`;
   }
   const named = splitting.entries
     .map(([code, values]) => `${code} separates them, taking ${quoteValues(values)}`)
@@ -482,14 +490,19 @@ export function describeRecordRows(
  * statement about one geography, so a ranking that lists the same one twice with two different
  * numbers is wrong however the rows are labelled — the fix is to pin the record, and the values
  * observed in the response are what the caller pins it to. The row count is the diagnosis, which
- * the paired message states, so the hint carries only the pin and the values to pick from.
+ * the paired message states, so the hint carries only the pin and the values to pick from. Rows
+ * nothing separates on a dataset that declares no filter dimension differ only in `GEO_ID`, as
+ * `describeRecordRows` words for one geography.
  */
 export function describeAmbiguousRows(
   observed: Record<string, Array<{ code: string; label: string }>>,
+  filterDimensions: readonly string[],
 ): string {
   const splitting = splittingRecordColumns(observed);
   if (!splitting) {
-    return "Set the dataset's filter dimensions explicitly in predicates — census_list_predicate_values enumerates the codes each one accepts — or query one geography at a time with census_query_data.";
+    return filterDimensions.length > 0
+      ? "Set the dataset's filter dimensions explicitly in predicates — census_list_predicate_values enumerates the codes each one accepts — or query one geography at a time with census_query_data."
+      : 'Only GEO_ID tells the rows apart, and no predicate picks one per geography. Query one geography at a time with census_query_data, adding GEO_ID to variables to label its rows and a GEO_ID predicate to pin one, or compare a vintage that publishes one row per geography.';
   }
   const named = splitting.entries
     .map(([code, values]) => `${code} took ${quoteValues(values)}`)
@@ -595,7 +608,19 @@ const ATTRIBUTE_FETCH_CONCURRENCY = 4;
  */
 const UNIVERSE_DEADLINE_MS = 20_000;
 
+/** A table's ID in the dataset's spelling, and every column variables.json files under it. */
+interface TableMembers {
+  id: string;
+  members: string[];
+}
+
 interface CacheEntry {
+  /**
+   * Each entry's `attributes` list, in the order listed, for the entries that list any — the
+   * annotation, margin-of-error, and significance columns a `group(<ID>)` request returns right
+   * after the column they belong to (`B01001_001E` → `B01001_001EA`, `B01001_001M`, `B01001_001MA`).
+   */
+  attributeLists: Map<string, string[]>;
   /**
    * Every column named in some entry's `attributes` list — `B19013_001EA`, `EMP_F`,
    * `NAICS2017_LABEL`. variables.json gives these no entry of their own, so this index is what
@@ -611,6 +636,8 @@ interface CacheEntry {
    * the uppercased spelling.
    */
   spellings: Map<string, string>;
+  /** Each table's ID and member columns, keyed by the ID uppercased; built by `tablesOf`. */
+  tables?: Map<string, TableMembers>;
   /**
    * Universe per table from groups.json, loaded on the first lookup that needs one. Unset after a
    * failed read, so the next lookup tries again.
@@ -623,6 +650,28 @@ interface CacheEntry {
 function spellingIn(entry: CacheEntry, code: string): string {
   const upper = code.toUpperCase();
   return entry.spellings.get(upper) ?? upper;
+}
+
+/**
+ * The entry's tables, keyed by ID uppercased, each with its member columns — built from the
+ * variables on the first group lookup and kept on the entry, so it expires with variables.json.
+ * variables.json files each column under its tables in `group`: comma-joined for a column every
+ * table shares (`GEO_ID`), so it is a member of each, and `N/A` for a column in none.
+ */
+function tablesOf(entry: CacheEntry): Map<string, TableMembers> {
+  if (entry.tables) return entry.tables;
+  const tables = new Map<string, TableMembers>();
+  for (const variable of entry.variables.values()) {
+    for (const name of variable.group?.split(',') ?? []) {
+      const id = name.trim();
+      if (!id || id === 'N/A') continue;
+      const table = tables.get(id.toUpperCase()) ?? { id, members: [] };
+      table.members.push(variable.code);
+      tables.set(id.toUpperCase(), table);
+    }
+  }
+  entry.tables = tables;
+  return tables;
 }
 
 /**
@@ -688,6 +737,58 @@ export class VariableCacheService {
   ): Promise<string[]> {
     const entry = await this.getEntry(dataset, year, ctx);
     return codes.map((code) => spellingIn(entry, code));
+  }
+
+  /**
+   * The table `id` names, with every column `group(<ID>)` returns (`CensusGroup`). The ID is
+   * matched regardless of case and surrounding space against the tables variables.json files its
+   * columns under, and comes back in the dataset's spelling, which the Census API matches exactly.
+   * Reads the cached variables.json, so a known table spends no request.
+   *
+   * A table the dataset files no column under is `variable_not_found`, thrown before any data
+   * request goes out — the Census API would answer it with a 400. Its recovery names the sibling
+   * dataset that publishes the table when a `groups/<ID>.json` probe confirms one
+   * (`findSiblingDatasets`): an `S` table asked of acs/acs5 is in acs/acs5/subject.
+   */
+  async resolveGroup(
+    id: string,
+    dataset: string,
+    year: number,
+    ctx: Context,
+  ): Promise<CensusGroup> {
+    const entry = await this.getEntry(dataset, year, ctx);
+    const wanted = id.trim().toUpperCase();
+    const table = tablesOf(entry).get(wanted);
+    if (!table) {
+      const sibling = (await this.findSiblingDatasets([wanted], dataset, year, ctx, 'groups')).get(
+        wanted,
+      );
+      throw notFound(
+        `Table ${wanted} not found in ${dataset} (${year}).`,
+        {
+          reason: 'variable_not_found',
+          group: wanted,
+          dataset,
+          year,
+          recovery: {
+            hint: sibling
+              ? describeSiblingHolders(new Map([[wanted, sibling]]))
+              : "Call census_search_variables with words from the table's subject: a table ID is the part of a variable code before its underscore (B01001 for B01001_001E).",
+          },
+        },
+        { literals: sibling ? [sibling] : ['B01001', 'B01001_001E'] },
+      );
+    }
+
+    // Each column is followed by its attributes, as the Census API lays a group out; a column
+    // already placed — an ACS margin of error is both an attribute and a synthesized entry — stays
+    // where it was first placed.
+    const columns = new Set<string>();
+    for (const code of [...table.members].sort()) {
+      columns.add(code);
+      for (const attribute of entry.attributeLists.get(code) ?? []) columns.add(attribute);
+    }
+    return { id: table.id, columns: [...columns] };
   }
 
   /**
@@ -844,7 +945,9 @@ export class VariableCacheService {
    * Census datasets mark some variables `required`, but the API does not enforce them: a query
    * that omits one succeeds and silently returns the aggregate across that whole dimension. A
    * `cbp` establishment count without `NAICS2017` is every industry, not the one that was asked
-   * for. Reporting the unset dimensions is the only way a caller can tell those apart.
+   * for. Reporting the unset dimensions is the only way a caller can tell those apart. Every
+   * declared dimension, set or not, comes back too: whether there is any decides how rows nothing
+   * separates can be pinned (`describeRecordRows`, `describeAmbiguousRows`).
    */
   async checkPredicates(
     params: { dataset: string; year: number; supplied: string[] },
@@ -853,9 +956,11 @@ export class VariableCacheService {
     const variables = await this.getVariables(params.dataset, params.year, ctx);
     const supplied = new Set(params.supplied);
 
+    const filterDimensions: string[] = [];
     const unset: UnsetPredicate[] = [];
     for (const variable of variables.values()) {
       if (!variable.required || NON_FILTERING_PREDICATES.has(variable.code)) continue;
+      filterDimensions.push(variable.code);
       if (!supplied.has(variable.code)) {
         unset.push({
           code: variable.code,
@@ -864,9 +969,14 @@ export class VariableCacheService {
         });
       }
     }
+    filterDimensions.sort((a, b) => a.localeCompare(b));
     unset.sort((a, b) => a.code.localeCompare(b.code));
 
-    return { unset, unknown: params.supplied.filter((code) => !variables.has(code)) };
+    return {
+      filterDimensions,
+      unset,
+      unknown: params.supplied.filter((code) => !variables.has(code)),
+    };
   }
 
   /**
@@ -1237,6 +1347,7 @@ export class VariableCacheService {
 
     const variables = new Map<string, CensusVariable>();
     const attributeNames = new Set<string>();
+    const attributeLists = new Map<string, string[]>();
     const rawVars = raw.variables ?? {};
     // The E/M suffix convention is an ACS table convention, not a Census-wide one — inferring
     // it elsewhere, or on the ACS comparison profiles, invents codes the dataset does not have.
@@ -1264,6 +1375,7 @@ export class VariableCacheService {
           .map((name) => name.trim())
           .filter(Boolean) ?? [];
       for (const name of attributes) attributeNames.add(name);
+      if (attributes.length > 0) attributeLists.set(code, attributes);
       // `_TTL` labels a filter dimension on some vintages (`acs/acs1/spp` 2012–2017 `POPGROUP_TTL`).
       // It is read only on a required dimension, since a labelled column that is not required is
       // taken as a record dimension, and requesting one changes which rows a query returns.
@@ -1339,6 +1451,7 @@ export class VariableCacheService {
 
     const fresh: CacheEntry = {
       variables,
+      attributeLists,
       attributeNames,
       attributes: new Map(),
       fetchedAt: Date.now(),

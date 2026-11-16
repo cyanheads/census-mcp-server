@@ -9,6 +9,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { censusCompareGeographies } from '@/mcp-server/tools/definitions/census-compare-geographies.tool.js';
 import { yearNotAvailable } from '@/services/census-api/errors.js';
 import { DATASET_AVAILABLE_YEARS } from '@/services/variable-cache/variable-cache-service.js';
+import { readVariableLabels } from '../helpers/variable-labels-readback.js';
 
 vi.mock('@/services/census-api/census-api-service.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/services/census-api/census-api-service.js')>()),
@@ -38,6 +39,10 @@ vi.mock('@/config/server-config.js', () => ({
   })),
 }));
 
+/** Every text block of a tool result's content[], joined. */
+const textOf = (result: { content: Array<{ type: string; text?: string }> }) =>
+  result.content.map((block) => block.text ?? '').join('\n');
+
 const mockQueryData = vi.fn();
 const mockCheckGeography = vi.fn();
 const mockLookupVariables = vi.fn();
@@ -61,7 +66,7 @@ describe('comparison ranking and paging contract', () => {
       geographyName: `County ${geoid}`,
       geographyFips: String(geoid).slice(2),
       geographyGeoid: String(geoid),
-      variables: { B19013_001E: { estimate, label: 'Income', suppressed: estimate === null } },
+      variables: { B19013_001E: { estimate, suppressed: estimate === null } },
     }));
 
   it.each([
@@ -205,7 +210,7 @@ describe('comparison ranking and paging contract', () => {
         .map((row) => ({
           ...row,
           variables: {
-            B19013_001E: { estimate: 250001, openEnded: true, label: 'Income', suppressed: false },
+            B19013_001E: { estimate: 250001, openEnded: true, suppressed: false },
           },
         })),
     );
@@ -263,13 +268,13 @@ describe('comparison ranking and paging contract', () => {
         geographyName: 'Z',
         geographyFips: '003',
         geographyGeoid: '53003',
-        variables: { GEO_ID: { estimate: null, value: 'Z', label: 'ID', suppressed: false } },
+        variables: { GEO_ID: { estimate: null, value: 'Z', suppressed: false } },
       },
       {
         geographyName: 'A',
         geographyFips: '001',
         geographyGeoid: '53001',
-        variables: { GEO_ID: { estimate: null, value: 'A', label: 'ID', suppressed: false } },
+        variables: { GEO_ID: { estimate: null, value: 'A', suppressed: false } },
       },
     ]);
     const ctx = createMockContext({ errors: censusCompareGeographies.errors });
@@ -323,12 +328,12 @@ beforeEach(async () => {
   });
 
   // Default: the dataset declares no filter dimensions, so nothing is unset or unknown.
-  mockCheckPredicates.mockResolvedValue({ unset: [], unknown: [] });
+  mockCheckPredicates.mockResolvedValue({ filterDimensions: [], unset: [], unknown: [] });
 
   // Default: the dataset publishes one row per geography, so nothing separates records.
   mockGetRecordDimensions.mockResolvedValue([]);
 
-  // Default: the variable cache has no entry for any requested code, so labels fall back.
+  // Default: the variable cache has no entry for any requested code, so none has a label.
   mockLookupVariables.mockResolvedValue(new Map());
 });
 
@@ -340,7 +345,7 @@ describe('censusCompareGeographies', () => {
         geographyFips: '033',
         geographyGeoid: '53033',
         variables: {
-          B19013_001E: { estimate: 105000, label: 'Median income', suppressed: false },
+          B19013_001E: { estimate: 105000, suppressed: false },
         },
       },
       {
@@ -348,7 +353,7 @@ describe('censusCompareGeographies', () => {
         geographyFips: '053',
         geographyGeoid: '53053',
         variables: {
-          B19013_001E: { estimate: 72000, label: 'Median income', suppressed: false },
+          B19013_001E: { estimate: 72000, suppressed: false },
         },
       },
       {
@@ -356,7 +361,7 @@ describe('censusCompareGeographies', () => {
         geographyFips: '063',
         geographyGeoid: '53063',
         variables: {
-          B19013_001E: { estimate: 65000, label: 'Median income', suppressed: false },
+          B19013_001E: { estimate: 65000, suppressed: false },
         },
       },
     ]);
@@ -387,7 +392,7 @@ describe('censusCompareGeographies', () => {
         geographyFips: '033',
         geographyGeoid: '53033',
         variables: {
-          B19013_001E: { estimate: 105000, label: 'Median income', suppressed: false },
+          B19013_001E: { estimate: 105000, suppressed: false },
         },
       },
       {
@@ -395,7 +400,7 @@ describe('censusCompareGeographies', () => {
         geographyFips: '063',
         geographyGeoid: '53063',
         variables: {
-          B19013_001E: { estimate: 65000, label: 'Median income', suppressed: false },
+          B19013_001E: { estimate: 65000, suppressed: false },
         },
       },
     ]);
@@ -424,19 +429,19 @@ describe('censusCompareGeographies', () => {
       geographyName: 'King County, Washington',
       geographyFips: '033',
       geographyGeoid: '53033',
-      variables: { B19013_001E: { estimate: 105000, label: 'Median income', suppressed: false } },
+      variables: { B19013_001E: { estimate: 105000, suppressed: false } },
     },
     {
       geographyName: 'Los Angeles County, California',
       geographyFips: '037',
       geographyGeoid: '06037',
-      variables: { B19013_001E: { estimate: 82000, label: 'Median income', suppressed: false } },
+      variables: { B19013_001E: { estimate: 82000, suppressed: false } },
     },
     {
       geographyName: 'Autauga County, Alabama',
       geographyFips: '001',
       geographyGeoid: '01001',
-      variables: { B19013_001E: { estimate: 69000, label: 'Median income', suppressed: false } },
+      variables: { B19013_001E: { estimate: 69000, suppressed: false } },
     },
   ];
 
@@ -467,13 +472,13 @@ describe('censusCompareGeographies', () => {
         geographyName: 'King County, Washington',
         geographyFips: '033',
         geographyGeoid: '53033',
-        variables: { B19013_001E: { estimate: 105000, label: 'Median income', suppressed: false } },
+        variables: { B19013_001E: { estimate: 105000, suppressed: false } },
       },
       {
         geographyName: 'Pierce County, Washington',
         geographyFips: '053',
         geographyGeoid: '53053',
-        variables: { B19013_001E: { estimate: 72000, label: 'Median income', suppressed: false } },
+        variables: { B19013_001E: { estimate: 72000, suppressed: false } },
       },
     ]);
 
@@ -512,13 +517,13 @@ describe('censusCompareGeographies', () => {
         geographyName: 'King County, Washington',
         geographyFips: '033',
         geographyGeoid: '53033',
-        variables: { B19013_001E: { estimate: 105000, label: 'Median income', suppressed: false } },
+        variables: { B19013_001E: { estimate: 105000, suppressed: false } },
       },
       {
         geographyName: "Prince George's County, Maryland",
         geographyFips: '033',
         geographyGeoid: '24033',
-        variables: { B19013_001E: { estimate: 97000, label: 'Median income', suppressed: false } },
+        variables: { B19013_001E: { estimate: 97000, suppressed: false } },
       },
     ]);
 
@@ -541,7 +546,7 @@ describe('censusCompareGeographies', () => {
         geographyName: 'King County, Washington',
         geographyFips: '033',
         geographyGeoid: '53033',
-        variables: { B19013_001E: { estimate: 105000, label: 'Median income', suppressed: false } },
+        variables: { B19013_001E: { estimate: 105000, suppressed: false } },
       },
     ]);
 
@@ -579,7 +584,6 @@ describe('censusCompareGeographies', () => {
       variables: {
         B19013_001E: {
           estimate: 50000 + i * 100,
-          label: 'Median income',
           suppressed: false,
         },
       },
@@ -607,7 +611,7 @@ describe('censusCompareGeographies', () => {
         geographyFips: '000100',
         geographyGeoid: '53033000100',
         variables: {
-          B19013_001E: { estimate: 98000, label: 'Median income', suppressed: false },
+          B19013_001E: { estimate: 98000, suppressed: false },
         },
       },
     ]);
@@ -634,7 +638,7 @@ describe('censusCompareGeographies', () => {
         geographyFips: '033',
         geographyGeoid: '53033',
         variables: {
-          B19013_001E: { estimate: 105000, label: 'Median income', suppressed: false },
+          B19013_001E: { estimate: 105000, suppressed: false },
         },
       },
     ]);
@@ -833,7 +837,7 @@ describe('censusCompareGeographies', () => {
         geographyFips: '099',
         geographyGeoid: '53099',
         variables: {
-          B19013_001E: { estimate: null, label: 'Median income', suppressed: true },
+          B19013_001E: { estimate: null, suppressed: true },
         },
       },
       {
@@ -841,7 +845,7 @@ describe('censusCompareGeographies', () => {
         geographyFips: '033',
         geographyGeoid: '53033',
         variables: {
-          B19013_001E: { estimate: 105000, label: 'Median income', suppressed: false },
+          B19013_001E: { estimate: 105000, suppressed: false },
         },
       },
     ]);
@@ -865,8 +869,8 @@ describe('censusCompareGeographies', () => {
         geographyFips: '001',
         geographyGeoid: '53001',
         variables: {
-          B17001_002E: { estimate: 5000, label: 'Poverty', suppressed: false },
-          B01001_001E: { estimate: 100000, label: 'Population', suppressed: false },
+          B17001_002E: { estimate: 5000, suppressed: false },
+          B01001_001E: { estimate: 100000, suppressed: false },
         },
       },
       {
@@ -874,8 +878,8 @@ describe('censusCompareGeographies', () => {
         geographyFips: '002',
         geographyGeoid: '53002',
         variables: {
-          B17001_002E: { estimate: 8000, label: 'Poverty', suppressed: false },
-          B01001_001E: { estimate: 200000, label: 'Population', suppressed: false },
+          B17001_002E: { estimate: 8000, suppressed: false },
+          B01001_001E: { estimate: 200000, suppressed: false },
         },
       },
     ]);
@@ -906,7 +910,7 @@ describe('censusCompareGeographies', () => {
       geographyFips: String(i).padStart(5, '0'),
       geographyGeoid: String(i).padStart(5, '0'),
       variables: {
-        B19013_001E: { estimate: i * 1000, label: 'Median income', suppressed: false },
+        B19013_001E: { estimate: i * 1000, suppressed: false },
       },
     }));
     mockQueryData.mockResolvedValue(manyRows);
@@ -934,7 +938,7 @@ describe('censusCompareGeographies', () => {
         geographyFips: '033',
         geographyGeoid: '53033',
         variables: {
-          B19013_001E: { estimate: 105000, label: 'Median income', suppressed: false },
+          B19013_001E: { estimate: 105000, suppressed: false },
         },
       },
     ]);
@@ -955,7 +959,7 @@ describe('censusCompareGeographies', () => {
       geographyFips: String(i).padStart(5, '0'),
       geographyGeoid: String(i).padStart(5, '0'),
       variables: {
-        B19013_001E: { estimate: i * 1000, label: 'Median income', suppressed: false },
+        B19013_001E: { estimate: i * 1000, suppressed: false },
       },
     }));
     mockQueryData.mockResolvedValue(manyRows);
@@ -995,7 +999,7 @@ describe('censusCompareGeographies', () => {
         geographyFips: '01',
         geographyGeoid: '01',
         variables: {
-          B19013_001E: { estimate: 50000, label: 'Median income', suppressed: false },
+          B19013_001E: { estimate: 50000, suppressed: false },
         },
       },
     ]);
@@ -1013,38 +1017,170 @@ describe('censusCompareGeographies', () => {
     expect(enrichment.year).toBe(2022);
   });
 
-  it('ranks a code the variable cache has no entry for under the service label', async () => {
+  /** A row used to label such a code with the code itself, a label that says nothing. */
+  it('ranks a code the variable cache has no entry for, with no label at all', async () => {
     mockQueryData.mockResolvedValue([
       {
         geographyName: 'County X',
         geographyFips: '001',
         geographyGeoid: '53001',
         variables: {
-          B19013_001E: { estimate: 80000, label: 'Median income', suppressed: false },
+          B19013_001E: { estimate: 80000, suppressed: false },
         },
       },
     ]);
 
-    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
-    const input = censusCompareGeographies.input.parse({
+    const result = await runToolContract(censusCompareGeographies, {
       variables: ['B19013_001E'],
       geography_level: 'county',
     });
-    const result = await censusCompareGeographies.handler(input, ctx);
-    expect(result.rows).toHaveLength(1);
-    const variables = result.rows[0]?.variables as Record<string, { label: string }>;
-    expect(variables.B19013_001E?.label).toBe('Median income');
+    const data = result.structuredContent as {
+      variable_labels: Record<string, string>;
+      rows: Array<{ rank: number; variables: Record<string, object> }>;
+    };
+    expect(data.rows).toHaveLength(1);
+    expect(data.rows[0]?.rank).toBe(1);
+    expect(data.variable_labels).toEqual({});
+    expect(data.rows[0]?.variables.B19013_001E).not.toHaveProperty('label');
+    expect(readVariableLabels(textOf(result))).toBeUndefined();
+  });
+
+  /**
+   * Each row used to repeat every variable's label, so on a multi-row result the labels outweighed
+   * the data. `B19013_001EA` keys row values, but variables.json lists it only inside another entry.
+   */
+  it('states each label once in variable_labels and the legend, and on no row', async () => {
+    const labels = {
+      B19013_001E: 'Estimate!!Median household income in the past 12 months',
+      B19013_001M: 'Margin of Error!!Median household income in the past 12 months',
+    };
+    mockLookupVariables.mockResolvedValue(
+      new Map(
+        Object.entries(labels).map(([code, label]) => [
+          code,
+          { code, label, predicateType: 'int' },
+        ]),
+      ),
+    );
+    mockQueryData.mockResolvedValue(
+      [
+        ['King County, Washington', '033', 122148, 1808],
+        ['Pierce County, Washington', '053', 98321, 1525],
+      ].map(([name, fips, estimate, moe]) => ({
+        geographyName: name,
+        geographyFips: fips,
+        geographyGeoid: `53${fips}`,
+        variables: {
+          B19013_001E: { estimate, moe, suppressed: false },
+          B19013_001M: { estimate: moe, suppressed: false },
+          B19013_001EA: { estimate: null, suppressed: false },
+        },
+      })),
+    );
+
+    const result = await runToolContract(censusCompareGeographies, {
+      variables: ['B19013_001E', 'B19013_001M', 'B19013_001EA'],
+      geography_level: 'county',
+      within: '53',
+    });
+    const data = result.structuredContent as {
+      variable_labels: Record<string, string>;
+      rows: Array<{ geography_geoid: string; rank: number; variables: Record<string, object> }>;
+    };
+
+    expect(data.variable_labels).toEqual(labels);
+    expect(Object.keys(data.variable_labels)).toEqual(['B19013_001E', 'B19013_001M']);
+    expect(data.rows.map((row) => [row.geography_geoid, row.rank])).toEqual([
+      ['53033', 1],
+      ['53053', 2],
+    ]);
+    for (const row of data.rows) {
+      expect(Object.keys(row.variables)).toEqual(['B19013_001E', 'B19013_001M', 'B19013_001EA']);
+      for (const entry of Object.values(row.variables)) expect(entry).not.toHaveProperty('label');
+    }
+    const text = textOf(result);
+    expect(readVariableLabels(text)).toEqual(labels);
+    for (const label of Object.values(labels)) {
+      expect(JSON.stringify(result.structuredContent).split(label)).toHaveLength(2);
+      expect(text.split(label)).toHaveLength(2);
+    }
+  });
+
+  it.each([0, 1, 2, 3, 9])(
+    'carries the same variable_labels on every page, offset %i included',
+    async (offset) => {
+      mockLookupVariables.mockResolvedValue(
+        new Map([
+          ['B01003_001E', { code: 'B01003_001E', label: 'Estimate!!Total', predicateType: 'int' }],
+        ]),
+      );
+      mockQueryData.mockResolvedValue(
+        ['001', '003', '005'].map((fips) => ({
+          geographyName: `County ${fips}`,
+          geographyFips: fips,
+          geographyGeoid: `53${fips}`,
+          variables: { B01003_001E: { estimate: Number(fips), suppressed: false } },
+        })),
+      );
+
+      const result = await runToolContract(censusCompareGeographies, {
+        variables: ['B01003_001E'],
+        geography_level: 'county',
+        within: '53',
+        limit: 1,
+        offset,
+      });
+      const data = result.structuredContent as {
+        variable_labels: Record<string, string>;
+        rows: unknown[];
+      };
+
+      expect(data.rows).toHaveLength(offset < 3 ? 1 : 0);
+      expect(data.variable_labels).toEqual({ B01003_001E: 'Estimate!!Total' });
+      expect(readVariableLabels(textOf(result))).toEqual({ B01003_001E: 'Estimate!!Total' });
+    },
+  );
+
+  /** A bare toLocaleString() stopped at three decimals: a Gini index read 0.469 ± 0.002. */
+  it('renders every digit structuredContent carries in content[]', async () => {
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'San Juan County, Washington',
+        geographyFips: '055',
+        geographyGeoid: '53055',
+        variables: {
+          B19083_001E: { estimate: 0.532, moe: 0.0196, suppressed: false },
+          B19083_001M: { estimate: 0.0196, suppressed: false },
+        },
+      },
+    ]);
+
+    const result = await runToolContract(censusCompareGeographies, {
+      variables: ['B19083_001E', 'B19083_001M'],
+      geography_level: 'county',
+      within: '53',
+    });
+    const data = result.structuredContent as {
+      rows: Array<{ variables: Record<string, { estimate: number; moe?: number }> }>;
+    };
+
+    expect(data.rows[0]?.variables.B19083_001E).toMatchObject({ estimate: 0.532, moe: 0.0196 });
+    expect(data.rows[0]?.variables.B19083_001M).toMatchObject({ estimate: 0.0196 });
+    const text = textOf(result);
+    expect(text).toContain('- **B19083_001E:** 0.532 ± 0.0196\n');
+    expect(text).toContain('- **B19083_001M:** 0.0196\n');
   });
 
   it('format output never contains API key or secrets', () => {
     const output = {
+      variable_labels: { B19013_001E: 'Median income' },
       rows: [
         {
           geography_name: 'King County, WA',
           geography_fips: '033',
           geography_geoid: '53033',
           variables: {
-            B19013_001E: { estimate: 105000, label: 'Median income', suppressed: false },
+            B19013_001E: { estimate: 105000, suppressed: false },
           },
           rank: 1,
         },
@@ -1090,10 +1226,9 @@ describe('censusCompareGeographies', () => {
         geographyFips: '033',
         geographyGeoid: '53033',
         variables: {
-          B19013_001E: { estimate: 122148, label: 'B19013_001E', suppressed: false },
+          B19013_001E: { estimate: 122148, suppressed: false },
           GEO_ID: {
             estimate: null,
-            label: 'GEO_ID',
             suppressed: false,
             value: '0500000US53033',
           },
@@ -1120,6 +1255,7 @@ describe('censusCompareGeographies', () => {
 
   it('format renders a text value rather than the N/A a missing one gets', () => {
     const output = {
+      variable_labels: { GEO_ID: 'Geography', B19013_001M: 'Margin of error' },
       rows: [
         {
           geography_name: 'King County, WA',
@@ -1128,11 +1264,10 @@ describe('censusCompareGeographies', () => {
           variables: {
             GEO_ID: {
               estimate: null,
-              label: 'Geography',
               suppressed: false,
               value: '0500000US53033',
             },
-            B19013_001M: { estimate: null, label: 'Margin of error', suppressed: false },
+            B19013_001M: { estimate: null, suppressed: false },
           },
           rank: 1,
         },
@@ -1148,13 +1283,14 @@ describe('censusCompareGeographies', () => {
 
   it('format shows moe alongside estimate when present', () => {
     const output = {
+      variable_labels: { B19013_001E: 'Median income' },
       rows: [
         {
           geography_name: 'King County, WA',
           geography_fips: '033',
           geography_geoid: '53033',
           variables: {
-            B19013_001E: { estimate: 105000, moe: 500, label: 'Median income', suppressed: false },
+            B19013_001E: { estimate: 105000, moe: 500, suppressed: false },
           },
           rank: 1,
         },
@@ -1186,6 +1322,7 @@ describe('censusCompareGeographies', () => {
 
   it('formats output with ranked geography table', () => {
     const output = {
+      variable_labels: { B19013_001E: 'Median household income' },
       rows: [
         {
           geography_name: 'King County, WA',
@@ -1194,7 +1331,6 @@ describe('censusCompareGeographies', () => {
           variables: {
             B19013_001E: {
               estimate: 105000,
-              label: 'Median household income',
               suppressed: false,
             },
           },
@@ -1219,7 +1355,7 @@ describe('censusCompareGeographies — predicates', () => {
       geographyName: 'King County, Washington',
       geographyFips: '033',
       geographyGeoid: '53033',
-      variables: { ESTAB: { estimate: 577, label: 'ESTAB', suppressed: false } },
+      variables: { ESTAB: { estimate: 577, suppressed: false } },
     },
   ];
 
@@ -1272,7 +1408,7 @@ describe('censusCompareGeographies — predicates', () => {
         geographyName: 'Pierce County, Washington',
         geographyFips: '053',
         geographyGeoid: '53053',
-        variables: { ESTAB: { estimate: 120, label: 'ESTAB', suppressed: false } },
+        variables: { ESTAB: { estimate: 120, suppressed: false } },
       },
     ]);
 
@@ -1332,7 +1468,7 @@ describe('censusCompareGeographies — FIPS scope widths', () => {
     geographyName: 'Garland County, Arkansas',
     geographyFips: '051',
     geographyGeoid: '05051',
-    variables: { B19013_001E: { estimate: 55409, label: 'B19013_001E', suppressed: false } },
+    variables: { B19013_001E: { estimate: 55409, suppressed: false } },
   };
 
   /**
@@ -1448,7 +1584,7 @@ describe('censusCompareGeographies — applied filter defaults', () => {
         geographyName: 'King County, WA',
         geographyFips: '033',
         geographyGeoid: '53033',
-        variables: { ESTAB: { estimate: 70376, label: 'ESTAB', suppressed: false } },
+        variables: { ESTAB: { estimate: 70376, suppressed: false } },
         appliedFilters: { NAICS2017: 'Total for all sectors' },
       },
     ]);
@@ -1480,7 +1616,7 @@ describe('censusCompareGeographies — applied filter defaults', () => {
         geographyName: 'King County, WA',
         geographyFips: '033',
         geographyGeoid: '53033',
-        variables: { ESTAB: { estimate: 70376, label: 'ESTAB', suppressed: false } },
+        variables: { ESTAB: { estimate: 70376, suppressed: false } },
       },
     ]);
 
@@ -1499,12 +1635,13 @@ describe('censusCompareGeographies — applied filter defaults', () => {
 
   it('format shows the applied filter defaults beside the ranked value', () => {
     const output = {
+      variable_labels: { ESTAB: 'Establishments' },
       rows: [
         {
           geography_name: 'King County, WA',
           geography_fips: '033',
           geography_geoid: '53033',
-          variables: { ESTAB: { estimate: 70376, label: 'Establishments', suppressed: false } },
+          variables: { ESTAB: { estimate: 70376, suppressed: false } },
           applied_filters: { NAICS2017: 'Total for all sectors' },
           rank: 1,
         },
@@ -1527,28 +1664,28 @@ describe('censusCompareGeographies — datasets that publish several records per
       geographyName: 'Washington',
       geographyFips: '53',
       geographyGeoid: '53',
-      variables: { POP: { estimate: 7705267, label: 'POP', suppressed: false } },
+      variables: { POP: { estimate: 7705267, suppressed: false } },
       record: { MONTH: { code: '4', label: 'April' } },
     },
     {
       geographyName: 'Washington',
       geographyFips: '53',
       geographyGeoid: '53',
-      variables: { POP: { estimate: 7724566, label: 'POP', suppressed: false } },
+      variables: { POP: { estimate: 7724566, suppressed: false } },
       record: { MONTH: { code: '7', label: 'July' } },
     },
     {
       geographyName: 'Oregon',
       geographyFips: '41',
       geographyGeoid: '41',
-      variables: { POP: { estimate: 4241500, label: 'POP', suppressed: false } },
+      variables: { POP: { estimate: 4241500, suppressed: false } },
       record: { MONTH: { code: '4', label: 'April' } },
     },
     {
       geographyName: 'Oregon',
       geographyFips: '41',
       geographyGeoid: '41',
-      variables: { POP: { estimate: 4237256, label: 'POP', suppressed: false } },
+      variables: { POP: { estimate: 4237256, suppressed: false } },
       record: { MONTH: { code: '7', label: 'July' } },
     },
   ];
@@ -1583,7 +1720,7 @@ describe('censusCompareGeographies — datasets that publish several records per
         geographyName: 'King County, Washington',
         geographyFips: '033',
         geographyGeoid: '53033',
-        variables: { POP: { estimate: i, label: 'POP', suppressed: false } },
+        variables: { POP: { estimate: i, suppressed: false } },
         record: { NAICS2017: { code: String(1000 + i), label: `Industry ${i}` } },
       })),
     );
@@ -1652,12 +1789,13 @@ describe('censusCompareGeographies — datasets that publish several records per
    */
   it('format names the record the ranking is over', () => {
     const blocks = censusCompareGeographies.format!({
+      variable_labels: { POP: 'Total population' },
       rows: [
         {
           geography_name: 'Washington',
           geography_fips: '53',
           geography_geoid: '53',
-          variables: { POP: { estimate: 7724566, label: 'POP', suppressed: false } },
+          variables: { POP: { estimate: 7724566, suppressed: false } },
           record: { MONTH: { code: '7', label: 'July' } },
           rank: 1,
         },
@@ -1680,13 +1818,13 @@ describe('censusCompareGeographies — datasets that publish several records per
         geographyName: 'King County, Washington',
         geographyFips: '033',
         geographyGeoid: '53033',
-        variables: { B19013_001E: { estimate: 105000, label: 'Income', suppressed: false } },
+        variables: { B19013_001E: { estimate: 105000, suppressed: false } },
       },
       {
         geographyName: 'Cook County, Illinois',
         geographyFips: '033',
         geographyGeoid: '17033',
-        variables: { B19013_001E: { estimate: 78000, label: 'Income', suppressed: false } },
+        variables: { B19013_001E: { estimate: 78000, suppressed: false } },
       },
     ]);
 
@@ -1700,5 +1838,27 @@ describe('censusCompareGeographies — datasets that publish several records per
     );
 
     expect(result.rows).toHaveLength(2);
+  });
+});
+
+describe('censusCompareGeographies — declared contract text', () => {
+  const declared = (reason: string) =>
+    censusCompareGeographies.errors?.find((entry) => entry.reason === reason);
+
+  it('declares ambiguous_rows for rows only GEO_ID separates, beside a record column', () => {
+    const entry = declared('ambiguous_rows');
+
+    expect(entry?.when).toContain('pep/charv MONTH');
+    expect(entry?.when).toContain('only GEO_ID does');
+    expect(entry?.recovery).toContain('MONTH, where "7" selects the July estimate');
+    expect(entry?.recovery).toContain(
+      'Where only GEO_ID tells the rows apart, no predicate pins one per geography, so compare a vintage that publishes one row per geography instead.',
+    );
+  });
+
+  it('describes the boundary guidance an unmatched geographies entry can carry', () => {
+    expect(censusCompareGeographies.enrichment?.notice.description).toContain(
+      'for a tract or block group entry on a vintage before 2020 or a Connecticut county in the other county scheme, which boundaries that vintage publishes',
+    );
   });
 });

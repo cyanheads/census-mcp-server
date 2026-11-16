@@ -4,12 +4,23 @@
  * @module services/geography/geography-service
  */
 
-import type { Context } from '@cyanheads/mcp-ts-core';
-import { notFound, serviceUnavailable, validationError } from '@cyanheads/mcp-ts-core/errors';
+import { z } from '@cyanheads/mcp-ts-core';
+import {
+  JsonRpcErrorCode,
+  McpError,
+  notFound,
+  serviceUnavailable,
+  validationError,
+} from '@cyanheads/mcp-ts-core/errors';
 import { fetchWithTimeout, type RequestContext, withRetry } from '@cyanheads/mcp-ts-core/utils';
+import {
+  type CensusRequestContext as Context,
+  censusCallContext,
+} from '@/services/census-api/census-request.js';
 import type {
   GeocoderResult,
   GeographyType,
+  NamesakeCheck,
   ResolvedGeography,
   TigerwebFeature,
   TigerwebResponse,
@@ -19,6 +30,166 @@ import { GEOGRAPHY_TYPES } from './types.js';
 /** Root of the TIGERweb ArcGIS services — the `TIGERweb` folder and the `Econ` folder beside it. */
 const TIGERWEB_SERVICES = 'https://tigerweb.geo.census.gov/arcgis/rest/services';
 const GEOCODER_BASE = 'https://geocoding.geo.census.gov/geocoder/geographies/onelineaddress';
+
+/** The two upstreams a resolution calls, as an error names them mid-sentence. */
+type GeographyUpstream = 'TIGERweb' | 'the Census Geocoder';
+
+/**
+ * What a request to each upstream is logged as, and the longest one attempt at it waits — less
+ * once the resolution's upstream budget has less left.
+ */
+const UPSTREAM_REQUESTS = {
+  TIGERweb: { operation: 'GeographyService.requestTigerweb', attemptTimeoutMs: 10_000 },
+  'the Census Geocoder': { operation: 'GeographyService.resolveAddress', attemptTimeoutMs: 15_000 },
+} as const satisfies Record<GeographyUpstream, { operation: string; attemptTimeoutMs: number }>;
+
+/** An upstream as an error's first words name it — "TIGERweb", "The Census Geocoder". */
+const subjectOf = (upstream: GeographyUpstream) =>
+  `${upstream.charAt(0).toUpperCase()}${upstream.slice(1)}`;
+
+/** The step after an upstream failed in a way a later call can outlast. */
+const retryHint = (upstream: GeographyUpstream) =>
+  `Retry the request; if it keeps failing, ${upstream} is temporarily unavailable.`;
+
+/** Codes `withRetry` retries — the failures a later attempt can outlast. */
+const TRANSIENT_CODES: ReadonlySet<number> = new Set([
+  JsonRpcErrorCode.ServiceUnavailable,
+  JsonRpcErrorCode.Timeout,
+  JsonRpcErrorCode.RateLimited,
+]);
+
+/** The body the Census Geocoder answers a request it rejects with. */
+const GeocoderRejectionSchema = z.object({ errors: z.array(z.string()).min(1) });
+
+/**
+ * Label a transport failure of TIGERweb or the Census Geocoder — an HTTP error status, a network
+ * error, or a per-attempt timeout, after the retries `withRetry` gave it — with the
+ * `resolution_unavailable` reason census_resolve_geography declares, under the ServiceUnavailable
+ * code it declares that reason with, and the step that follows. A status a retry can outlast (5xx,
+ * 429) is retryable; any other 4xx refuses the request as sent and is not. The upstream's body never
+ * reaches the error: the status is the diagnosis. The resolution's upstream budget running out
+ * partway through a request's attempts and backoffs is {@link budgetSpent}. A caller cancellation,
+ * and every failure this service already classified (an HTML page, an unparseable body, an ArcGIS
+ * error), pass through unchanged.
+ */
+function upstreamFailure(error: unknown, upstream: GeographyUpstream, ctx: Context): unknown {
+  if (ctx.signal.aborted || !(error instanceof McpError)) return error;
+  if (error.data?.reason === 'retry_deadline_exceeded' && ctx.censusBudget) {
+    return budgetSpent(ctx.censusBudget, upstream, error);
+  }
+  const source = error.data?.errorSource;
+  const attempts = typeof error.data?.retryAttempts === 'number' ? error.data.retryAttempts : 1;
+  const subject = subjectOf(upstream);
+  const tries = attempts > 1 ? ` on all ${attempts} attempts` : '';
+  const labelled = {
+    reason: 'resolution_unavailable',
+    ...(attempts > 1 && { retryAttempts: attempts }),
+  };
+
+  if (source === 'FetchHttpError') {
+    const status = error.data?.status;
+    const retryable = TRANSIENT_CODES.has(error.code) && error.data?.retryable !== false;
+    return new McpError(
+      JsonRpcErrorCode.ServiceUnavailable,
+      `${subject} answered HTTP ${String(status)}${tries}.`,
+      {
+        ...labelled,
+        status,
+        retryable,
+        recovery: {
+          hint: retryable
+            ? retryHint(upstream)
+            : 'The request was refused rather than failing transiently, so retrying it unchanged gets the same status. Resolve the geography by another name or level, or pass FIPS codes already in hand straight to the data tools.',
+        },
+      },
+      { cause: error },
+    );
+  }
+  if (source === 'FetchNetworkErrorWrapper' || source === 'FetchTimeout') {
+    const failed =
+      source === 'FetchTimeout'
+        ? `did not answer within ${UPSTREAM_REQUESTS[upstream].attemptTimeoutMs / 1000} s`
+        : 'could not be reached';
+    return serviceUnavailable(
+      `${subject} ${failed}${tries}.`,
+      { ...labelled, retryable: true, recovery: { hint: retryHint(upstream) } },
+      { cause: error },
+    );
+  }
+  return error;
+}
+
+/**
+ * The failure of a request the resolution's upstream budget ran out on, before it was sent or
+ * partway through its attempts and backoffs: `resolution_unavailable`, with the call-deadline
+ * fields the Census data tools' budget expiry carries.
+ */
+function budgetSpent(
+  budget: NonNullable<Context['censusBudget']>,
+  upstream: GeographyUpstream,
+  cause?: unknown,
+): McpError {
+  const deadlineMs = budget.expiresAtMs - budget.startedAtMs;
+  return serviceUnavailable(
+    `${subjectOf(upstream)} did not finish answering within the call's ${deadlineMs / 1000} s upstream budget.`,
+    {
+      reason: 'resolution_unavailable',
+      retryable: true,
+      deadlineMs,
+      elapsedMs: Date.now() - budget.startedAtMs,
+      callDeadlineExceeded: true,
+      recovery: { hint: retryHint(upstream) },
+    },
+    cause === undefined ? undefined : { cause },
+  );
+}
+
+/**
+ * Milliseconds left of the resolution's upstream budget as a request is about to start; unbounded
+ * on a context that carries none. A spent budget fails the request before it is sent, while a
+ * caller that has already cancelled still reaches the transport, which reports the cancellation.
+ */
+function budgetLeftMs(ctx: Context, upstream: GeographyUpstream): number {
+  if (!ctx.censusBudget) return Number.POSITIVE_INFINITY;
+  const leftMs = ctx.censusBudget.expiresAtMs - Date.now();
+  if (leftMs <= 0 && !ctx.signal.aborted) throw budgetSpent(ctx.censusBudget, upstream);
+  return Math.max(1, leftMs);
+}
+
+/**
+ * A request the Census Geocoder rejected (HTTP 400) is about the address — it states why, as it
+ * does for one past its 100-character limit — so it is a validation error carrying that statement,
+ * not an unavailable upstream. Anything else goes to {@link upstreamFailure}.
+ */
+function geocoderFailure(error: unknown, ctx: Context): unknown {
+  if (
+    ctx.signal.aborted ||
+    !(error instanceof McpError) ||
+    error.data?.errorSource !== 'FetchHttpError' ||
+    error.data?.status !== 400
+  ) {
+    return upstreamFailure(error, 'the Census Geocoder', ctx);
+  }
+  let stated: string | undefined;
+  try {
+    const parsed = GeocoderRejectionSchema.safeParse(JSON.parse(String(error.data.body)));
+    if (parsed.success) stated = parsed.data.errors.join('; ');
+  } catch {
+    // An unparseable body states nothing; the rejection itself is still the answer.
+  }
+  return validationError(
+    `The Census Geocoder rejected the address${stated ? `: ${stated}` : ''}.`,
+    {
+      reason: 'address_rejected',
+      status: 400,
+      ...(stated && { upstreamMessage: stated }),
+      recovery: {
+        hint: 'Send a shorter or corrected address — house number, street, city, state, and ZIP code are enough — or resolve the city or county by name instead (e.g., "Seattle, WA").',
+      },
+    },
+    { cause: error },
+  );
+}
 
 /**
  * The January 2022 boundaries (the ACS 2022 vintage) an economic place's county prefix is read
@@ -35,6 +206,42 @@ const BOUNDARIES_2022 = {
 } as const;
 
 const ECONOMIC_PLACE = 'economic place' satisfies GeographyType;
+const COUNTY_SUBDIVISION = 'county subdivision' satisfies GeographyType;
+
+/**
+ * The twelve states whose county subdivisions — towns and townships — are general-purpose local
+ * governments, which the Census publishes everywhere it publishes places (Census geography
+ * glossary, "County Subdivision"). Only a name with one of these suffixes auto-detects to the
+ * subdivision level: elsewhere a subdivision is a statistical census county division or a
+ * nonfunctioning township, and would displace a closer answer ("Winston, NC" is Winston-Salem, not
+ * Winston township).
+ */
+const GOVERNMENT_SUBDIVISION_STATES = new Set([
+  'CT',
+  'ME',
+  'MA',
+  'MI',
+  'MN',
+  'NH',
+  'NJ',
+  'NY',
+  'PA',
+  'RI',
+  'VT',
+  'WI',
+]);
+
+/** A trailing "Township" in an uppercased subdivision term — "CLINTON TOWNSHIP". */
+const TRAILING_TOWNSHIP = / TOWNSHIP$/;
+
+/** The folded NAME of a Michigan charter township — "clinton charter township". */
+const CHARTER_TOWNSHIP = / charter township$/;
+
+/** TIGERweb's "County subdivisions not defined" placeholder rows, one per county they fill. */
+const UNDEFINED_SUBDIVISION = '00000';
+
+/** Joins the levels a lookup tried — "place or county", "place, county, or county subdivision". */
+const LEVEL_LIST = new Intl.ListFormat('en', { type: 'disjunction' });
 
 /**
  * One TIGERweb layer group — the fields a level exposes and the WHERE clauses it accepts.
@@ -109,6 +316,20 @@ const TIGERWEB_LAYERS = {
     codeLength: 5,
     stateScoped: true,
     countyScoped: false,
+    stateInName: false,
+    variantRetries: true,
+  },
+  // Every state has county subdivisions: the towns and townships that govern in twelve of them,
+  // census county divisions (CCDs) and nonfunctioning townships elsewhere. FUNCSTAT tells a
+  // government (A) from the rest.
+  'county subdivision': {
+    service: 'TIGERweb/Places_CouSub_ConCity_SubMCD',
+    layers: [1],
+    outFields: 'NAME,BASENAME,STATE,COUNTY,COUSUB,FUNCSTAT',
+    codeField: 'COUSUB',
+    codeLength: 5,
+    stateScoped: true,
+    countyScoped: true,
     stateInName: false,
     variantRetries: true,
   },
@@ -265,13 +486,31 @@ const STATE_NAME_ALIASES: Record<string, string> = {
  * (Richmond borough became Staten Island in 1975, the county keeping its name), so this table
  * does not drift with TIGERweb vintages the way a spelling alias would.
  */
-const NYC_BOROUGHS: Record<string, { borough: string; county: string; countyFips: string }> = {
-  brooklyn: { borough: 'Brooklyn', county: 'Kings', countyFips: '047' },
-  manhattan: { borough: 'Manhattan', county: 'New York', countyFips: '061' },
-  'staten island': { borough: 'Staten Island', county: 'Richmond', countyFips: '085' },
-  bronx: { borough: 'The Bronx', county: 'Bronx', countyFips: '005' },
-  queens: { borough: 'Queens', county: 'Queens', countyFips: '081' },
-};
+const NYC_BOROUGHS = new Map<string, { borough: string; county: string; countyFips: string }>([
+  ['brooklyn', { borough: 'Brooklyn', county: 'Kings', countyFips: '047' }],
+  ['manhattan', { borough: 'Manhattan', county: 'New York', countyFips: '061' }],
+  ['staten island', { borough: 'Staten Island', county: 'Richmond', countyFips: '085' }],
+  ['bronx', { borough: 'The Bronx', county: 'Bronx', countyFips: '005' }],
+  ['queens', { borough: 'Queens', county: 'Queens', countyFips: '081' }],
+]);
+
+/**
+ * Connecticut's eight counties, keyed by their folded name. The Census replaced them with nine
+ * planning regions (110–190) from the 2022 vintages on, but every vintage through 2021 — the 2020
+ * Census included — still publishes these codes. Current TIGERweb holds only the planning regions,
+ * so the county level answers these names from this table without a request. The list is closed:
+ * Connecticut abolished county government in 1960, and no later vintage brings the codes back.
+ */
+const CONNECTICUT_COUNTIES_BEFORE_2022 = new Map<string, { name: string; countyFips: string }>([
+  ['fairfield', { name: 'Fairfield County', countyFips: '001' }],
+  ['hartford', { name: 'Hartford County', countyFips: '003' }],
+  ['litchfield', { name: 'Litchfield County', countyFips: '005' }],
+  ['middlesex', { name: 'Middlesex County', countyFips: '007' }],
+  ['new haven', { name: 'New Haven County', countyFips: '009' }],
+  ['new london', { name: 'New London County', countyFips: '011' }],
+  ['tolland', { name: 'Tolland County', countyFips: '013' }],
+  ['windham', { name: 'Windham County', countyFips: '015' }],
+]);
 
 /** Two-letter postal abbreviation → 2-digit state FIPS, for WHERE clauses on non-state layers. */
 const STATE_ABBR_TO_FIPS: Record<string, string> = Object.fromEntries(
@@ -283,11 +522,15 @@ const STATE_FIPS_TO_ABBR: Record<string, string> = Object.fromEntries(
   US_STATES.map((s) => [s.fips, s.abbr]),
 );
 
-/** Lowercased full state name → postal abbreviation, for detecting spelled-out state inputs. */
-const STATE_NAME_TO_ABBR: Record<string, string> = {
-  ...Object.fromEntries(US_STATES.map((s) => [s.name.toLowerCase(), s.abbr])),
-  ...STATE_NAME_ALIASES,
-};
+/**
+ * Lowercased full state name → postal abbreviation, for detecting spelled-out state inputs. A
+ * `Map`, since the key is the caller's text: on an object, "constructor" and "__proto__" would
+ * read as states.
+ */
+const STATE_NAME_TO_ABBR = new Map<string, string>([
+  ...US_STATES.map((s): [string, string] => [s.name.toLowerCase(), s.abbr]),
+  ...Object.entries(STATE_NAME_ALIASES),
+]);
 
 /** Candidates listed in an `ambiguous_name` error. */
 const MAX_CANDIDATES = 10;
@@ -354,8 +597,12 @@ interface LevelMatch {
   exact: boolean;
   features: LayerFeature[];
   geographyType: GeographyType;
+  /** The row is one of Connecticut's counties before 2022, from the fixed table. */
+  legacyCounty?: true;
   /** The name as the caller gave it. */
   name: string;
+  /** The spelling the rows were found under. */
+  term: SearchTerm;
 }
 
 /** What every level query of one lookup shares. */
@@ -364,6 +611,10 @@ interface NameLookup {
   ctx: Context;
   /** The name as the caller gave it — for `ambiguous_name` and a row with no `NAME`. */
   name: string;
+  /** The level the caller set, when they set one — auto-detection leaves it undefined. */
+  requestedType: GeographyType | undefined;
+  /** Make each TIGERweb request once, without retries — for a check the answer can do without. */
+  singleAttempt?: true;
   split: SplitName;
 }
 
@@ -382,13 +633,30 @@ const fold = (value: string) => stripMarks(value).toLowerCase().trim();
  */
 const nycBorough = ({ placeName, stateAbbr }: SplitName) =>
   stateAbbr === 'NY'
-    ? NYC_BOROUGHS[
+    ? NYC_BOROUGHS.get(
         fold(placeName)
           .replace(/\s+/g, ' ')
           .replace(/^the /, '')
-          .replace(/\s+borough$/, '')
-      ]
+          .replace(/\s+borough$/, ''),
+      )
     : undefined;
+
+/**
+ * The Connecticut county before 2022 a name gives, when its state suffix is Connecticut and the
+ * name says "County" or the caller asked for the county level. A bare "Fairfield, CT" found at the
+ * county level of an auto-detected chain is left to the current geographies — Fairfield town —
+ * since this table would otherwise end the chain on county 001 before the subdivision level.
+ */
+const connecticutCountyBefore2022 = (
+  { placeName, stateAbbr }: SplitName,
+  countyRequested: boolean,
+) => {
+  if (stateAbbr !== 'CT') return;
+  const folded = fold(placeName).replace(/\s+/g, ' ');
+  const saysCounty = folded.endsWith(' county');
+  if (!saysCounty && !countyRequested) return;
+  return CONNECTICUT_COUNTIES_BEFORE_2022.get(folded.replace(/ county$/, ''));
+};
 
 /**
  * The name respelled with each Saint token in TIGERweb's abbreviated form ("Saint Louis" →
@@ -435,11 +703,19 @@ export class GeographyService {
    *
    * A `countyFips` restricts that chain to the levels whose layers carry `COUNTY`, so the
    * scope is either applied or reported — never carried past a layer that cannot express it.
+   *
+   * Every request a resolution makes — each level and respelling, an economic place's county test,
+   * the address lookup, the namesake check — spends from one upstream budget started here, the one
+   * the Census data tools' calls carry, so the call settles before an MCP client's request timeout.
+   * Each attempt, backoff, and body read stops where the budget ends, and a request it runs out on
+   * fails the resolution as `resolution_unavailable`; only the advisory namesake check reports
+   * itself unavailable instead, keeping the answer already found.
    */
   async resolveGeography(
     params: { name: string; geographyType?: GeographyType; countyFips?: string },
-    ctx: Context,
+    caller: Context,
   ): Promise<ResolvedGeography> {
+    const ctx = censusCallContext(caller);
     const { name, geographyType } = params;
     const trimmed = name.trim();
     // TIGERweb stores COUNTY zero-padded, so an unpadded '51' would match nothing at all.
@@ -447,11 +723,12 @@ export class GeographyService {
     ctx.log.info('Resolving geography', { name, geographyType, countyFips });
 
     const isAddress = this.looksLikeAddress(trimmed);
+    const split = this.splitStateSuffix(trimmed);
     const detected = isAddress
       ? []
       : geographyType
         ? [geographyType]
-        : this.detectGeographyTypes(trimmed);
+        : this.detectGeographyTypes(trimmed, split);
 
     // A level with no COUNTY field answers exactly as it would have with no county named, so
     // the scope narrows the chain rather than riding along unapplied: a caller who scoped a
@@ -467,27 +744,85 @@ export class GeographyService {
 
     if (isAddress) return this.resolveAddress(name, ctx);
 
-    const split = this.splitStateSuffix(trimmed);
-    const lookup = { name, split, countyFips, ctx };
-
-    const primary = await this.preferredLevel(
-      types.map((type) => () => this.resolvePrimary(trimmed, type, lookup)),
-    );
-    if (primary) return this.settle(primary, ctx);
+    const lookup: NameLookup = { name, split, countyFips, ctx, requestedType: geographyType };
 
     // A level's respellings are tried in order and its first hit stands for the level.
-    const respelled = await this.preferredLevel(
-      types.map((type) => async () => {
-        for (const term of this.retryTerms(split.placeName, type)) {
-          const match = await this.resolveTerm(type, term, lookup);
-          if (match) return match;
-        }
-        return null;
-      }),
-    );
-    if (respelled) return this.settle(respelled, ctx);
+    const match =
+      (await this.preferredLevel(
+        types.map((type) => () => this.resolvePrimary(trimmed, type, lookup)),
+      )) ??
+      (await this.preferredLevel(
+        types.map((type) => async () => {
+          for (const term of this.retryTerms(split.placeName, type)) {
+            const respelled = await this.resolveTerm(type, term, lookup);
+            if (respelled) return respelled;
+          }
+          return null;
+        }),
+      ));
+    if (!match) throw this.noMatch(name, split, types, countyFips);
 
-    throw this.noMatch(name, split, types, countyFips);
+    const result = await this.settle(match, ctx);
+    if (this.checksNamesakes(match, result, types, lookup)) {
+      const namesakes = await this.namesakeSubdivisions(match.term, lookup);
+      if (namesakes) result.namesakes = namesakes;
+    }
+    return result;
+  }
+
+  /**
+   * Whether an answer gets the check for a governing county subdivision of the same name: a county
+   * auto-detected through the twelve-state chain ("Plymouth, MA" is Plymouth County, and Plymouth
+   * town is what the name ordinarily means), or a CDP answered at `geography_type: "place"` in one
+   * of those states ("Greenwich, CT" there is the Greenwich CDP inside Greenwich town). A borough
+   * is skipped — it carries its own notice, and a borough is no government.
+   */
+  private checksNamesakes(
+    match: LevelMatch,
+    result: ResolvedGeography,
+    types: GeographyType[],
+    { requestedType, split }: NameLookup,
+  ): boolean {
+    if (match.borough) return false;
+    if (result.geographyType === 'county') {
+      return requestedType === undefined && types.includes(COUNTY_SUBDIVISION);
+    }
+    return (
+      requestedType === 'place' &&
+      result.censusDesignatedPlace === true &&
+      GOVERNMENT_SUBDIVISION_STATES.has(split.stateAbbr ?? '')
+    );
+  }
+
+  /**
+   * The governing county subdivisions (`FUNCSTAT` `A`) named exactly the term, within the caller's
+   * state and county scope. Advisory, so one attempt: when TIGERweb cannot answer it — any failure
+   * labelled `resolution_unavailable`, a refusal included — or the resolution's upstream budget runs
+   * out first, the result says the check did not run rather than failing an answer already found.
+   * A cancelled call still fails.
+   */
+  private async namesakeSubdivisions(
+    term: SearchTerm,
+    lookup: NameLookup,
+  ): Promise<NamesakeCheck | undefined> {
+    let match: LevelMatch | null;
+    try {
+      match = await this.resolveTerm(COUNTY_SUBDIVISION, term, { ...lookup, singleAttempt: true });
+    } catch (err) {
+      const upstreamDown = err instanceof McpError && err.data?.reason === 'resolution_unavailable';
+      if (lookup.ctx.signal.aborted || !upstreamDown) throw err;
+      return { kind: 'unavailable' };
+    }
+    if (!match?.exact) return;
+
+    const subdivisions = match.features.flatMap((f) => {
+      const countyFips = this.levelCode(f.attributes, 'COUNTY', 3);
+      const countySubdivisionFips = this.levelCode(f.attributes, 'COUSUB', 5);
+      return f.attributes.FUNCSTAT === 'A' && countyFips && countySubdivisionFips
+        ? [{ name: String(f.attributes.NAME ?? ''), countyFips, countySubdivisionFips }]
+        : [];
+    });
+    return subdivisions.length > 0 ? { kind: 'found', subdivisions } : undefined;
   }
 
   /**
@@ -510,8 +845,8 @@ export class GeographyService {
 
   /**
    * Build the `county_scope_unsupported` error for a `county_fips` no level reached by this
-   * call can apply — only `county` and `tract` sit inside a county, and a street address
-   * resolves to a single point rather than a set a county could narrow.
+   * call can apply — only `county`, `county subdivision`, and `tract` sit inside a county, and a
+   * street address resolves to a single point rather than a set a county could narrow.
    */
   private countyScopeUnsupported(
     geographyType: GeographyType | undefined,
@@ -522,16 +857,16 @@ export class GeographyService {
       ? 'a street address, which already resolves to one county on its own'
       : geographyType
         ? `the ${geographyType} level`
-        : `the ${detected.join(' or ')} level${detected.length > 1 ? 's' : ''} this name auto-detects to`;
+        : `the ${LEVEL_LIST.format(detected)} level${detected.length > 1 ? 's' : ''} this name auto-detects to`;
 
     return validationError(
-      `county_fips does not apply to ${subject} — only county and tract sit within a county.`,
+      `county_fips does not apply to ${subject} — only county, county subdivision, and tract sit within a county.`,
       {
         reason: 'county_scope_unsupported',
         ...(geographyType && { geographyType }),
         ...(detected.length > 0 && { attemptedTypes: detected }),
         recovery: {
-          hint: 'Drop county_fips, or set geography_type to "county" or "tract" to use it.',
+          hint: 'Drop county_fips, or set geography_type to "county", "county subdivision", or "tract" to use it.',
         },
       },
     );
@@ -545,12 +880,44 @@ export class GeographyService {
    * asks for Kings), as that level's query term rather than a retry, so a place row that only
    * contains the borough name never outranks the county. The place level keeps the name as given:
    * "Manhattan" read as "New York" there would answer with New York city, a different geography.
+   *
+   * A Connecticut county from before 2022 is answered at the county level from its fixed table,
+   * with no request — current TIGERweb no longer holds it — when the caller's county scope admits
+   * it.
    */
   private async resolvePrimary(
     trimmed: string,
     geographyType: GeographyType,
     lookup: NameLookup,
   ): Promise<LevelMatch | null> {
+    if (geographyType === 'county') {
+      const legacy = connecticutCountyBefore2022(lookup.split, lookup.requestedType === 'county');
+      if (legacy) {
+        if (lookup.countyFips && lookup.countyFips !== legacy.countyFips) return null;
+        return {
+          features: [
+            {
+              // Connecticut's state code, on the county level's layer — the row TIGERweb would
+              // return if it still held these counties.
+              attributes: {
+                NAME: legacy.name,
+                BASENAME: legacy.name.replace(/ County$/, ''),
+                STATE: '09',
+                COUNTY: legacy.countyFips,
+              },
+              layer: 1,
+            },
+          ],
+          exact: true,
+          cdpOnly: false,
+          geographyType,
+          legacyCounty: true,
+          name: lookup.name,
+          term: { pattern: legacy.name.toUpperCase(), exactTerm: legacy.name },
+        };
+      }
+    }
+
     // A ZCTA is named by its code, which the layer holds in GEOID — a ZIP+4 names the ZCTA of
     // its first five digits, and anything else names no ZCTA at all.
     if (geographyType === ZCTA) {
@@ -645,7 +1012,15 @@ export class GeographyService {
     const spec = TIGERWEB_LAYERS[geographyType];
     const { stateAbbr } = lookup.split;
 
-    let whereClause = `UPPER(NAME) LIKE '%${term.pattern.replace(/'/g, "''")}%'`;
+    const nameLike = (pattern: string) => `UPPER(NAME) LIKE '%${pattern.replace(/'/g, "''")}%'`;
+    let whereClause = nameLike(term.pattern);
+
+    // A Michigan charter township is named "Clinton charter township", which "Clinton Township"
+    // is not a substring of, so the subdivision level asks for that form as well.
+    if (geographyType === COUNTY_SUBDIVISION && TRAILING_TOWNSHIP.test(term.pattern)) {
+      const charter = term.pattern.replace(TRAILING_TOWNSHIP, ' CHARTER TOWNSHIP');
+      whereClause = `(${whereClause} OR ${nameLike(charter)})`;
+    }
 
     // A statistical area spans whatever states it spans, so its layer carries no STATE to
     // filter on — scoping it would be an ArcGIS error, not a narrower answer.
@@ -660,6 +1035,12 @@ export class GeographyService {
 
     if (lookup.countyFips && spec.countyScoped) {
       whereClause += ` AND COUNTY='${lookup.countyFips}'`;
+    }
+
+    // A county with no subdivisions holds one placeholder row, "County subdivisions not defined",
+    // which is no geography a name means.
+    if (geographyType === COUNTY_SUBDIVISION) {
+      whereClause += ` AND COUSUB<>'${UNDEFINED_SUBDIVISION}'`;
     }
 
     const match = await this.findMatches({
@@ -690,10 +1071,11 @@ export class GeographyService {
     name: string;
     /** State abbreviation to match against row names, on layers that carry no `STATE`. */
     nameStateAbbr?: string;
+    singleAttempt?: true;
     term: SearchTerm;
     whereClause: string;
   }): Promise<LevelMatch | null> {
-    const { ctx, geographyType, name, nameStateAbbr, term, whereClause } = opts;
+    const { ctx, geographyType, name, nameStateAbbr, singleAttempt, term, whereClause } = opts;
     const spec: TigerwebLayerSpec = TIGERWEB_LAYERS[geographyType];
 
     const perLayer = await Promise.all(
@@ -703,6 +1085,7 @@ export class GeographyService {
           whereClause,
           spec.outFields,
           ctx,
+          { ...(singleAttempt && { singleAttempt }) },
         );
         return features.map((f) => ({ ...f, layer }));
       }),
@@ -718,12 +1101,13 @@ export class GeographyService {
 
     if (features.length === 0) return null;
 
-    const preferred = this.preferExactMatches(features, term.exactTerm, spec);
+    const preferred = this.preferExactMatches(features, term.exactTerm, geographyType);
     return {
       ...preferred,
       cdpOnly: preferred.exact && preferred.features.every((f) => f.layer === spec.cdpLayer),
       geographyType,
       name,
+      term,
     };
   }
 
@@ -745,6 +1129,7 @@ export class GeographyService {
 
     const stateFips = this.levelCode(attrs, 'STATE', 2);
     const countyFips = this.levelCode(attrs, 'COUNTY', 3);
+    const countySubdivisionFips = this.levelCode(attrs, 'COUSUB', 5);
     const placeFips = this.levelCode(attrs, 'PLACE', 5);
     const tractFips = this.levelCode(attrs, 'TRACT', 6);
     const fipsSummary = this.levelCode(attrs, spec.codeField, spec.codeLength);
@@ -764,11 +1149,13 @@ export class GeographyService {
 
     if (stateFips) result.stateFips = stateFips;
     if (countyFips) result.countyFips = countyFips;
+    if (countySubdivisionFips) result.countySubdivisionFips = countySubdivisionFips;
     if (tractFips) result.tractFips = tractFips;
     if (placeFips) result.placeFips = placeFips;
     const cdp = row.layer === spec.cdpLayer;
     if (cdp) result.censusDesignatedPlace = true;
     if (match.borough) result.borough = match.borough;
+    if (match.legacyCounty) result.legacyCounty = true;
 
     if (geographyType === ECONOMIC_PLACE) {
       if (!stateFips) {
@@ -873,6 +1260,7 @@ export class GeographyService {
           hint: `Query ecnbasic 2022 at geography_level "economic place" with geography_fips "*", parent_fips "${stateFips}", and an industry predicate, and take the row whose code ends in the place code.`,
         },
       },
+      { literals: ['*', stateFips] },
     );
   }
 
@@ -882,52 +1270,31 @@ export class GeographyService {
     whereClause: string,
     outFields: string,
     ctx: Context,
-    options: { returnGeometry?: boolean } = {},
+    options: { returnGeometry?: boolean; singleAttempt?: true } = {},
   ): Promise<TigerwebResponse> {
     const url = `${TIGERWEB_SERVICES}/${layerPath}/query?where=${encodeURIComponent(whereClause)}&outFields=${outFields}&returnGeometry=${options.returnGeometry ?? false}&f=json`;
 
     ctx.log.debug('TIGERweb query', { url, whereClause });
 
-    return this.requestTigerweb(url, ctx);
+    return this.requestTigerweb(url, ctx, {}, options.singleAttempt);
   }
 
-  /** Send one TIGERweb request, retrying transient failures, and read its JSON body. */
+  /**
+   * Send one TIGERweb request, retrying transient failures unless `singleAttempt` is set, and read
+   * its JSON body.
+   */
   private async requestTigerweb(
     url: string,
     ctx: Context,
     init: { method?: 'POST'; body?: URLSearchParams } = {},
+    singleAttempt?: true,
   ): Promise<TigerwebResponse> {
-    const data = await withRetry(
-      async () => {
-        const response = await fetchWithTimeout(url, 10_000, ctx as unknown as RequestContext, {
-          ...init,
-          signal: ctx.signal,
-        });
-        const text = await response.text();
-
-        if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
-          throw serviceUnavailable('TIGERweb returned HTML instead of JSON.', {
-            reason: 'resolution_unavailable',
-          });
-        }
-
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(text);
-        } catch {
-          throw serviceUnavailable('TIGERweb response could not be parsed.', {
-            reason: 'resolution_unavailable',
-          });
-        }
-
-        return parsed as TigerwebResponse;
-      },
-      {
-        operation: 'GeographyService.requestTigerweb',
-        context: ctx as unknown as RequestContext,
-        baseDelayMs: 1000,
-        signal: ctx.signal,
-      },
+    const data = await this.requestJson<TigerwebResponse>(
+      'TIGERweb',
+      url,
+      ctx,
+      init,
+      singleAttempt,
     );
 
     if (data.error) {
@@ -937,6 +1304,59 @@ export class GeographyService {
     }
 
     return data;
+  }
+
+  /**
+   * Send one request to TIGERweb or the Census Geocoder and read its JSON body, retrying transient
+   * failures unless `singleAttempt` is set — all within what is left of the resolution's upstream
+   * budget. Every attempt, backoff, and body read shares that budget, and an attempt's own timeout
+   * is cut to the time left, so no request runs past it.
+   */
+  private async requestJson<T>(
+    upstream: GeographyUpstream,
+    url: string,
+    ctx: Context,
+    init: { method?: 'POST'; body?: URLSearchParams } = {},
+    singleAttempt?: true,
+  ): Promise<T> {
+    const { operation, attemptTimeoutMs } = UPSTREAM_REQUESTS[upstream];
+    const leftMs = budgetLeftMs(ctx, upstream);
+    return await withRetry(
+      async ({ signal, remainingMs }) => {
+        const response = await fetchWithTimeout(
+          url,
+          Math.min(attemptTimeoutMs, remainingMs),
+          ctx as unknown as RequestContext,
+          { ...init, signal },
+        );
+        const text = await response.text();
+
+        if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
+          throw serviceUnavailable(`${subjectOf(upstream)} returned HTML instead of JSON.`, {
+            reason: 'resolution_unavailable',
+          });
+        }
+        try {
+          return JSON.parse(text) as T;
+        } catch {
+          throw serviceUnavailable(`${subjectOf(upstream)} response could not be parsed.`, {
+            reason: 'resolution_unavailable',
+          });
+        }
+      },
+      {
+        operation,
+        context: ctx as unknown as RequestContext,
+        baseDelayMs: 1000,
+        signal: ctx.signal,
+        ...(Number.isFinite(leftMs) && { deadlineMs: leftMs }),
+        ...(singleAttempt && { maxRetries: 0 }),
+      },
+    ).catch((error: unknown) => {
+      throw upstream === 'TIGERweb'
+        ? upstreamFailure(error, upstream, ctx)
+        : geocoderFailure(error, ctx);
+    });
   }
 
   /**
@@ -989,12 +1409,16 @@ export class GeographyService {
    *
    * `exact` says whether the rows kept are named the term or only contain it, which is what
    * lets a later level's exact row outrank them.
+   *
+   * On the county subdivision level a charter township is also named exactly "<name> Township":
+   * that is what "Clinton charter township" is called.
    */
   private preferExactMatches(
     features: LayerFeature[],
     queryTerm: string,
-    spec: TigerwebLayerSpec,
+    geographyType: GeographyType,
   ): { features: LayerFeature[]; exact: boolean } {
+    const spec: TigerwebLayerSpec = TIGERWEB_LAYERS[geographyType];
     const term = fold(queryTerm);
     if (!term) return { features, exact: false };
 
@@ -1005,7 +1429,14 @@ export class GeographyService {
       const bare = spec.stateInName ? basename.replace(BASENAME_STATE_LIST, '') : basename;
       return fold(bare) === term;
     });
-    const byName = features.filter((f) => fold(String(f.attributes.NAME ?? '')) === term);
+    const byName = features.filter((f) => {
+      const name = fold(String(f.attributes.NAME ?? ''));
+      return (
+        name === term ||
+        (geographyType === COUNTY_SUBDIVISION &&
+          name.replace(CHARTER_TOWNSHIP, ' township') === term)
+      );
+    });
     const exact = byBasename.length > 0 ? byBasename : byName;
     if (exact.length === 0) return { features, exact: false };
 
@@ -1015,10 +1446,12 @@ export class GeographyService {
 
   /**
    * Build the `ambiguous_name` error, giving each candidate enough to act on without a
-   * re-query: its own code, plus the state that separates same-named places.
+   * re-query: its own code, plus the state that separates same-named places — and for a tract or
+   * county subdivision, whose names repeat within a state, the county.
    */
   private ambiguousName(name: string, geographyType: GeographyType, matches: TigerwebFeature[]) {
     const spec = TIGERWEB_LAYERS[geographyType];
+    const countySeparated = geographyType === 'tract' || geographyType === COUNTY_SUBDIVISION;
 
     const candidates = matches.slice(0, MAX_CANDIDATES).map((f) => {
       const stateFips = this.levelCode(f.attributes, 'STATE', 2);
@@ -1043,28 +1476,38 @@ export class GeographyService {
     const candidateList = candidates
       .map((c) => {
         const state = c.stateAbbr ? `, ${c.stateAbbr}` : '';
-        // Tract names repeat within a state, so the county is what separates them.
-        const county = geographyType === 'tract' && c.countyFips ? ` (county ${c.countyFips})` : '';
+        const county = countySeparated && c.countyFips ? ` (county ${c.countyFips})` : '';
         return `"${c.name}${state}"${county}`;
       })
       .join(', ');
     const remaining = matches.length - candidates.length;
     const more = remaining > 0 ? `, and ${remaining} more` : '';
 
-    // A tract candidate is not re-queryable by name — every one of them carries the same
-    // name and state, so the county FIPS is the only input that separates them.
-    const next =
-      geographyType === 'tract'
-        ? ' — tract names repeat within a state, so re-call census_resolve_geography with county_fips set to the county of the one you want'
-        : geographyType === ECONOMIC_PLACE
-          ? ' — an economic place code carries a county prefix only resolution finds, so re-call census_resolve_geography with the name of the one you want'
-          : '';
+    // A tract or same-named subdivision is not re-queryable by name alone — the candidates carry
+    // the same name and state, so the county FIPS is the input that separates them. Two
+    // subdivisions can also share a county (Maine's Rangeley town and Rangeley plantation, both
+    // county 007), and there only the full name as listed tells them apart.
+    const counties = candidates.map((c) => c.countyFips);
+    const sharedCounty = new Set(counties).size < counties.length;
+    const next = countySeparated
+      ? ` — ${geographyType} names repeat within a state, so re-call census_resolve_geography with county_fips set to the county of the one you want${sharedCounty ? ', and with its full name as listed where two share a county' : ''}`
+      : geographyType === ECONOMIC_PLACE
+        ? ' — an economic place code carries a county prefix only resolution finds, so re-call census_resolve_geography with the name of the one you want'
+        : '';
 
-    return validationError(`"${name}" matched ${matches.length} geographies.`, {
-      reason: 'ambiguous_name',
-      candidates,
-      recovery: { hint: `Re-query with one of: ${candidateList}${more}${next}` },
-    });
+    return validationError(
+      `"${name}" matched ${matches.length} geographies.`,
+      {
+        reason: 'ambiguous_name',
+        candidates,
+        recovery: { hint: `Re-query with one of: ${candidateList}${more}${next}.` },
+      },
+      {
+        literals: countySeparated
+          ? candidates.flatMap((c) => (c.countyFips ? [c.countyFips] : []))
+          : [],
+      },
+    );
   }
 
   /**
@@ -1090,7 +1533,7 @@ export class GeographyService {
     countyFips: string | undefined,
   ): { message: string; hint: string } {
     const { placeName, stateLabel } = split;
-    const attempted = types.join(' or ');
+    const attempted = LEVEL_LIST.format(types);
     // The levels a caller could switch to — the ones just tried are the miss, not an option.
     const otherLevels = GEOGRAPHY_TYPES.filter((type) => !types.includes(type)).join(', ');
 
@@ -1123,9 +1566,15 @@ export class GeographyService {
     }
 
     // county_fips narrows the chain to the levels that sit in a county, so it is part of why
-    // nothing matched — a caller told only to check the spelling would re-run the same miss.
-    const where = stateLabel && (countyFips ? `county ${countyFips} of ${stateLabel}` : stateLabel);
-    const named = `No ${attempted} named "${placeName}" exists in ${where}.`;
+    // nothing matched — a caller told only to check the spelling would re-run the same miss. On a
+    // county search it is the county's own code, not a place the county sits in.
+    const countyCode = countyFips !== undefined && types.every((type) => type === 'county');
+    const where =
+      stateLabel &&
+      (countyFips && !countyCode ? `county ${countyFips} of ${stateLabel}` : stateLabel);
+    const named = countyCode
+      ? `No county named "${placeName}" has code ${countyFips} in ${where}.`
+      : `No ${attempted} named "${placeName}" exists in ${where}.`;
 
     // A borough reaches its county only at the county level, so a miss here is another level
     // asked for alone, or a county scope that rules the borough's county out.
@@ -1168,7 +1617,7 @@ export class GeographyService {
           hint: `Check the spelling,${dropScope} set geography_type to search a different level (${otherLevels}), or pass a full street address.`,
         }
       : {
-          message: `No ${attempted} matched "${name}"${countyFips ? ` in county ${countyFips}` : ''}.`,
+          message: `No ${attempted} matched "${name}"${countyFips ? ` ${countyCode ? 'with code' : 'in county'} ${countyFips}` : ''}.`,
           hint: `Add the state abbreviation (e.g., "Springfield, IL"),${dropScope} set geography_type to search a different level (${otherLevels}), or pass a full street address.`,
         };
   }
@@ -1190,7 +1639,7 @@ export class GeographyService {
     const suffix = comma === -1 ? '' : name.slice(comma + 1).trim();
 
     if (placeName) {
-      const byName = STATE_NAME_TO_ABBR[suffix.toLowerCase()];
+      const byName = STATE_NAME_TO_ABBR.get(suffix.toLowerCase());
       if (byName) return { placeName, stateAbbr: byName, stateLabel: byName };
       if (STATE_LIST_SUFFIX.test(suffix)) {
         const stateLabel = suffix.toUpperCase();
@@ -1209,41 +1658,12 @@ export class GeographyService {
   }
 
   private async resolveAddress(address: string, ctx: Context): Promise<ResolvedGeography> {
-    const url = `${GEOCODER_BASE}?address=${encodeURIComponent(address)}&benchmark=4&vintage=4&layers=8,12,28&format=json`;
+    // Layers 8 (tracts), 12 (blocks), 22 (county subdivisions), and 28 (incorporated places).
+    const url = `${GEOCODER_BASE}?address=${encodeURIComponent(address)}&benchmark=4&vintage=4&layers=8,12,22,28&format=json`;
 
     ctx.log.debug('Census Geocoder query', { address });
 
-    const data = await withRetry(
-      async () => {
-        const response = await fetchWithTimeout(url, 15_000, ctx as unknown as RequestContext, {
-          signal: ctx.signal,
-        });
-        const text = await response.text();
-
-        if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
-          throw serviceUnavailable('Census Geocoder returned HTML instead of JSON.', {
-            reason: 'resolution_unavailable',
-          });
-        }
-
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(text);
-        } catch {
-          throw serviceUnavailable('Census Geocoder response could not be parsed.', {
-            reason: 'resolution_unavailable',
-          });
-        }
-
-        return parsed as GeocoderResult;
-      },
-      {
-        operation: 'GeographyService.resolveAddress',
-        context: ctx as unknown as RequestContext,
-        baseDelayMs: 1000,
-        signal: ctx.signal,
-      },
-    );
+    const data = await this.requestJson<GeocoderResult>('the Census Geocoder', url, ctx);
 
     const matches = data.result?.addressMatches ?? [];
 
@@ -1271,6 +1691,7 @@ export class GeographyService {
     const blockGeo = (geos['2020 Census Blocks'] ?? [])[0];
     const tractGeo = (geos['Census Tracts'] ?? [])[0] ?? blockGeo;
     const placeGeo = (geos['Incorporated Places'] ?? [])[0];
+    const subdivisionGeo = (geos['County Subdivisions'] ?? [])[0];
     const stateGeo = (geos.States ?? [])[0];
 
     // STATE field is available in Census Tracts, Blocks, and Incorporated Places.
@@ -1282,6 +1703,9 @@ export class GeographyService {
     // a place — an address outside every incorporated place has no place to report.
     const blockGroupFips = blockGeo?.BLKGRP ? String(blockGeo.BLKGRP) : undefined;
     const placeFips = placeGeo?.PLACE ? String(placeGeo.PLACE).padStart(5, '0') : undefined;
+    const countySubdivisionFips = subdivisionGeo?.COUSUB
+      ? String(subdivisionGeo.COUSUB).padStart(5, '0')
+      : undefined;
 
     if (!stateFips) {
       throw notFound('Geocoder matched address but returned no geographic identifiers.', {
@@ -1302,6 +1726,7 @@ export class GeographyService {
     };
 
     if (countyFips) result.countyFips = countyFips;
+    if (countySubdivisionFips) result.countySubdivisionFips = countySubdivisionFips;
     if (tractFips) result.tractFips = tractFips;
     if (blockGroupFips) result.blockGroupFips = blockGroupFips;
     if (placeFips) result.placeFips = placeFips;
@@ -1325,18 +1750,25 @@ export class GeographyService {
    * "New York" resolves to the state: the Census place name for New York City is also
    * exactly "New York", and there is no qualifier a caller would naturally add to tell them
    * apart, so the city requires an explicit `geography_type: "place"`.
+   *
+   * A state suffix naming one of the twelve states whose towns and townships govern adds the
+   * county subdivision level after county: an exact subdivision then outranks a place that only
+   * contains the name or a CDP named exactly it ("Greenwich, CT" is Greenwich town), while an
+   * exact county still answers first ("Plymouth, MA" is Plymouth County).
    */
-  private detectGeographyTypes(name: string): GeographyType[] {
+  private detectGeographyTypes(name: string, { stateAbbr }: SplitName): GeographyType[] {
     const trimmed = name.trim();
     const lower = trimmed.toLowerCase();
 
     if (ZIP_CODE.test(trimmed)) return [ZCTA];
     if (/^[A-Z]{2}$/.test(trimmed)) return ['state'];
-    if (STATE_NAME_TO_ABBR[lower]) return ['state'];
+    if (STATE_NAME_TO_ABBR.has(lower)) return ['state'];
     if (/\b(?:county|parish)\b/.test(lower)) return ['county'];
     if (/\bborough\b/.test(lower)) return ['county', 'place'];
     if (/\btract\b/.test(lower)) return ['tract'];
-    return ['place', 'county'];
+    return GOVERNMENT_SUBDIVISION_STATES.has(stateAbbr ?? '')
+      ? ['place', 'county', COUNTY_SUBDIVISION]
+      : ['place', 'county'];
   }
 
   private looksLikeAddress(name: string): boolean {

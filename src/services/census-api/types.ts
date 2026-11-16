@@ -116,8 +116,6 @@ export interface CensusVariableValue {
    * high relative standard error, noise infusion) leaves the estimate in place.
    */
   flag?: CensusFlag;
-  /** Human-readable label for this variable code. */
-  label: string;
   /** Margin of error if the corresponding MOE variable was requested. */
   moe?: number | null;
   /**

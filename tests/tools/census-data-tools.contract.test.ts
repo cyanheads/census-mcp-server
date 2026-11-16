@@ -21,6 +21,7 @@ import { initCensusApiService } from '@/services/census-api/census-api-service.j
 import { initGeographyService } from '@/services/geography/geography-service.js';
 import { initVariableCacheService } from '@/services/variable-cache/variable-cache-service.js';
 import { readNotice, readParagraphs } from '../helpers/markdown-readback.js';
+import { readVariableLabels } from '../helpers/variable-labels-readback.js';
 
 vi.mock('@/config/server-config.js', () => ({
   getDiscoveryConfig: vi.fn(() => ({ defaultYear: 2024, variableCacheTtlHours: 24 })),
@@ -131,6 +132,7 @@ const textOf = (result: { content: Array<{ type: string; text?: string }> }) =>
 
 const structured = (result: { structuredContent?: unknown }) =>
   result.structuredContent as {
+    variable_labels: Record<string, string>;
     rows: Array<{
       geography_name: string;
       geography_geoid: string;
@@ -142,7 +144,6 @@ const structured = (result: { structuredContent?: unknown }) =>
         {
           estimate: number | null;
           moe?: number | null;
-          label: string;
           suppressed: boolean;
           suppression_reason?: string;
           open_ended?: boolean;
@@ -530,13 +531,16 @@ describe('an unknown variable code is variable_not_found, and case is normalized
     expect(v.B19013_001E).toMatchObject({
       estimate: 122148,
       moe: 1808,
-      label: 'Estimate!!Median household income in the past 12 months',
     });
+    expect(structured(result).variable_labels.B19013_001E).toBe(
+      'Estimate!!Median household income in the past 12 months',
+    );
   });
 
   /**
    * `B19013_001EA` is accepted by the data API but has no `variables.json` entry. Before, its miss
-   * failed the whole label lookup and every code in the response lost its label.
+   * failed the whole label lookup and every code in the response lost its label. It keys its row
+   * values, and has no label of its own to state.
    */
   it('census_query_data keeps each label when an annotation column rides along', async () => {
     serveMetadata('acs/acs5', 2024, acsVariables);
@@ -552,11 +556,45 @@ describe('an unknown variable code is variable_not_found, and case is normalized
       parent_fips: '53',
     });
 
-    const v = structured(result).rows[0]?.variables ?? {};
-    expect(v.B19013_001E?.label).toBe('Estimate!!Median household income in the past 12 months');
-    expect(v.B19013_001M?.label).toContain('Margin of Error');
-    expect(v.B19013_001EA?.label).toBe('B19013_001EA');
-    expect(textOf(result)).toContain('*Estimate!!Median household income in the past 12 months*');
+    const out = structured(result);
+    const v = out.rows[0]?.variables ?? {};
+    expect(Object.keys(v)).toEqual(['B19013_001E', 'B19013_001M', 'B19013_001EA']);
+    for (const entry of Object.values(v)) expect(entry).not.toHaveProperty('label');
+    expect(out.variable_labels).toEqual({
+      B19013_001E: 'Estimate!!Median household income in the past 12 months',
+      B19013_001M: 'Margin of Error!!Median household income in the past 12 months',
+    });
+    const text = textOf(result);
+    expect(readVariableLabels(text)).toEqual(out.variable_labels);
+    for (const label of Object.values(out.variable_labels)) {
+      expect(JSON.stringify(result.structuredContent).split(label)).toHaveLength(2);
+      expect(text.split(label)).toHaveLength(2);
+    }
+  });
+
+  /** A business dataset's flag column, like an ACS annotation, sits only in another entry. */
+  it('census_query_data gives a cbp flag column requested as a code no label', async () => {
+    serveMetadata('cbp', 2023, {
+      EMP: { label: 'Number of employees', predicateType: 'int', attributes: 'EMP_F' },
+    });
+    serveData('cbp', 2023, () => [
+      ['NAME', 'EMP', 'EMP_F', 'state', 'county'],
+      ['King County, Washington', '1234567', 'r', '53', '033'],
+    ]);
+
+    const result = await runToolContract(censusQueryData, {
+      variables: ['EMP', 'EMP_F'],
+      geography_level: 'county',
+      geography_fips: '033',
+      parent_fips: '53',
+      dataset: 'cbp',
+      year: 2023,
+    });
+
+    const out = structured(result);
+    expect(Object.keys(out.rows[0]?.variables ?? {})).toEqual(['EMP', 'EMP_F']);
+    expect(out.variable_labels).toEqual({ EMP: 'Number of employees' });
+    expect(readVariableLabels(textOf(result))).toEqual({ EMP: 'Number of employees' });
   });
 
   it('census_compare_geographies ranks by a lowercase sort_by as its canonical code', async () => {
@@ -1391,6 +1429,62 @@ describe('predicate values: blank is omitted, "*" is a labelled breakdown', () =
     expect(hint).toContain('NAICS2017');
     expect(hint).toContain('"11" (Agriculture, forestry, fishing and hunting)');
   });
+
+  /**
+   * Two King County rows nothing in the response separates. cbp declares filter dimensions, so
+   * both tools send the caller to them — never to GEO_ID, which pins rows only on a dataset that
+   * declares none (geoinfo, #92).
+   */
+  const unseparatedRows = (url: URL) => {
+    const [header = [], row = []] = cbpRows(url);
+    return [header, row, header.map((column, i) => (column === 'ESTAB' ? '612' : row[i]))];
+  };
+  const pinned = { NAICS2017: '00', LFO: '001', EMPSZES: '001' };
+
+  it('census_query_data names the filter dimensions for one geography on rows nothing separates', async () => {
+    serveMetadata('cbp', 2023, cbpVariables);
+    serveData('cbp', 2023, unseparatedRows);
+
+    const result = await runToolContract(censusQueryData, {
+      variables: ['ESTAB'],
+      geography_level: 'county',
+      geography_fips: '033',
+      parent_fips: '53',
+      dataset: 'cbp',
+      predicates: pinned,
+    });
+
+    expect(structured(result).rows).toHaveLength(2);
+    const notice = structured(result).notice ?? '';
+    expect(notice).toContain(
+      "cbp (2023) returned 2 rows for a single geography and nothing in the response separates them. Set the dataset's filter dimensions explicitly in predicates to pin one — census_list_predicate_values enumerates the codes each one accepts.",
+    );
+    expect(notice).not.toContain('GEO_ID');
+    expect(readNotice(result)).toBe(notice);
+  });
+
+  it('census_compare_geographies names the filter dimensions for rows nothing separates', async () => {
+    serveMetadata('cbp', 2023, cbpVariables);
+    serveData('cbp', 2023, unseparatedRows);
+
+    const result = await runToolContract(censusCompareGeographies, {
+      variables: ['ESTAB'],
+      geography_level: 'county',
+      within: '53',
+      dataset: 'cbp',
+      predicates: pinned,
+    });
+
+    expect(result.isError).toBe(true);
+    const error = errorOf(result);
+    expect(error.data).toMatchObject({ reason: 'ambiguous_rows', rowsPerGeography: 2 });
+    const hint = (error.data.recovery as { hint: string }).hint;
+    expect(hint).toBe(
+      "Set the dataset's filter dimensions explicitly in predicates — census_list_predicate_values enumerates the codes each one accepts — or query one geography at a time with census_query_data.",
+    );
+    const paragraphs = readParagraphs(textOf(result));
+    expect(paragraphs.find((p) => p.startsWith('Recovery: '))).toBe(`Recovery: ${hint}`);
+  });
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -2173,9 +2267,13 @@ describe('census_compare_geographies refuses a ranking it cannot make', () => {
     });
 
     expect(result.isError).toBe(true);
-    expect(errorOf(result).message).toBe('At least one variable code is required.');
+    // #88: a table in group is the other way to name something to retrieve.
+    expect(errorOf(result).message).toBe(
+      'At least one variable code or a table in group is required.',
+    );
+    expect(errorOf(result).data.reason).toBe('variables_or_group_required');
     expect(textOf(result)).toContain(
-      'Recovery: Pass variable codes such as B01003_001E — census_search_variables finds them.',
+      'Recovery: Pass variable codes such as `B01003_001E`, or a table ID such as `B01001` in group — census_search_variables finds both.',
     );
     expect(calls).toHaveLength(0);
   });
@@ -2500,6 +2598,8 @@ describe('the added datasets answer on both surfaces', () => {
       geography_level: 'state',
       geography_fips: '53',
       dataset: 'acs/acs1/cprofile',
+      // The 2021–2024 vintages carry the 2020 columns; the 2025 default does not (#91).
+      year: 2024,
     });
 
     const value = structured(result).rows[0]?.variables.CP03_2020_062E;
@@ -4708,6 +4808,25 @@ describe('no error repeats itself between its message and its recovery hint (#62
     },
     {
       tool: tool('census_resolve_geography'),
+      reason: 'address_rejected',
+      label: 'an address the geocoder rejects as too long',
+      input: { name: `1 ${'Long '.repeat(25)}St, Seattle, WA 98109` },
+      serve: () => {
+        routes.push({
+          match: (u) => u.hostname === 'geocoding.geo.census.gov',
+          respond: () =>
+            new Response(
+              JSON.stringify({
+                errors: ['Address cannot be empty and cannot exceed 100 characters'],
+                status: '400',
+              }),
+              { status: 400, headers: { 'content-type': 'application/json' } },
+            ),
+        });
+      },
+    },
+    {
+      tool: tool('census_resolve_geography'),
       reason: undefined,
       label: 'a blank name',
       input: { name: '   ' },
@@ -4921,7 +5040,8 @@ describe('no error repeats itself between its message and its recovery hint (#62
         },
         {
           tool: definition,
-          reason: undefined,
+          // census_query_data also takes a table in group, so its refusal names a reason (#88).
+          reason: definition === query ? 'variables_or_group_required' : undefined,
           label: 'only blank codes',
           input: { ...base, variables: ['  '] },
         },
@@ -5099,6 +5219,55 @@ describe('no error repeats itself between its message and its recovery hint (#62
         },
       }),
     ),
+
+    // A table requested whole through group (#88).
+    {
+      tool: query,
+      reason: 'group_not_supported',
+      label: 'a table on a dataset whose tables carry filter dimensions',
+      input: { ...atState, dataset: 'cbp', group: 'CB2300CBP' },
+      serve: serveCbp,
+    },
+    {
+      tool: query,
+      reason: 'multiple_groups',
+      label: 'group and a group() entry naming two tables',
+      input: { ...atState, variables: ['group(B19013)'], group: 'B01001' },
+    },
+    {
+      tool: query,
+      reason: 'variable_not_found',
+      label: 'a table the dataset does not publish',
+      input: { ...atState, group: 'B99999' },
+      serve: () => {
+        serveAcs();
+        override('/data/2024/acs/acs1/groups/B99999.json', () => plain(404, 'Not Found'));
+      },
+    },
+    {
+      tool: query,
+      reason: 'variable_not_found',
+      label: 'a table a sibling dataset publishes',
+      input: { ...atState, group: 'S1701' },
+      serve: () => {
+        serveAcs();
+        override('/data/2024/acs/acs5/subject/groups/S1701.json', () => ({ name: 'S1701' }));
+      },
+    },
+    {
+      tool: query,
+      reason: 'upstream_error',
+      label: 'a whole table the data endpoint never answers',
+      input: { ...atState, group: 'B19013' },
+      serve: () => {
+        serveMetadata('acs/acs5', 2024, {
+          ...acsVariables,
+          B19013_001E: { ...acsVariables.B19013_001E, group: 'B19013' },
+        });
+        serveData('acs/acs5', 2024, () => HANG);
+      },
+      backoff: true,
+    },
   ];
 
   const run = async (scenario: Scenario) => {
@@ -5150,6 +5319,1284 @@ describe('no error repeats itself between its message and its recovery hint (#62
       expect(message).toBe(error.message);
       expect(hint, 'every failure names a next step').toBeDefined();
       expect(repeatsBetween(message ?? '', hint ?? '')).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// #92 — geoinfo: land area and internal points
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * geoinfo modelled on api.census.gov answers captured on 2026-11-15, in the shape every query here
+ * sends. GEOCOMP is its only required variable, so it declares no filter dimension, and its 2020
+ * vintage publishes a ZCTA once per delineation, told apart only by GEO_ID.
+ */
+describe('geoinfo answers land area and internal points (#92)', () => {
+  type Cells = Readonly<Record<string, string>>;
+
+  const measure = (label: string, predicateType: 'int' | 'float') => ({
+    label,
+    concept: 'Annual Geographic Information Table',
+    predicateType,
+    group: 'GEOINFO',
+  });
+  const geoinfoVariables = {
+    AREALAND: measure('Area (Land, in square meters)', 'int'),
+    AREAWATR: measure('Area (Water, in square meters)', 'int'),
+    AREALAND_SQMI: measure('Area (Land, in square miles)', 'float'),
+    AREAWATR_SQMI: measure('Area (Water, in square miles)', 'float'),
+    INTPTLAT: measure('Internal Point (Latitude)', 'float'),
+    INTPTLON: measure('Internal Point (Longitude)', 'float'),
+    GEO_ID: {
+      label: 'Geographic Identifier',
+      concept: 'Annual Geographic Information Table',
+      predicateType: 'string',
+      group: 'GEOINFO',
+      attributes: 'NAME',
+    },
+    GEOCOMP: {
+      label: 'GEO_ID Component',
+      required: 'default displayed',
+      predicateType: 'string',
+      group: 'N/A',
+    },
+    // The geography columns publish no predicate type.
+    STATE: { label: 'State', predicateType: null, group: 'N/A' },
+    ZCTA: { label: 'ZIP Code Tabulation Area', predicateType: null, group: 'N/A' },
+  };
+
+  const ZCTA = 'zip code tabulation area';
+  const levels = [
+    { name: 'us', geoLevelDisplay: '010' },
+    { name: 'state', geoLevelDisplay: '040' },
+    {
+      name: 'county',
+      geoLevelDisplay: '050',
+      requires: ['state'],
+      wildcard: ['state'],
+      optionalWithWCFor: 'state',
+    },
+    {
+      name: 'tract',
+      geoLevelDisplay: '140',
+      requires: ['state', 'county'],
+      wildcard: ['county'],
+      optionalWithWCFor: 'county',
+    },
+    {
+      name: 'place',
+      geoLevelDisplay: '160',
+      requires: ['state'],
+      wildcard: ['state'],
+      optionalWithWCFor: 'state',
+    },
+    { name: ZCTA, geoLevelDisplay: '860' },
+  ];
+
+  /** Land area in square miles of every Washington county, 2024. */
+  const WA_COUNTIES = [
+    ['001', 'Adams', '1924.989'],
+    ['003', 'Asotin', '636.075'],
+    ['005', 'Benton', '1700.128'],
+    ['007', 'Chelan', '2921.178'],
+    ['009', 'Clallam', '1738.774'],
+    ['011', 'Clark', '628.501'],
+    ['013', 'Columbia', '868.585'],
+    ['015', 'Cowlitz', '1141.159'],
+    ['017', 'Douglas', '1819.244'],
+    ['019', 'Ferry', '2203.241'],
+    ['021', 'Franklin', '1241.596'],
+    ['023', 'Garfield', '710.835'],
+    ['025', 'Grant', '2679.547'],
+    ['027', 'Grays Harbor', '1901.464'],
+    ['029', 'Island', '208.474'],
+    ['031', 'Jefferson', '1803.728'],
+    ['033', 'King', '2115.696'],
+    ['035', 'Kitsap', '395.111'],
+    ['037', 'Kittitas', '2297.291'],
+    ['039', 'Klickitat', '1871.636'],
+    ['041', 'Lewis', '2402.782'],
+    ['043', 'Lincoln', '2310.599'],
+    ['045', 'Mason', '959.553'],
+    ['047', 'Okanogan', '5266.193'],
+    ['049', 'Pacific', '933.373'],
+    ['051', 'Pend Oreille', '1400.245'],
+    ['053', 'Pierce', '1668.004'],
+    ['055', 'San Juan', '173.914'],
+    ['057', 'Skagit', '1730.231'],
+    ['059', 'Skamania', '1658.268'],
+    ['061', 'Snohomish', '2086.515'],
+    ['063', 'Spokane', '1764.224'],
+    ['065', 'Stevens', '2477.103'],
+    ['067', 'Thurston', '722.501'],
+    ['069', 'Wahkiakum', '262.928'],
+    ['071', 'Walla Walla', '1270.033'],
+    ['073', 'Whatcom', '2107.949'],
+    ['075', 'Whitman', '2159.262'],
+    ['077', 'Yakima', '4294.512'],
+  ] as const;
+
+  /** King County's other measures, as the Census prints them. */
+  const KING_COUNTY = {
+    AREAWATR_SQMI: '191.707',
+    INTPTLAT: '47.49055180',
+    INTPTLON: '-121.83397650',
+  };
+
+  const published2024: Cells[] = [
+    ...WA_COUNTIES.map(([county, name, landSqmi]) => ({
+      NAME: `${name} County, Washington`,
+      AREALAND_SQMI: landSqmi,
+      ...(county === '033' && KING_COUNTY),
+      state: '53',
+      county,
+    })),
+    {
+      NAME: 'Census Tract 71.01; King County; Washington',
+      AREALAND_SQMI: '0.191',
+      state: '53',
+      county: '033',
+      tract: '007101',
+    },
+    { NAME: 'Seattle city, Washington', AREALAND_SQMI: '84.000', state: '53', place: '63000' },
+  ];
+
+  /** 2020 publishes each ZCTA under its 2010 (8600000) and its 2020 (860Z200) delineation. */
+  const published2020: Cells[] = (
+    [
+      ['98101', '0.519', '0.528'],
+      ['98102', '1.292', '1.273'],
+    ] as const
+  ).flatMap(([zcta, land2010, land2020]) => [
+    { NAME: `ZCTA5 ${zcta}`, AREALAND_SQMI: land2010, GEO_ID: `8600000US${zcta}`, [ZCTA]: zcta },
+    { NAME: `ZCTA5 ${zcta}`, AREALAND_SQMI: land2020, GEO_ID: `860Z200US${zcta}`, [ZCTA]: zcta },
+  ]);
+
+  /**
+   * Answer a data request the way the Census does: the rows matching `for`, `in`, and a GEO_ID
+   * predicate, with the requested columns, the echoed predicate, then the geography columns.
+   */
+  const answer =
+    (published: readonly Cells[]) =>
+    (url: URL): Body => {
+      const [level = '', codes = ''] = (url.searchParams.get('for') ?? '').split(':');
+      const parents = (url.searchParams.get('in') ?? '')
+        .split(' ')
+        .filter(Boolean)
+        .map((clause) => clause.split(':') as [string, string]);
+      // A row is at the requested level when its geography columns are exactly the clause's.
+      const geoColumns = [...parents.map(([column]) => column), level];
+      const pinned = url.searchParams.get('GEO_ID');
+      const rows = published.filter(
+        (cells) =>
+          Object.keys(cells)
+            .filter((column) => /^[a-z]/.test(column))
+            .join('|') === geoColumns.join('|') &&
+          (codes === '*' || codes.split(',').includes(cells[level] ?? '')) &&
+          parents.every(([column, code]) => cells[column] === code) &&
+          (pinned === null || cells.GEO_ID === pinned),
+      );
+      if (rows.length === 0) return new Response(null, { status: 204 });
+      const header = [...getList(url), ...(pinned === null ? [] : ['GEO_ID']), ...geoColumns];
+      return [header, ...rows.map((cells) => header.map((column) => cells[column] ?? null))];
+    };
+
+  const serveGeoinfo = (year: number, published: readonly Cells[]) => {
+    routes.push(
+      {
+        match: (u) => u.pathname === `${at('geoinfo', year)}/variables.json`,
+        respond: () => ({ variables: geoinfoVariables }),
+      },
+      {
+        match: (u) => u.pathname === `${at('geoinfo', year)}/geography.json`,
+        respond: () => ({ fips: levels }),
+      },
+    );
+    serveData('geoinfo', year, answer(published));
+  };
+
+  it('census_query_data returns the areas and internal point of a county, with no notice and no applied_filters', async () => {
+    serveGeoinfo(2024, published2024);
+
+    const result = await runToolContract(censusQueryData, {
+      variables: ['AREALAND_SQMI', 'AREAWATR_SQMI', 'INTPTLAT', 'INTPTLON'],
+      geography_level: 'county',
+      geography_fips: '033',
+      parent_fips: '53',
+      dataset: 'geoinfo',
+      year: 2024,
+    });
+
+    expect(result.isError).toBeFalsy();
+    // No filter dimension, record dimension, or flag column adds anything to the request.
+    expect(getList(dataCalls('geoinfo', 2024)[0])).toEqual([
+      'NAME',
+      'AREALAND_SQMI',
+      'AREAWATR_SQMI',
+      'INTPTLAT',
+      'INTPTLON',
+    ]);
+    const out = structured(result);
+    expect(out.rows).toHaveLength(1);
+    const [row] = out.rows;
+    expect(row?.geography_name).toBe('King County, Washington');
+    expect(row?.geography_geoid).toBe('53033');
+    expect(row?.variables.AREALAND_SQMI?.estimate).toBe(2115.696);
+    expect(row?.variables.AREAWATR_SQMI?.estimate).toBe(191.707);
+    expect(row?.variables.INTPTLAT?.estimate).toBe(47.4905518);
+    expect(row?.variables.INTPTLON?.estimate).toBe(-121.8339765);
+    expect(row).not.toHaveProperty('applied_filters');
+    expect(row).not.toHaveProperty('record');
+    expect(out.notice).toBeUndefined();
+    expect(textOf(result)).toContain('King County, Washington');
+  });
+
+  it.each([
+    [
+      'tract 007101',
+      { geography_level: 'tract', geography_fips: '007101', parent_fips: '53', county_fips: '033' },
+      'Census Tract 71.01; King County; Washington',
+      0.191,
+    ],
+    [
+      'place 63000',
+      { geography_level: 'place', geography_fips: '63000', parent_fips: '53' },
+      'Seattle city, Washington',
+      84,
+    ],
+  ])('census_query_data returns the land area of %s', async (_name, geography, name, landSqmi) => {
+    serveGeoinfo(2024, published2024);
+
+    const result = await runToolContract(censusQueryData, {
+      variables: ['AREALAND_SQMI'],
+      dataset: 'geoinfo',
+      year: 2024,
+      ...geography,
+    });
+
+    const [row] = structured(result).rows;
+    expect(row?.geography_name).toBe(name);
+    expect(row?.variables.AREALAND_SQMI?.estimate).toBe(landSqmi);
+    expect(structured(result).notice).toBeUndefined();
+  });
+
+  it('census_compare_geographies ranks Washington counties by land area, Okanogan first of 39', async () => {
+    serveGeoinfo(2024, published2024);
+
+    const result = await runToolContract(censusCompareGeographies, {
+      variables: ['AREALAND_SQMI'],
+      geography_level: 'county',
+      within: '53',
+      dataset: 'geoinfo',
+      year: 2024,
+      limit: 3,
+    });
+
+    expect(result.isError).toBeFalsy();
+    const out = structured(result) as ReturnType<typeof structured> & { totalCount: number };
+    expect(out.totalCount).toBe(39);
+    expect(
+      out.rows.map((row) => [row.rank, row.geography_name, row.variables.AREALAND_SQMI?.estimate]),
+    ).toEqual([
+      [1, 'Okanogan County, Washington', 5266.193],
+      [2, 'Yakima County, Washington', 4294.512],
+      [3, 'Chelan County, Washington', 2921.178],
+    ]);
+  });
+
+  it('census_query_data returns one 2020 ZCTA on two rows, which GEO_ID labels when requested', async () => {
+    serveGeoinfo(2020, published2020);
+
+    const bare = await runToolContract(censusQueryData, {
+      variables: ['AREALAND_SQMI'],
+      geography_level: ZCTA,
+      geography_fips: '98101',
+      dataset: 'geoinfo',
+      year: 2020,
+    });
+    expect(structured(bare).rows.map((row) => row.variables.AREALAND_SQMI?.estimate)).toEqual([
+      0.519, 0.528,
+    ]);
+    const notice = structured(bare).notice ?? '';
+    expect(notice).toContain('returned 2 rows for a single geography');
+    // geoinfo declares no filter dimension, so the notice names the one column that separates them.
+    expect(notice).toContain('only GEO_ID tells them apart');
+    expect(notice).toContain('{"GEO_ID": "<its GEO_ID>"}');
+    expect(notice).not.toMatch(/filter dimension/);
+    expect(notice).not.toContain('census_list_predicate_values');
+    expect(readNotice(bare)).toBe(notice);
+
+    const labelled = await runToolContract(censusQueryData, {
+      variables: ['AREALAND_SQMI', 'GEO_ID'],
+      geography_level: ZCTA,
+      geography_fips: '98101',
+      dataset: 'geoinfo',
+      year: 2020,
+    });
+    expect(structured(labelled).rows.map((row) => row.variables.GEO_ID?.value)).toEqual([
+      '8600000US98101',
+      '860Z200US98101',
+    ]);
+    const text = textOf(labelled);
+    expect(text).toContain('8600000US98101');
+    expect(text).toContain('860Z200US98101');
+  });
+
+  it('census_query_data pins one 2020 delineation with a GEO_ID predicate, as the catalog says', async () => {
+    serveGeoinfo(2020, published2020);
+
+    const result = await runToolContract(censusQueryData, {
+      variables: ['AREALAND_SQMI'],
+      geography_level: ZCTA,
+      geography_fips: '98101',
+      dataset: 'geoinfo',
+      year: 2020,
+      predicates: { GEO_ID: '860Z200US98101' },
+    });
+
+    expect(dataCalls('geoinfo', 2020)[0]?.searchParams.get('GEO_ID')).toBe('860Z200US98101');
+    const out = structured(result);
+    expect(out.rows.map((row) => row.variables.AREALAND_SQMI?.estimate)).toEqual([0.528]);
+    expect(out.notice).toBeUndefined();
+  });
+
+  it('census_compare_geographies refuses to rank 2020 ZCTAs published once per delineation', async () => {
+    serveGeoinfo(2020, published2020);
+
+    const result = await runToolContract(censusCompareGeographies, {
+      variables: ['AREALAND_SQMI'],
+      geography_level: ZCTA,
+      geographies: ['98101', '98102'],
+      dataset: 'geoinfo',
+      year: 2020,
+    });
+
+    expect(result.isError).toBe(true);
+    const error = errorOf(result);
+    expect(error.data).toMatchObject({
+      reason: 'ambiguous_rows',
+      dataset: 'geoinfo',
+      year: 2020,
+      rowsPerGeography: 2,
+    });
+    // The recovery names GEO_ID, not filter dimensions geoinfo does not have.
+    const hint = (error.data.recovery as { hint: string }).hint;
+    expect(hint).toMatch(/^Only GEO_ID tells the rows apart/);
+    expect(hint).toContain('census_query_data');
+    expect(hint).not.toMatch(/filter dimension/);
+    expect(hint).not.toContain('census_list_predicate_values');
+    const paragraphs = readParagraphs(textOf(result));
+    expect(paragraphs.find((p) => p.startsWith('Recovery: '))).toBe(`Recovery: ${hint}`);
+    expect(repeatsBetween(error.message, hint)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// #94 — a vintage drawn on earlier tracts, and Connecticut's two county schemes
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Modelled on api.census.gov answers probed on 2026-11-15: King County, WA tract 007100 (Census
+ * Tract 71) is published through 2019, and the 2020 Census split it into 007101 and 007102; acs/acs5
+ * 2021 publishes Connecticut's eight counties and 2022 its nine planning regions, with the same
+ * tract codes under each.
+ */
+describe('a code a vintage draws differently from the resolver is named as a possible cause (#94)', () => {
+  const TRACT_2010 =
+    'acs/acs5 (2019) publishes census tracts as drawn for the 2010 Census, not the 2020 tracts census_resolve_geography returns — the 2020 Census split, merged, or renumbered many of them, so a 2020 tract code can be missing here';
+  const QUERY_LISTING =
+    'geography_fips "*" at geography_level "tract", with the same parent_fips and county_fips, lists the tracts this vintage publishes.';
+  const WIDTH = 'Confirm the FIPS codes exist in';
+  const GEOID_GUIDANCE = "The geographies filter matches a row's full GEOID";
+
+  /** Every level from state down to block, each listed with the parents and wildcards it takes. */
+  const serveLevels = (dataset: string, year: number) => {
+    routes.push(
+      {
+        match: (u) => u.pathname === `${at(dataset, year)}/variables.json`,
+        respond: () => ({ variables: acsVariables }),
+      },
+      {
+        match: (u) => u.pathname === `${at(dataset, year)}/geography.json`,
+        respond: () => ({
+          fips: [
+            { name: 'state', geoLevelDisplay: '040' },
+            {
+              name: 'county',
+              geoLevelDisplay: '050',
+              requires: ['state'],
+              wildcard: ['state'],
+              optionalWithWCFor: 'state',
+            },
+            {
+              name: 'county subdivision',
+              geoLevelDisplay: '060',
+              requires: ['state', 'county'],
+              wildcard: ['county'],
+              optionalWithWCFor: 'county',
+            },
+            {
+              name: 'tract',
+              geoLevelDisplay: '140',
+              requires: ['state', 'county'],
+              wildcard: ['county'],
+              optionalWithWCFor: 'county',
+            },
+            {
+              name: 'block group',
+              geoLevelDisplay: '150',
+              requires: ['state', 'county', 'tract'],
+              wildcard: ['county', 'tract'],
+              optionalWithWCFor: 'tract',
+            },
+            {
+              name: 'block',
+              geoLevelDisplay: '100',
+              requires: ['state', 'county', 'tract'],
+              wildcard: ['county', 'tract'],
+              optionalWithWCFor: 'tract',
+            },
+          ],
+        }),
+      },
+    );
+  };
+
+  /** The geography columns the Census API answers a level with ahead of its own, named or not. */
+  const PARENT_COLUMNS: Readonly<Record<string, string[]>> = {
+    county: ['state'],
+    'county subdivision': ['state', 'county'],
+    tract: ['state', 'county'],
+    'block group': ['state', 'county', 'tract'],
+    block: ['state', 'county', 'tract'],
+  };
+
+  /**
+   * Answer the data endpoint from the codes `published` holds, each a row of codes from state down
+   * to the requested level, filtered by the request's `for` and `in` as the Census API filters them.
+   * A parent the request leaves out of `in` is still a column of every row. Nothing selected is a
+   * 204, as the Census API answers it.
+   */
+  const servePublished = (dataset: string, year: number, published: string[][]) => {
+    serveLevels(dataset, year);
+    serveData(dataset, year, (url) => {
+      const header = getList(url);
+      const [level = '', target = '*'] = (url.searchParams.get('for') ?? '').split(':');
+      const scope = (url.searchParams.get('in') ?? '').split(' ').filter(Boolean);
+      const levels = [...(PARENT_COLUMNS[level] ?? []), level];
+      const targets = target.split(',');
+      const rows = published.filter(
+        (codes) =>
+          codes.length === levels.length &&
+          scope.every((part) => {
+            const [column = '', code] = part.split(':');
+            return code === '*' || code === codes[levels.indexOf(column)];
+          }) &&
+          (target === '*' || targets.includes(codes.at(-1) ?? '')),
+      );
+      if (rows.length === 0) return new Response(null, { status: 204 });
+      return [
+        [...header, ...levels],
+        ...rows.map((codes) => [
+          ...header.map((h) => (h === 'NAME' ? `${level} ${codes.at(-1)}` : '5301')),
+          ...codes,
+        ]),
+      ];
+    });
+  };
+
+  /** The King County tracts and block groups a 2019 vintage publishes around Tract 71. */
+  const king2019 = (dataset = 'acs/acs5', year = 2019) =>
+    servePublished(dataset, year, [
+      ['53', '033'],
+      ['53', '033', '007000'],
+      ['53', '033', '007100'],
+      ['53', '033', '007100', '1'],
+      ['53', '033', '007100', '2'],
+    ]);
+
+  const hintOf = (result: { structuredContent?: unknown }) =>
+    (errorOf(result).data.recovery as { hint: string }).hint;
+
+  /** content[]'s Recovery paragraph, read back with each code span's text in place of its marker. */
+  const recoveryShown = (result: { content: Array<{ type: string; text?: string }> }) =>
+    readParagraphs(textOf(result))
+      .find((p) => p.startsWith('Recovery: '))
+      ?.slice('Recovery: '.length)
+      .replace(/«code_inline:([^»]*)»/g, '$1');
+
+  /** The no_data contract for a hint that names a boundary change ahead of the code guidance. */
+  const expectBoundaryHint = (
+    result: Awaited<ReturnType<typeof runToolContract>>,
+    boundary: string,
+    guidance: string,
+  ) => {
+    expect(result.isError).toBe(true);
+    const error = errorOf(result);
+    expect(error.data.reason).toBe('no_data');
+    const hint = hintOf(result);
+    expect(hint).toContain(boundary);
+    // The width or GEOID guidance stays, as the second cause.
+    expect(hint.indexOf(guidance)).toBeGreaterThan(hint.indexOf(boundary));
+    // A value to send back ("*", "09") reaches content[] as a code span a model copies verbatim,
+    // and the whole hint reads back as structuredContent carries it.
+    for (const value of ['*', '09']) {
+      if (hint.includes(`"${value}"`)) expect(textOf(result)).toContain(`"\`${value}\`"`);
+    }
+    expect(recoveryShown(result)).toBe(hint);
+    expect(repeatsBetween(error.message, hint)).toEqual([]);
+  };
+
+  const kingTract = (overrides: Record<string, unknown> = {}) => ({
+    variables: ['B01003_001E'],
+    geography_level: 'tract',
+    geography_fips: '007101',
+    parent_fips: '53',
+    county_fips: '033',
+    year: 2019,
+    ...overrides,
+  });
+
+  it('census_query_data: a 2020 tract on acs/acs5 2019 names the 2010 tracts and the listing first', async () => {
+    king2019();
+
+    const result = await runToolContract(censusQueryData, kingTract());
+
+    expectBoundaryHint(result, `${TRACT_2010}. ${QUERY_LISTING}`, WIDTH);
+    expect(errorOf(result).message).toBe('No data returned for tract in acs/acs5 (2019).');
+    expect(hintOf(result)).toContain('a county is "051", not "51"');
+    expect(dataCalls('acs/acs5', 2019)).toHaveLength(1);
+  });
+
+  it('census_compare_geographies: a 2020 tract GEOID on 2019 names the 2010 tracts and the listing first', async () => {
+    king2019();
+
+    const result = await runToolContract(censusCompareGeographies, {
+      variables: ['B01003_001E'],
+      geography_level: 'tract',
+      within: '53',
+      within_county: '033',
+      geographies: ['53033007101'],
+      year: 2019,
+    });
+
+    expectBoundaryHint(
+      result,
+      `${TRACT_2010}. Omitting geographies, with the same within and within_county, lists every tract this vintage publishes, each GEOID carrying its tract.`,
+      GEOID_GUIDANCE,
+    );
+  });
+
+  it('census_query_data: a list returns the 2010 tract and names the 2020 one with the tract change', async () => {
+    king2019();
+
+    const result = await runToolContract(
+      censusQueryData,
+      kingTract({ geography_fips: '007101,007100' }),
+    );
+
+    expect(result.isError).not.toBe(true);
+    expect(structured(result).rows.map((row) => row.geography_geoid)).toEqual(['53033007100']);
+    const notice = structured(result).notice ?? '';
+    expect(notice).toContain(
+      `No row came back for 1 of the 2 geography_fips codes: 007101. ${TRACT_2010}. ${QUERY_LISTING} The Census API matches each code literally`,
+    );
+    expect(readNotice(result)).toBe(notice);
+  });
+
+  it('census_compare_geographies: a list ranks the 2010 tract and names the 2020 one with the tract change', async () => {
+    king2019();
+
+    const result = await runToolContract(censusCompareGeographies, {
+      variables: ['B01003_001E'],
+      geography_level: 'tract',
+      within: '53',
+      within_county: '033',
+      geographies: ['53033007101', '53033007100'],
+      year: 2019,
+    });
+
+    expect(result.isError).not.toBe(true);
+    expect(structured(result).rows.map((row) => row.geography_geoid)).toEqual(['53033007100']);
+    const notice = structured(result).notice ?? '';
+    expect(notice).toContain(
+      `No tract matched 1 of the requested geographies: 53033007101. ${TRACT_2010}. Omitting geographies`,
+    );
+    expect(notice).toContain('. Entries must be a full GEOID');
+    expect(readNotice(result)).toBe(notice);
+  });
+
+  it.each([
+    ['block group "2"', { geography_level: 'block group', geography_fips: '2' }],
+    ['block group "*"', { geography_level: 'block group', geography_fips: '*' }],
+  ])(
+    'census_query_data: a %s inside the 2020 tract on 2019 gets the tract-vintage hint',
+    async (_label, level) => {
+      king2019();
+
+      const result = await runToolContract(
+        censusQueryData,
+        kingTract({ ...level, tract_fips: '007101' }),
+      );
+
+      expectBoundaryHint(
+        result,
+        `${TRACT_2010}, along with its block groups. ${QUERY_LISTING}`,
+        WIDTH,
+      );
+    },
+  );
+
+  it('census_query_data: block "*" inside the 2020 tract on dec/pl 2010 gets the tract-vintage hint', async () => {
+    king2019('dec/pl', 2010);
+
+    const result = await runToolContract(
+      censusQueryData,
+      kingTract({
+        dataset: 'dec/pl',
+        year: 2010,
+        geography_level: 'block',
+        geography_fips: '*',
+        tract_fips: '007101',
+      }),
+    );
+
+    expectBoundaryHint(
+      result,
+      'dec/pl (2010) publishes census tracts as drawn for the 2010 Census, not the 2020 tracts census_resolve_geography returns — the 2020 Census split, merged, or renumbered many of them, so a 2020 tract code can be missing here, along with its blocks.',
+      WIDTH,
+    );
+  });
+
+  it('census_compare_geographies: a block group GEOID inside the 2020 tract on 2019 gets the tract-vintage hint', async () => {
+    king2019();
+
+    const result = await runToolContract(censusCompareGeographies, {
+      variables: ['B01003_001E'],
+      geography_level: 'block group',
+      within: '53',
+      within_county: '033',
+      geographies: ['530330071012'],
+      year: 2019,
+    });
+
+    expectBoundaryHint(result, `${TRACT_2010}, along with its block groups.`, GEOID_GUIDANCE);
+  });
+
+  it('census_compare_geographies: a bare block group code on 2019 names no tract change, carrying no tract', async () => {
+    king2019();
+
+    const result = await runToolContract(censusCompareGeographies, {
+      variables: ['B01003_001E'],
+      geography_level: 'block group',
+      within: '53',
+      within_county: '033',
+      geographies: ['1', '3'],
+      year: 2019,
+    });
+
+    expect(result.isError).not.toBe(true);
+    expect(structured(result).rows.map((row) => row.geography_geoid)).toEqual(['530330071001']);
+    const notice = structured(result).notice ?? '';
+    expect(notice).toContain(
+      'No block group matched 1 of the requested geographies: 3. Entries must be a full GEOID',
+    );
+    expect(notice).not.toContain('census tracts as drawn');
+  });
+
+  it.each([
+    ['acs/acs5', 2009],
+    ['dec/pl', 2000],
+  ])('%s %i names 2000 tracts', async (dataset, year) => {
+    king2019(dataset, year);
+
+    const result = await runToolContract(censusQueryData, kingTract({ dataset, year }));
+
+    expectBoundaryHint(
+      result,
+      `${dataset} (${year}) publishes census tracts as drawn for the 2000 Census`,
+      WIDTH,
+    );
+  });
+
+  it.each([
+    ['a 2020 vintage', kingTract({ year: 2020, geography_fips: '999999' }), 2020],
+    ['a tract-level "*"', kingTract({ geography_fips: '*', county_fips: '999' }), 2019],
+    [
+      'the county level',
+      {
+        ...kingTract({ geography_level: 'county', geography_fips: '999' }),
+        county_fips: undefined,
+      },
+      2019,
+    ],
+  ])('names no tract change for %s', async (_label, input, year) => {
+    king2019('acs/acs5', year);
+
+    const result = await runToolContract(censusQueryData, input);
+
+    expect(errorOf(result).data.reason).toBe('no_data');
+    expect(hintOf(result)).not.toContain('census tracts as drawn');
+    expect(textOf(result)).not.toContain('census tracts as drawn');
+  });
+
+  /** Connecticut on acs/acs5 2021 and 2022: the eight counties, then the nine planning regions. */
+  const connecticut = () => {
+    servePublished('acs/acs5', 2021, [
+      ['09', '001'],
+      ['09', '005'],
+      ['09', '001', '010101'],
+    ]);
+    servePublished('acs/acs5', 2022, [
+      ['09', '110'],
+      ['09', '190'],
+      ['09', '190', '010101'],
+    ]);
+  };
+  const ctCounty = (year: number, code: string) => ({
+    variables: ['B01003_001E'],
+    geography_level: 'county',
+    geography_fips: code,
+    parent_fips: '09',
+    year,
+  });
+
+  it.each([
+    [
+      2021,
+      '190',
+      "Connecticut's county 190 is among the nine planning regions (110–190) that vintages from 2022 publish; acs/acs5 (2021) publishes the eight counties from before 2022 (001–015) in their place.",
+    ],
+    [
+      2022,
+      '001',
+      "Connecticut's county 001 is among the eight counties from before 2022 (001–015); acs/acs5 (2022) publishes the nine planning regions (110–190) that replaced them.",
+    ],
+  ])(
+    'census_query_data: a Connecticut county on %i in the other scheme (%s) names the scheme change',
+    async (year, code, sentence) => {
+      connecticut();
+
+      const result = await runToolContract(censusQueryData, ctCounty(year, code));
+
+      expectBoundaryHint(
+        result,
+        `${sentence} geography_fips "*" at the county level with parent_fips "09" lists them.`,
+        WIDTH,
+      );
+      expect(textOf(result)).toContain('"`09`"');
+    },
+  );
+
+  it('census_query_data: a tract scoped by a planning region on 2021 names the earlier counties', async () => {
+    connecticut();
+
+    const result = await runToolContract(censusQueryData, {
+      ...ctCounty(2021, '010101'),
+      geography_level: 'tract',
+      county_fips: '190',
+    });
+
+    expectBoundaryHint(
+      result,
+      "Connecticut's county 190 is among the nine planning regions (110–190) that vintages from 2022 publish; acs/acs5 (2021) publishes the eight counties from before 2022 (001–015) in their place. Tracts and county subdivisions kept their codes and changed only county",
+      WIDTH,
+    );
+    // A 2021 vintage is drawn on 2020 tracts, so no tract change is named.
+    expect(hintOf(result)).not.toContain('census tracts as drawn');
+  });
+
+  it('census_query_data: a Connecticut county list names only the code of the other scheme', async () => {
+    connecticut();
+
+    const result = await runToolContract(censusQueryData, ctCounty(2021, '001,190'));
+
+    expect(result.isError).not.toBe(true);
+    const notice = structured(result).notice ?? '';
+    expect(notice).toContain(
+      "No row came back for 1 of the 2 geography_fips codes: 190. Connecticut's county 190 is among the nine planning regions",
+    );
+    expect(readNotice(result)).toBe(notice);
+  });
+
+  it('census_compare_geographies: a planning-region within_county on 2021 names the earlier counties', async () => {
+    connecticut();
+
+    const result = await runToolContract(censusCompareGeographies, {
+      variables: ['B01003_001E'],
+      geography_level: 'tract',
+      within: '09',
+      within_county: '190',
+      year: 2021,
+    });
+
+    expectBoundaryHint(
+      result,
+      'Tracts and county subdivisions kept their codes and changed only county: within_county "*" with within "09", and no geographies, lists each under the county this vintage publishes it in.',
+      'Confirm tract is supported',
+    );
+  });
+
+  it.each([
+    ['GEOID', '09001'],
+    ['bare code within "09"', '001'],
+  ])(
+    'census_compare_geographies: a pre-2022 county %s on 2022 names the planning regions',
+    async (_label, entry) => {
+      connecticut();
+
+      const result = await runToolContract(censusCompareGeographies, {
+        variables: ['B01003_001E'],
+        geography_level: 'county',
+        within: '09',
+        geographies: [entry],
+        year: 2022,
+      });
+
+      expectBoundaryHint(
+        result,
+        'Connecticut\'s county 001 is among the eight counties from before 2022 (001–015); acs/acs5 (2022) publishes the nine planning regions (110–190) that replaced them. Omitting geographies at the county level with within "09" lists them.',
+        GEOID_GUIDANCE,
+      );
+    },
+  );
+
+  /**
+   * Below the county level a GEOID carries its county after the state, at a width set by the level.
+   * Greenwich town (county subdivision 33620) sits in Fairfield County (001) on 2021 and in the
+   * Western Connecticut planning region (190) from 2022.
+   */
+  it.each([
+    ['county subdivision', '0919033620', ['09', '001', '33620']],
+    ['tract', '09190010101', ['09', '001', '010101']],
+    ['block group', '091900101011', ['09', '001', '010101', '1']],
+  ])(
+    'census_compare_geographies: a %s GEOID under a planning region on 2021 names the earlier counties',
+    async (level, entry, published) => {
+      servePublished('acs/acs5', 2021, [published]);
+
+      const result = await runToolContract(censusCompareGeographies, {
+        variables: ['B01003_001E'],
+        geography_level: level,
+        within: '09',
+        within_county: '*',
+        geographies: [entry],
+        year: 2021,
+      });
+
+      expectBoundaryHint(
+        result,
+        'Connecticut\'s county 190 is among the nine planning regions (110–190) that vintages from 2022 publish; acs/acs5 (2021) publishes the eight counties from before 2022 (001–015) in their place. Tracts and county subdivisions kept their codes and changed only county: within_county "*" with within "09", and no geographies, lists each under the county this vintage publishes it in.',
+        GEOID_GUIDANCE,
+      );
+    },
+  );
+
+  it.each([
+    [2021, '001'],
+    [2022, '190'],
+  ])(
+    'census_query_data names no scheme change for a county in the scheme %i publishes (%s)',
+    async (year, code) => {
+      connecticut();
+
+      const result = await runToolContract(censusQueryData, ctCounty(year, `${code},999`));
+
+      expect(result.isError).not.toBe(true);
+      expect(structured(result).notice).toContain('No row came back for 1 of the 2');
+      expect(structured(result).notice).not.toContain('planning regions');
+    },
+  );
+
+  it('census_query_data describes the boundary guidance its notice can carry', () => {
+    expect(censusQueryData.enrichment?.notice.description).toContain(
+      'for a list of tracts on a vintage before 2020 or of Connecticut counties in the other county scheme, which boundaries that vintage publishes',
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// #88 — a whole table through group(<ID>)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * census_query_data's `group` input, end to end through the real services. The data endpoint lays
+ * a response out as api.census.gov does (2024 vintages, captured 2026-11-15): `NAME` and the codes
+ * named one by one, then every column of the table in its own order, then the geography.
+ */
+describe('census_query_data reads a whole table through group (#88)', () => {
+  /** Two lines of acs/acs5 B01001; GEO_ID is filed under every table and NAME is its attribute. */
+  const groupAcsVariables = {
+    ...acsVariables,
+    B01001_002E: {
+      label: 'Estimate!!Total:!!Male:',
+      concept: 'Sex by Age',
+      predicateType: 'int',
+      group: 'B01001',
+      attributes: 'B01001_002EA,B01001_002M,B01001_002MA',
+    },
+    B01001_001E: {
+      label: 'Estimate!!Total:',
+      concept: 'Sex by Age',
+      predicateType: 'int',
+      group: 'B01001',
+      attributes: 'B01001_001EA,B01001_001M,B01001_001MA',
+    },
+    GEO_ID: {
+      label: 'Geography',
+      predicateType: 'string',
+      group: 'B19013,B01001',
+      attributes: 'NAME',
+    },
+  };
+
+  /** Each table as `group(<ID>)` lays it out. */
+  const tables: Record<string, readonly string[]> = {
+    B01001: [
+      'B01001_001E',
+      'B01001_001EA',
+      'B01001_001M',
+      'B01001_001MA',
+      'B01001_002E',
+      'B01001_002EA',
+      'B01001_002M',
+      'B01001_002MA',
+      'GEO_ID',
+      'NAME',
+    ],
+    DP05: [
+      'DP05_0001E',
+      'DP05_0001EA',
+      'DP05_0001M',
+      'DP05_0001MA',
+      'DP05_0001PE',
+      'DP05_0001PEA',
+      'DP05_0001PM',
+      'DP05_0001PMA',
+      'GEO_ID',
+      'NAME',
+    ],
+    CP03: [
+      'CP03_2019_001E',
+      'CP03_2019_001EA',
+      'CP03_2024to2019_001SS',
+      'CP03_2024_001E',
+      'CP03_2024_001EA',
+      'GEO_ID',
+      'NAME',
+    ],
+    P1: ['GEO_ID', 'NAME', 'P1_001N', 'P1_001NA', 'P1_002N', 'P1_002NA'],
+  };
+
+  const cells: Record<string, string> = {
+    B19013_001E: '122148',
+    B19013_001M: '1808',
+    B01001_001E: '2287171',
+    B01001_001M: '-555555555',
+    B01001_002E: '1140843',
+    B01001_002M: '1234',
+    DP05_0001E: '7785786',
+    DP05_0001M: '-555555555',
+    DP05_0001PE: '7785786',
+    DP05_0001PM: '-888888888',
+    CP03_2019_001E: '6100000',
+    CP03_2024to2019_001SS: '*',
+    CP03_2024_001E: '6300000',
+    P1_001N: '7705281',
+    P1_002N: '7101093',
+  };
+
+  /** Answer as api.census.gov does, for one geography whose columns `geography` gives. */
+  const answerGroup =
+    (geography: Record<string, string>, name = 'King County, Washington') =>
+    (url: URL): Body => {
+      const items = getList(url);
+      const token = items.find((item) => item.startsWith('group('));
+      const header = [
+        ...items.filter((item) => item !== token),
+        ...(token ? (tables[token.slice('group('.length, -1)] ?? []) : []),
+        ...Object.keys(geography),
+      ];
+      return [
+        header,
+        header.map(
+          (column) =>
+            geography[column] ??
+            cells[column] ??
+            (column === 'NAME' ? name : column === 'GEO_ID' ? `0500000US53033` : null),
+        ) as string[],
+      ];
+    };
+
+  const atKing = { geography_level: 'county', geography_fips: '033', parent_fips: '53' };
+  const kingGeography = { state: '53', county: '033' };
+
+  /** Pins the request a call without group sends — the regression the feature must not move. */
+  it('sends the same get= and returns the same row without group (characterization)', async () => {
+    serveMetadata('acs/acs5', 2024, groupAcsVariables);
+    serveData('acs/acs5', 2024, answerGroup(kingGeography));
+
+    const result = await runToolContract(censusQueryData, {
+      ...atKing,
+      variables: ['b19013_001e', 'B19013_001M'],
+    });
+
+    expect(getList(dataCalls('acs/acs5', 2024)[0])).toEqual(['NAME', 'B19013_001E', 'B19013_001M']);
+    expect(structured(result).rows).toEqual([
+      {
+        geography_name: 'King County, Washington',
+        geography_fips: '033',
+        geography_geoid: '53033',
+        variables: {
+          B19013_001E: { estimate: 122148, moe: 1808, suppressed: false },
+          B19013_001M: { estimate: 1808, suppressed: false },
+        },
+      },
+    ]);
+  });
+
+  /** Sent as a code, it went out as `GROUP(B01001)`, which api.census.gov answers 204. */
+  it('sends a group(<ID>) entry of variables as the table, in the dataset spelling', async () => {
+    serveMetadata('acs/acs5', 2024, groupAcsVariables);
+    serveData('acs/acs5', 2024, answerGroup(kingGeography));
+
+    const result = await runToolContract(censusQueryData, {
+      ...atKing,
+      variables: ['group(b01001)'],
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(getList(dataCalls('acs/acs5', 2024)[0])).toEqual(['NAME', 'group(B01001)']);
+  });
+
+  it('returns the table E/M-paired without annotations, its GEOID free of table columns', async () => {
+    serveMetadata('acs/acs5', 2024, groupAcsVariables);
+    serveData('acs/acs5', 2024, answerGroup(kingGeography));
+
+    const result = await runToolContract(censusQueryData, { ...atKing, group: 'b01001' });
+    const out = structured(result);
+
+    expect(out.rows).toHaveLength(1);
+    const row = out.rows[0];
+    expect(row?.geography_geoid).toBe('53033');
+    expect(Object.keys(row?.variables ?? {})).toEqual([
+      'B01001_001E',
+      'B01001_001M',
+      'B01001_002E',
+      'B01001_002M',
+    ]);
+    expect(row?.variables.B01001_001E).toEqual({ estimate: 2287171, moe: 0, suppressed: false });
+    expect(row?.variables.B01001_002E).toEqual({ estimate: 1140843, moe: 1234, suppressed: false });
+    expect(out.variable_labels).toEqual({
+      B01001_001E: 'Estimate!!Total:',
+      B01001_001M: 'Margin of Error!!Total:',
+      B01001_002E: 'Estimate!!Total:!!Male:',
+      B01001_002M: 'Margin of Error!!Total:!!Male:',
+    });
+
+    // content[] carries the same columns, labels, and numbers.
+    const text = textOf(result);
+    expect(readVariableLabels(text)).toEqual(out.variable_labels);
+    expect(text).toContain('**GEOID:** `53033`');
+    expect(text).toContain('- **B01001_001E:** 2,287,171 ± 0');
+    expect(text).toContain('- **B01001_002E:** 1,140,843 ± 1,234');
+    expect(text).toContain('- **B01001_002M:** 1,234');
+    expect(text).not.toContain('B01001_001EA');
+  });
+
+  it('keys the listed codes first and sends a code the table returns only once', async () => {
+    serveMetadata('acs/acs5', 2024, groupAcsVariables);
+    serveData('acs/acs5', 2024, answerGroup(kingGeography));
+
+    const result = await runToolContract(censusQueryData, {
+      ...atKing,
+      variables: ['B19013_001E', 'B01001_001E'],
+      group: 'B01001',
+    });
+
+    expect(getList(dataCalls('acs/acs5', 2024)[0])).toEqual([
+      'NAME',
+      'B19013_001E',
+      'group(B01001)',
+    ]);
+    const out = structured(result);
+    expect(Object.keys(out.rows[0]?.variables ?? {})).toEqual([
+      'B19013_001E',
+      'B01001_001E',
+      'B01001_001M',
+      'B01001_002E',
+      'B01001_002M',
+    ]);
+    expect(Object.keys(out.variable_labels)).toEqual([
+      'B19013_001E',
+      'B01001_001E',
+      'B01001_001M',
+      'B01001_002E',
+      'B01001_002M',
+    ]);
+  });
+
+  it.each([
+    [
+      'acs/acs5/profile',
+      'DP05',
+      {
+        DP05_0001E: { estimate: 7785786, moe: 0, suppressed: false },
+        DP05_0001M: { estimate: 0, suppressed: false },
+        DP05_0001PE: { estimate: 7785786, moe: null, suppressed: false },
+        DP05_0001PM: {
+          estimate: null,
+          suppressed: true,
+          suppression_reason: 'Not applicable or not available',
+        },
+      },
+    ],
+    [
+      'acs/acs5/cprofile',
+      'CP03',
+      {
+        CP03_2019_001E: { estimate: 6100000, suppressed: false },
+        CP03_2024to2019_001SS: { estimate: null, suppressed: false, value: '*' },
+        CP03_2024_001E: { estimate: 6300000, suppressed: false },
+      },
+    ],
+    [
+      'dec/pl',
+      'P1',
+      {
+        P1_001N: { estimate: 7705281, suppressed: false },
+        P1_002N: { estimate: 7101093, suppressed: false },
+      },
+    ],
+  ])('keys each column family %s publishes in %s', async (dataset, table, expected) => {
+    const year = dataset === 'dec/pl' ? 2020 : 2024;
+    const columns = tables[table] ?? [];
+    // variables.json for the table: each member with the attribute columns that follow it.
+    const isAttribute = (column: string) =>
+      column === 'NAME' ||
+      /(?:\d+M|PM|SS)$/.test(column) ||
+      (column.endsWith('A') && columns.includes(column.slice(0, -1)));
+    const members: Array<[string, string[]]> = [];
+    for (const column of columns) {
+      if (isAttribute(column)) members.at(-1)?.[1].push(column);
+      else members.push([column, []]);
+    }
+    const variables = Object.fromEntries(
+      members.map(([code, attributes]) => [
+        code,
+        {
+          label: `Label of ${code}`,
+          predicateType: code === 'GEO_ID' ? 'string' : 'int',
+          group: table,
+          attributes: attributes.join(','),
+        },
+      ]),
+    );
+    serveMetadata(dataset, year, variables);
+    serveData(dataset, year, answerGroup({ state: '53' }, 'Washington'));
+
+    const result = await runToolContract(censusQueryData, {
+      dataset,
+      year,
+      group: table,
+      geography_level: 'state',
+      geography_fips: '53',
+    });
+
+    expect(result.isError).toBeFalsy();
+    const row = structured(result).rows[0];
+    expect(row?.variables).toEqual(expected);
+    expect(Object.keys(row?.variables ?? {})).toEqual(Object.keys(expected));
+    expect(row?.geography_geoid).toBe('53');
+  });
+
+  it('fails an unknown table before any data request, naming search', async () => {
+    serveMetadata('acs/acs5', 2024, groupAcsVariables);
+    routes.push({
+      match: (u) => u.pathname === '/data/2024/acs/acs1/groups/B99999.json',
+      respond: () => new Response('Not Found', { status: 404 }),
+    });
+
+    const result = await runToolContract(censusQueryData, { ...atKing, group: 'B99999' });
+
+    expect(result.isError).toBe(true);
+    expect(errorOf(result)).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      message: 'Table B99999 not found in acs/acs5 (2024).',
+      data: { reason: 'variable_not_found', group: 'B99999' },
+    });
+    expect(dataCalls('acs/acs5', 2024)).toEqual([]);
+  });
+
+  it('names the sibling dataset that publishes the table, as a code span', async () => {
+    serveMetadata('acs/acs5', 2024, groupAcsVariables);
+    routes.push({
+      match: (u) => u.pathname === '/data/2024/acs/acs5/subject/groups/S1701.json',
+      respond: () => ({ name: 'S1701' }),
+    });
+
+    const result = await runToolContract(censusQueryData, { ...atKing, group: 'S1701' });
+
+    expect(errorOf(result).data).toMatchObject({
+      reason: 'variable_not_found',
+      recovery: { hint: 'S1701 is in acs/acs5/subject — query that dataset instead.' },
+    });
+    expect(textOf(result)).toContain(
+      'Recovery: S1701 is in `acs/acs5/subject` — query that dataset instead.',
+    );
+    expect(dataCalls('acs/acs5', 2024)).toEqual([]);
+  });
+
+  it('refuses a table on cbp, whose tables carry its filter dimensions, before the data request', async () => {
+    serveMetadata('cbp', 2023, {
+      ESTAB: { label: 'Number of establishments', predicateType: 'int', group: 'CB2300CBP' },
+      NAICS2017: {
+        label: 'Meaning of NAICS code',
+        required: 'default displayed',
+        predicateType: 'string',
+        group: 'CB2300CBP',
+      },
+      LFO: { label: 'Legal form', required: 'default displayed', predicateType: 'string' },
+      EMPSZES: { label: 'Employment size', required: 'default displayed', predicateType: 'string' },
+    });
+
+    const result = await runToolContract(censusQueryData, {
+      ...atKing,
+      dataset: 'cbp',
+      group: 'CB2300CBP',
+    });
+
+    expect(errorOf(result)).toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'group_not_supported', dimensions: ['EMPSZES', 'LFO', 'NAICS2017'] },
+    });
+    expect(dataCalls('cbp', 2023)).toEqual([]);
+  });
+
+  it('names a narrower geography or the needed codes when the data deadline runs out', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      serveMetadata('acs/acs5', 2024, groupAcsVariables);
+      serveData('acs/acs5', 2024, () => HANG);
+
+      const pending = runToolContract(censusQueryData, {
+        geography_level: 'county',
+        geography_fips: '*',
+        parent_fips: '*',
+        group: 'B01001',
+      });
+      await vi.advanceTimersByTimeAsync(300_000);
+      const result = await pending;
+
+      expect(errorOf(result).data).toMatchObject({
+        reason: 'upstream_error',
+        recovery: {
+          hint: 'Retry the request once. If it fails the same way, request a narrower geography, or list only the codes you need from the table in variables in place of group: a response too large to arrive within one attempt fails on every retry. Otherwise the Census API is temporarily unavailable for this dataset and year.',
+        },
+      });
     } finally {
       vi.useRealTimers();
     }

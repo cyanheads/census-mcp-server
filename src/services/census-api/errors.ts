@@ -12,8 +12,8 @@ import {
 } from '@cyanheads/mcp-ts-core/errors';
 
 /**
- * Render a year list with contiguous runs collapsed — `[2005…2019, 2021…2024]` reads as
- * "2005-2019, 2021-2024". The lists run to fifteen vintages, and a caller looking for the
+ * Render a year list with contiguous runs collapsed — `[2005…2019, 2021…2025]` reads as
+ * "2005-2019, 2021-2025". The lists run to twenty vintages, and a caller looking for the
  * gap in a flat sequence of numbers has to find it by eye.
  */
 export function formatYears(years: number[]): string {
@@ -122,6 +122,15 @@ const DATA_DEADLINE_HINT =
   'Retry the request once. If it fails the same way, request a narrower geography or fewer variables per call: a response too large to arrive within one attempt fails on every retry. Otherwise the Census API is temporarily unavailable for this dataset and year.';
 
 /**
+ * The same step for a query that requested a whole table. Every column of a wide table over a broad
+ * scope is one response (`group(DP05)` returns 866 columns a row, for every county requested), so
+ * asking for less means a narrower geography or naming only the table's codes that are needed. The
+ * call's shared upstream budget running out on such a query gives the same step.
+ */
+export const GROUP_DEADLINE_HINT =
+  'Retry the request once. If it fails the same way, request a narrower geography, or list only the codes you need from the table in variables in place of group: a response too large to arrive within one attempt fails on every retry. Otherwise the Census API is temporarily unavailable for this dataset and year.';
+
+/**
  * The data request's spent deadline as the retryable `upstream_error` the keyed tools declare; any
  * other error unchanged.
  *
@@ -129,12 +138,18 @@ const DATA_DEADLINE_HINT =
  * 'retry_deadline_exceeded'`, a reason no tool contract declares, so it would reach the caller with
  * no recovery hint. A caller's own cancellation never takes this shape — `withRetry` passes it
  * through ahead of the deadline — so it stays a cancellation. A data query (`scope.variables`
- * present) is told to ask for less as well as to retry; an enumeration's response is small, so its
- * spent deadline reads as an outage.
+ * present) is told to ask for less as well as to retry, and one that requested a whole table
+ * (`scope.group`) is told the two ways to ask for less of it; an enumeration's response is small,
+ * so its spent deadline reads as an outage.
  */
 export function censusDeadlineError(
   error: unknown,
-  scope: { dataset: string; year: number; variables?: readonly string[] },
+  scope: {
+    dataset: string;
+    year: number;
+    variables?: readonly string[];
+    group?: { readonly id: string };
+  },
 ): unknown {
   if (!(error instanceof McpError) || error.data?.reason !== 'retry_deadline_exceeded')
     return error;
@@ -154,7 +169,13 @@ export function censusDeadlineError(
       deadlineMs,
       elapsedMs,
       retryAttempts,
-      recovery: { hint: scope.variables ? DATA_DEADLINE_HINT : RETRY_LATER_HINT },
+      recovery: {
+        hint: scope.group
+          ? GROUP_DEADLINE_HINT
+          : scope.variables
+            ? DATA_DEADLINE_HINT
+            : RETRY_LATER_HINT,
+      },
     },
     { cause: error },
   );

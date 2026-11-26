@@ -19,25 +19,16 @@ vi.mock('@/services/census-api/census-api-service.js', async (importOriginal) =>
 
 vi.mock('@/services/variable-cache/variable-cache-service.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/services/variable-cache/variable-cache-service.js')>()),
-  DATASET_LATEST_YEARS: { 'acs/acs5': 2024, cbp: 2023, 'dec/ddhca': 2020, 'pep/charv': 2023 },
-  KNOWN_DATASETS: new Set([
-    'acs/acs5',
-    'acs/acs1',
-    'acs/acs5/profile',
-    'dec/pl',
-    'dec/ddhca',
-    'cbp',
-    'pep/charv',
-  ]),
   getVariableCacheService: vi.fn(),
 }));
 
 vi.mock('@/config/server-config.js', () => ({
-  getDiscoveryConfig: vi.fn(() => ({ defaultYear: 2024, variableCacheTtlHours: 24 })),
+  activeDiscoveryConfig: vi.fn(() => ({ variableCacheTtlHours: 24, clampLimits: true })),
+  getDiscoveryConfig: vi.fn(() => ({ variableCacheTtlHours: 24, clampLimits: true })),
   getServerConfig: vi.fn(() => ({
-    defaultYear: 2024,
     censusApiKey: 'test-key',
     variableCacheTtlHours: 24,
+    clampLimits: true,
   })),
 }));
 
@@ -470,6 +461,29 @@ describe('censusQueryData', () => {
     expect(mockQueryData).not.toHaveBeenCalled();
   });
 
+  it('reads the level "ZIP Code Tabulation Area" as the ZCTA level for its parent_required step', async () => {
+    mockCheckGeography.mockResolvedValue({ status: 'parent_required', missingParents: ['state'] });
+
+    const ctx = createMockContext({ errors: censusQueryData.errors });
+    const input = censusQueryData.input.parse({
+      variables: ['B01003_001E'],
+      geography_level: 'ZIP Code Tabulation Area',
+      geography_fips: '98109',
+      year: 2019,
+    });
+    const err = await failureOf(input, ctx);
+    const { data } = err as { data: { reason: string; recovery: { hint: string } } };
+
+    expect(data.reason).toBe('parent_required');
+    expect(data.recovery.hint).toBe(
+      "To query this level, set parent_fips to the 2-digit FIPS of the ZCTA's state — census_resolve_geography returns no state_fips for a ZCTA, so resolve the state's name for it.",
+    );
+    expect(mockCheckGeography).toHaveBeenCalledWith(
+      expect.objectContaining({ geographyLevel: 'zip code tabulation area' }),
+      expect.anything(),
+    );
+  });
+
   it('parent_required names county_fips when the county parent is missing', async () => {
     mockCheckGeography.mockResolvedValue({ status: 'parent_required', missingParents: ['county'] });
 
@@ -770,8 +784,9 @@ describe('censusQueryData', () => {
       (e: unknown) => e,
     );
     // #62: census_list_geographies is the contract recovery's step, so the message leaves it out.
+    // #96: no year given, so the vintage is acs/acs1's newest.
     expect((error as Error).message).toBe(
-      'Geography level "tract" does not exist in acs/acs1 (2024). It publishes 13 geography levels.',
+      'Geography level "tract" does not exist in acs/acs1 (2025). It publishes 13 geography levels.',
     );
     expect(error).toMatchObject({ data: { availableLevels } });
   });
@@ -997,8 +1012,8 @@ describe('censusQueryData', () => {
   });
 
   /**
-   * ecnbasic publishes nothing below the national level until an industry is named, so an
-   * empty result there is a missing predicate rather than a bad FIPS code.
+   * ecnbasic answers an unset NAICS with one sector, which a county often does not publish, so
+   * an empty result there is a missing predicate rather than a bad FIPS code.
    */
   it('no_data recovery names the unset predicates when the dataset has any', async () => {
     mockCheckPredicates.mockResolvedValue({
@@ -1013,14 +1028,61 @@ describe('censusQueryData', () => {
       geography_level: 'county',
       geography_fips: '033',
       parent_fips: '53',
-      dataset: 'cbp',
+      dataset: 'ecnbasic',
+      year: 2022,
     });
     await expect(censusQueryData.handler(input, ctx)).rejects.toMatchObject({
       data: {
         reason: 'no_data',
-        recovery: { hint: expect.stringContaining('NAICS2022') },
+        recovery: { hint: expect.stringContaining('until NAICS2022 is set') },
       },
     });
+  });
+
+  it('documents the three NAICS ranges in the predicates description (#101)', () => {
+    const schema = censusQueryData.input.toJSONSchema() as {
+      properties: Record<string, { description?: string }>;
+    };
+    const description = schema.properties.predicates?.description ?? '';
+
+    for (const range of ['31-33', '44-45', '48-49']) expect(description).toContain(range);
+    expect(description).not.toContain('at any depth');
+  });
+
+  /**
+   * #101: the hint reads the predicate values, not only their keys — cbp publishes 48 only as
+   * 48-49 — and an all-establishments default such as EMPSZES or LFO is no cause to name.
+   */
+  it('no_data recovery names the NAICS range a two-digit code sits in, on both surfaces (#101)', async () => {
+    mockCheckPredicates.mockResolvedValue({
+      unset: [
+        { code: 'EMPSZES', label: 'Employment size of establishments code' },
+        { code: 'LFO', label: 'Legal form of organization code' },
+      ],
+      unknown: [],
+    });
+    mockQueryData.mockResolvedValue([]);
+
+    const result = await runToolContract(censusQueryData, {
+      variables: ['ESTAB'],
+      geography_level: 'county',
+      geography_fips: '053',
+      parent_fips: '53',
+      dataset: 'cbp',
+      year: 2021,
+      predicates: { NAICS2017: '48' },
+    });
+    const { reason, recovery } = (
+      result.structuredContent as {
+        error: { data: { reason: string; recovery: { hint: string } } };
+      }
+    ).error.data;
+
+    expect(reason).toBe('no_data');
+    expect(recovery.hint).toContain('so NAICS2017 "48" returns no row — send "48-49"');
+    expect(recovery.hint).toContain('check the NAICS2017 value');
+    expect(recovery.hint).not.toMatch(/EMPSZES|LFO/);
+    expect(textOf(result)).toContain('send "48-49" for the whole sector');
   });
 
   /**

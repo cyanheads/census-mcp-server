@@ -48,6 +48,22 @@ describe('censusListDatasets', () => {
   );
 
   /**
+   * #101: the business datasets publish manufacturing, retail trade, and transportation and
+   * warehousing only as ranges, so a two-digit code inside one returns no row.
+   */
+  it.each(['cbp', 'ecnbasic', 'nonemp'])(
+    'tells a caller %s publishes three NAICS sectors only as ranges',
+    async (id) => {
+      const ctx = createMockContext();
+      const result = await censusListDatasets.handler(censusListDatasets.input.parse({}), ctx);
+      const description = result.datasets.find((d) => d.dataset_id === id)?.description ?? '';
+
+      for (const range of ['31-33', '44-45', '48-49']) expect(description).toContain(range);
+      expect(description).toMatch(/a two-digit code inside one[^.]*returns no row/);
+    },
+  );
+
+  /**
    * These datasets publish levels census_resolve_geography cannot resolve a name to — zip code,
    * congressional district, region, metropolitan division — so the catalog has to name the gap.
    * `us` is a level of all three and resolves from no name at all, so even nonemp, whose named

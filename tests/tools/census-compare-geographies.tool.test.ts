@@ -18,24 +18,16 @@ vi.mock('@/services/census-api/census-api-service.js', async (importOriginal) =>
 
 vi.mock('@/services/variable-cache/variable-cache-service.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/services/variable-cache/variable-cache-service.js')>()),
-  DATASET_LATEST_YEARS: { 'acs/acs5': 2024, cbp: 2023, 'pep/charv': 2023 },
-  KNOWN_DATASETS: new Set([
-    'acs/acs5',
-    'acs/acs1',
-    'acs/acs5/profile',
-    'dec/pl',
-    'cbp',
-    'pep/charv',
-  ]),
   getVariableCacheService: vi.fn(),
 }));
 
 vi.mock('@/config/server-config.js', () => ({
-  getDiscoveryConfig: vi.fn(() => ({ defaultYear: 2024, variableCacheTtlHours: 24 })),
+  activeDiscoveryConfig: vi.fn(() => ({ variableCacheTtlHours: 24, clampLimits: true })),
+  getDiscoveryConfig: vi.fn(() => ({ variableCacheTtlHours: 24, clampLimits: true })),
   getServerConfig: vi.fn(() => ({
-    defaultYear: 2024,
     censusApiKey: 'test-key',
     variableCacheTtlHours: 24,
+    clampLimits: true,
   })),
 }));
 
@@ -96,6 +88,32 @@ describe('comparison ranking and paging contract', () => {
       expect(text).toContain(`### 2. County ${ids[2]}`);
     },
   );
+
+  it.each([
+    [
+      1000,
+      'Rows 1,001–1,200 of 1,200. This is the last page; offset: 0 starts from the first row.',
+    ],
+    [
+      1200,
+      'offset 1,200 is at or past the last of the 1,200 matched rows, so no rows are returned. Pass an offset below 1,200; offset: 0 starts from the first row.',
+    ],
+  ])('groups the counts in the terminal notice at offset %i', async (offset, notice) => {
+    mockQueryData.mockResolvedValue(
+      Array.from({ length: 1200 }, (_, i) => {
+        const geoid = `53${String(i).padStart(3, '0')}`;
+        return {
+          geographyName: `County ${geoid}`,
+          geographyFips: geoid.slice(2),
+          geographyGeoid: geoid,
+          variables: { B19013_001E: { estimate: i, suppressed: false } },
+        };
+      }),
+    );
+    const result = await runToolContract(censusCompareGeographies, { ...base, limit: 500, offset });
+
+    expect((result.structuredContent as { notice?: string }).notice).toContain(notice);
+  });
 
   it('pages through a numeric tie without overlap and retains ranks and terminal notices', async () => {
     mockQueryData.mockResolvedValue(fixture());
@@ -512,6 +530,7 @@ describe('censusCompareGeographies', () => {
   });
 
   it('notices a bare level code that matched a geography in more than one state', async () => {
+    mockCheckGeography.mockResolvedValue({ status: 'ok', acceptedParents: ['state'] });
     mockQueryData.mockResolvedValue([
       {
         geographyName: 'King County, Washington',
@@ -537,7 +556,81 @@ describe('censusCompareGeographies', () => {
 
     // The rows are real counties, so nothing is unmatched — the ambiguity is the finding.
     expect(result.rows).toHaveLength(2);
-    expect(getEnrichment(ctx).notice).toContain('033 matched a county in more than one state');
+    expect(getEnrichment(ctx).notice).toContain(
+      '033 matched more than one county because a bare level code carries no parent. Use within to scope the comparison, or pass full GEOIDs (e.g. "53033") to name exactly the geographies you want.',
+    );
+  });
+
+  it('points a bare block group code that matched under several tracts at full GEOIDs alone', async () => {
+    mockCheckGeography.mockResolvedValue({
+      status: 'ok',
+      acceptedParents: ['state', 'county', 'tract'],
+    });
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'Block Group 1, Census Tract 71, King County, Washington',
+        geographyFips: '1',
+        geographyGeoid: '530330071001',
+        variables: { B19013_001E: { estimate: 105000, suppressed: false } },
+      },
+      {
+        geographyName: 'Block Group 1, Census Tract 72, King County, Washington',
+        geographyFips: '1',
+        geographyGeoid: '530330072001',
+        variables: { B19013_001E: { estimate: 97000, suppressed: false } },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['B19013_001E'],
+      geography_level: 'block group',
+      within: '53',
+      within_county: '033',
+      geographies: ['1'],
+    });
+    await censusCompareGeographies.handler(input, ctx);
+
+    // Both parents the comparison takes are already set, so no scope input narrows it further.
+    expect(getEnrichment(ctx).notice).toContain(
+      '1 matched more than one block group because a bare level code carries no parent. Pass full GEOIDs (e.g. "53033") to name exactly the geographies you want.',
+    );
+  });
+
+  /** #97: a bare 6-digit tract matched in the 4 digits dec/pl 2000 lists it by is named as written. */
+  it('names a bare dec/pl 2000 tract entry that matched more than one tract as written', async () => {
+    mockCheckGeography.mockResolvedValue({ status: 'ok', acceptedParents: ['state', 'county'] });
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'Census Tract 71, King County, Washington',
+        geographyFips: '0071',
+        geographyGeoid: '530330071',
+        variables: { PL001001: { estimate: 1809, suppressed: false } },
+      },
+      {
+        geographyName: 'Census Tract 71, Snohomish County, Washington',
+        geographyFips: '0071',
+        geographyGeoid: '530610071',
+        variables: { PL001001: { estimate: 2400, suppressed: false } },
+      },
+    ]);
+
+    const ctx = createMockContext({ errors: censusCompareGeographies.errors });
+    const input = censusCompareGeographies.input.parse({
+      variables: ['PL001001'],
+      dataset: 'dec/pl',
+      year: 2000,
+      geography_level: 'tract',
+      within: '53',
+      geographies: ['007100'],
+    });
+    const result = await censusCompareGeographies.handler(input, ctx);
+
+    expect(result.rows).toHaveLength(2);
+    // within names the state, so the parent left open is the county.
+    expect(getEnrichment(ctx).notice).toContain(
+      '007100 matched more than one tract because a bare level code carries no parent. Use within_county to scope the comparison, or pass full GEOIDs (e.g. "53033") to name exactly the geographies you want.',
+    );
   });
 
   it('stays silent when within scopes a bare level code to a single match', async () => {
@@ -681,6 +774,77 @@ describe('censusCompareGeographies', () => {
     });
   });
 
+  describe('no_data recovery for a predicated comparison (#101)', () => {
+    const hintOf = async (input: Record<string, unknown>) => {
+      const result = await runToolContract(censusCompareGeographies, input as never);
+      const { reason, recovery } = (
+        result.structuredContent as {
+          error: { data: { reason: string; recovery: { hint: string } } };
+        }
+      ).error.data;
+      return { reason, hint: recovery.hint, text: textOf(result as never) };
+    };
+
+    it('names an unset ecnbasic NAICS dimension', async () => {
+      mockCheckPredicates.mockResolvedValue({
+        unset: [
+          { code: 'NAICS2022', label: '2022 NAICS code' },
+          { code: 'TAXSTAT', label: 'Tax status code' },
+        ],
+        unknown: [],
+      });
+      mockQueryData.mockResolvedValue([]);
+
+      const { reason, hint } = await hintOf({
+        variables: ['ESTAB'],
+        geography_level: 'county',
+        within: '53',
+        dataset: 'ecnbasic',
+        year: 2022,
+      });
+
+      expect(reason).toBe('no_data');
+      expect(hint).toContain('until NAICS2022 is set');
+      expect(hint).not.toContain('TAXSTAT');
+    });
+
+    it('names the NAICS range a two-digit code sits in, on both surfaces, and not EMPSZES or LFO', async () => {
+      mockCheckPredicates.mockResolvedValue({
+        unset: [
+          { code: 'EMPSZES', label: 'Employment size of establishments code' },
+          { code: 'LFO', label: 'Legal form of organization code' },
+        ],
+        unknown: [],
+      });
+      mockQueryData.mockResolvedValue([]);
+
+      const { reason, hint, text } = await hintOf({
+        variables: ['ESTAB'],
+        geography_level: 'county',
+        within: '53',
+        dataset: 'cbp',
+        year: 2021,
+        predicates: { NAICS2017: '48' },
+      });
+
+      expect(reason).toBe('no_data');
+      expect(hint).toContain('so NAICS2017 "48" returns no row — send "48-49"');
+      expect(hint).toContain('check the NAICS2017 value');
+      expect(hint).not.toMatch(/EMPSZES|LFO/);
+      expect(text).toContain('send "48-49" for the whole sector');
+    });
+
+    it('documents the three NAICS ranges in the predicates description', () => {
+      const schema = censusCompareGeographies.input.toJSONSchema() as {
+        properties: Record<string, { description?: string }>;
+      };
+      const description = schema.properties.predicates?.description ?? '';
+
+      for (const range of ['31-33', '44-45', '48-49']) expect(description).toContain(range);
+      expect(description).not.toContain('at any depth');
+    });
+  });
+
   it('throws parent_required before querying when within is missing', async () => {
     mockCheckGeography.mockResolvedValue({ status: 'parent_required', missingParents: ['state'] });
 
@@ -796,8 +960,9 @@ describe('censusCompareGeographies', () => {
       (e: unknown) => e,
     );
     // #62: census_list_geographies is the contract recovery's step, so the message leaves it out.
+    // #96: no year given, so the vintage is acs/acs1's newest.
     expect((error as Error).message).toBe(
-      'Geography level "tract" does not exist in acs/acs1 (2024). It publishes 13 geography levels.',
+      'Geography level "tract" does not exist in acs/acs1 (2025). It publishes 13 geography levels.',
     );
     expect(error).toMatchObject({ data: { availableLevels } });
   });
@@ -898,10 +1063,64 @@ describe('censusCompareGeographies', () => {
     expect(enrichment.sortVariable).toBe('B01001_001E');
   });
 
-  it('rejects a limit above 500 at the schema rather than clamping it', () => {
-    const base = { variables: ['B19013_001E'], geography_level: 'county' };
-    expect(censusCompareGeographies.input.safeParse({ ...base, limit: 501 }).success).toBe(false);
-    expect(censusCompareGeographies.input.safeParse({ ...base, limit: 500 }).success).toBe(true);
+  /** #95: a limit above the 500 cap is served at the cap, said so ahead of the paging sentence. */
+  it('serves limit 501 at 500 and says so ahead of the truncation notice', async () => {
+    mockQueryData.mockResolvedValue(
+      Array.from({ length: 600 }, (_, i) => ({
+        geographyName: `County ${i}`,
+        geographyFips: String(i).padStart(5, '0'),
+        geographyGeoid: String(i).padStart(5, '0'),
+        variables: { B19013_001E: { estimate: i * 1000, suppressed: false } },
+      })),
+    );
+
+    const result = await runToolContract(censusCompareGeographies, {
+      variables: ['B19013_001E'],
+      geography_level: 'county',
+      limit: 501,
+    });
+
+    const out = result.structuredContent as {
+      rows: unknown[];
+      nextOffset?: number;
+      notice?: string;
+    };
+    expect(out.rows).toHaveLength(500);
+    expect(out.nextOffset).toBe(500);
+    const sentence =
+      'limit 501 is over the 500-geography cap, so this page holds up to 500 geographies. Results truncated — 100 more geographies not shown.';
+    expect(out.notice).toContain(sentence);
+    expect(out.notice).not.toContain('increase the limit parameter');
+    expect(textOf(result)).toContain(sentence);
+  });
+
+  it('serves limit 501 at 500 and says so when every geography fits the page', async () => {
+    mockQueryData.mockResolvedValue([
+      {
+        geographyName: 'King County, WA',
+        geographyFips: '033',
+        geographyGeoid: '53033',
+        variables: { B19013_001E: { estimate: 105000, suppressed: false } },
+      },
+      {
+        geographyName: 'Pierce County, WA',
+        geographyFips: '053',
+        geographyGeoid: '53053',
+        variables: { B19013_001E: { estimate: 72000, suppressed: false } },
+      },
+    ]);
+
+    const result = await runToolContract(censusCompareGeographies, {
+      variables: ['B19013_001E'],
+      geography_level: 'county',
+      limit: 501,
+    });
+
+    const out = result.structuredContent as { rows: unknown[]; notice?: string };
+    expect(out.rows).toHaveLength(2);
+    expect(out.notice).toBe(
+      'limit 501 is over the 500-geography cap, so this page holds up to 500 geographies.',
+    );
   });
 
   it('returns 500 rows at limit 500 and does not advise raising the limit past it', async () => {
@@ -928,7 +1147,8 @@ describe('censusCompareGeographies', () => {
     expect(enrichment.truncated).toBe(true);
     expect(enrichment.totalCount).toBe(600);
     expect(enrichment.notice).toContain('100 more geographies not shown');
-    expect(enrichment.notice).not.toMatch(/Increase the limit/);
+    expect(enrichment.notice).not.toContain('increase the limit parameter');
+    expect(enrichment.notice).not.toContain('is over the');
   });
 
   it('sets truncated=false when results fit within limit', async () => {

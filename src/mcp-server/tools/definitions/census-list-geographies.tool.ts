@@ -5,12 +5,11 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { getDiscoveryConfig } from '@/config/server-config.js';
 import { getCensusApiService } from '@/services/census-api/census-api-service.js';
 import { yearNotAvailable } from '@/services/census-api/errors.js';
 import {
   DATASET_AVAILABLE_YEARS,
-  DATASET_LATEST_YEARS,
+  latestYearOf,
   resolveDataset,
 } from '@/services/variable-cache/variable-cache-service.js';
 
@@ -38,6 +37,8 @@ export const censusListGeographies = tool('census_list_geographies', {
       .optional()
       .describe('Vintage year. Defaults to the latest available year for the dataset.'),
   }),
+  // The name census_list_datasets returns the code under.
+  inputAliases: { dataset_id: 'dataset' },
   output: z.object({
     geography_levels: z
       .array(
@@ -104,8 +105,7 @@ export const censusListGeographies = tool('census_list_geographies', {
 
   async handler(input, ctx) {
     const dataset = resolveDataset(input.dataset);
-    const { defaultYear } = getDiscoveryConfig();
-    const year = input.year ?? DATASET_LATEST_YEARS[dataset] ?? defaultYear;
+    const year = input.year ?? latestYearOf(dataset);
 
     ctx.log.info('Listing geography levels', { dataset, year });
 

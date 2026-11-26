@@ -6,15 +6,28 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { getDiscoveryConfig } from '@/config/server-config.js';
+import { countLimit } from '@/mcp-server/tools/count-limit.js';
 import { renderNotice } from '@/mcp-server/tools/notice-trailer.js';
 import {
   type CodeMiss,
-  DATASET_LATEST_YEARS,
   describeSiblingHolders,
   getVariableCacheService,
+  latestYearOf,
   resolveDataset,
 } from '@/services/variable-cache/variable-cache-service.js';
+
+/**
+ * Variables per page: about 1 MB a surface at the cap (acs/acs5 "income" at 3,000 variables), the
+ * size the data tools reach with their widest variables list.
+ */
+const LIMIT = countLimit({
+  tool: 'census_search_variables',
+  default: 20,
+  cap: 3_000,
+  unit: ['variable', 'variables'],
+  describe: (bounds) =>
+    `Variables per page. ${bounds} Follow nextOffset to continue the same search.`,
+});
 
 /** The empty-result notice for a query shaped like a code, by why it matched nothing. */
 function codeMissNotice(
@@ -62,16 +75,10 @@ export const censusSearchVariables = tool('census_search_variables', {
       .number()
       .optional()
       .describe('Vintage year to search (default: latest available for the dataset).'),
-    limit: z
-      .number()
-      .int()
-      .min(1)
-      .max(100)
-      .optional()
-      .describe(
-        'Maximum results per page (default: 20, max: 100). Follow nextOffset to continue the same search.',
-      ),
+    limit: LIMIT.schema,
   }),
+  // The name census_list_datasets returns the code under, and a common name for a search term.
+  inputAliases: { dataset_id: 'dataset', keyword: 'query' },
   output: z.object({
     variables: z
       .array(
@@ -130,12 +137,17 @@ export const censusSearchVariables = tool('census_search_variables', {
       .optional()
       .describe('Offset for the next page; absent when no matches remain after this page.'),
     shown: z.number().optional().describe('Number of variables returned after the limit.'),
-    cap: z.number().optional().describe('The limit that was applied.'),
+    cap: z
+      .number()
+      .optional()
+      .describe(
+        'The limit the page was cut at: the requested one, or 3,000 when a larger one was served at the cap.',
+      ),
     notice: z
       .string()
       .optional()
       .describe(
-        'Guidance for no matches, partial-term matches, continuation, the final page or an offset past the end. For a code the dataset does not publish, names the confirmed sibling dataset or census_get_variable for an attribute column; for a table cut inside its code tier, names the last code shown and the next offset.',
+        'Guidance for no matches, partial-term matches, continuation, the final page or an offset past the end. For a code the dataset does not publish, names the confirmed sibling dataset or census_get_variable for an attribute column; for a table cut inside its code tier, names the last code shown and the next offset. A limit above 3,000 served at 3,000 is said so ahead of the paging guidance.',
       ),
   },
   // The notice quotes the query.
@@ -179,9 +191,8 @@ export const censusSearchVariables = tool('census_search_variables', {
 
   async handler(input, ctx) {
     const dataset = resolveDataset(input.dataset, 'acs/acs5');
-    const { defaultYear } = getDiscoveryConfig();
-    const year = input.year ?? DATASET_LATEST_YEARS[dataset] ?? defaultYear;
-    const limit = input.limit ?? 20;
+    const year = input.year ?? latestYearOf(dataset);
+    const { limit, clampNotice } = LIMIT.apply(ctx, input.limit);
     const offset = input.offset ?? 0;
 
     ctx.log.info('Searching Census variables', { query: input.query, dataset, year, limit });
@@ -195,44 +206,54 @@ export const censusSearchVariables = tool('census_search_variables', {
     const truncated = nextOffset < totalMatches;
     ctx.enrich({ dataset, year, totalMatches, truncated, ...(truncated && { nextOffset }) });
 
+    // Counts in prose are grouped (19,423); offsets a caller sends back stay bare digits.
+    const matches = totalMatches.toLocaleString('en-US');
     const partial =
       matchedTermCount < termCount
-        ? `No variable contains every word of "${input.query}"; these are the ${totalMatches} that contain ${matchedTermCount} of its ${termCount} words, and each can be missing a different one. Change or drop a word to match them all.`
+        ? `No variable contains every word of "${input.query}"; these are the ${matches} that contain ${matchedTermCount} of its ${termCount} words, and each can be missing a different one. Change or drop a word to match them all.`
         : undefined;
 
+    // A clamped limit is disclosed ahead of the paging sentence, after the partial-match warning,
+    // which says the page answers a different question.
+    const clamp = clampNotice ? `${clampNotice} ` : '';
+    const max = LIMIT.cap.toLocaleString('en-US');
     if (termCount === 0) {
       ctx.enrich.notice(
-        `"${input.query}" has no letters or digits to match. Search with words from a variable's label or concept, such as "median household income".`,
+        `${clamp}"${input.query}" has no letters or digits to match. Search with words from a variable's label or concept, such as "median household income".`,
       );
     } else if (totalMatches > 0 && variables.length === 0) {
       ctx.enrich.notice(
-        `offset ${offset} is past the last of the ${totalMatches} matching variables. Pass an offset below ${totalMatches}, or offset: 0 to start again.${partial ? ` ${partial}` : ''}`,
+        `${clamp}offset ${offset.toLocaleString('en-US')} is past the last of the ${matches} matching variables. Pass an offset below ${matches}, or offset: 0 to start again.${partial ? ` ${partial}` : ''}`,
       );
     } else if (totalMatches === 0) {
       ctx.enrich.notice(
-        codeMiss
-          ? codeMissNotice(input.query, codeMiss, { dataset, year })
-          : `No variables matched "${input.query}". Try broader keywords or a different dataset.`,
+        `${clamp}${
+          codeMiss
+            ? codeMissNotice(input.query, codeMiss, { dataset, year })
+            : `No variables matched "${input.query}". Try broader keywords or a different dataset.`
+        }`,
       );
     } else if (truncated) {
-      const shown = `${totalMatches} variables matched — ${totalMatches - variables.length} not shown`;
+      const shown = `${matches} variables matched — ${(totalMatches - variables.length).toLocaleString('en-US')} not shown`;
       // A table cut inside its code tier: words added to the code drop it, so narrowing cannot help.
       const continuation = `Call again with offset: ${nextOffset}, keeping query, dataset, year and limit unchanged, for the next page.`;
       const truncation =
         codeMatches > nextOffset
-          ? `${shown}; the table continues in code order after ${variables.at(-1)?.code}. ${continuation}${limit < 100 ? ' Raise limit (max 100) for a larger page.' : ''}`
-          : `${shown}. ${continuation} ${limit < 100 ? 'Narrow the query or raise limit (max 100).' : 'Narrow the query for fewer matches.'}`;
+          ? `${shown}; the table continues in code order after ${variables.at(-1)?.code}. ${continuation}${limit < LIMIT.cap ? ` Raise limit (max ${max}) for a larger page.` : ''}`
+          : `${shown}. ${continuation} ${limit < LIMIT.cap ? `Narrow the query or raise limit (max ${max}).` : 'Narrow the query for fewer matches.'}`;
       ctx.enrich.truncated({
         shown: variables.length,
         cap: limit,
-        guidance: partial ? `${partial} ${truncation}` : truncation,
+        guidance: `${partial ? `${partial} ` : ''}${clamp}${truncation}`,
       });
     } else if (offset > 0) {
       ctx.enrich.notice(
-        `This is the last page of ${totalMatches} matching variables; offset: 0 starts again.${partial ? ` ${partial}` : ''}`,
+        `${clamp}This is the last page of ${matches} matching variables; offset: 0 starts again.${partial ? ` ${partial}` : ''}`,
       );
     } else if (partial) {
-      ctx.enrich.notice(partial);
+      ctx.enrich.notice(clampNotice ? `${partial} ${clampNotice}` : partial);
+    } else if (clampNotice) {
+      ctx.enrich.notice(clampNotice);
     }
 
     return {

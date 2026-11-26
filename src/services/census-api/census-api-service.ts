@@ -624,7 +624,10 @@ export class CensusApiService {
       parentFips?: string;
       /** County FIPS code — required when querying tracts or block groups within a specific county. */
       countyFips?: string;
-      /** 6-digit tract code — scopes a block-group or block query to one tract of the county. */
+      /**
+       * Tract code in the form the vintage lists it — 6 digits, or on dec/pl 2000 the first 4 of a
+       * whole-number tract — scoping a block-group or block query to one tract of the county.
+       */
       tractFips?: string;
       /**
        * Dataset-specific filter values sent as extra query parameters, keyed by variable code

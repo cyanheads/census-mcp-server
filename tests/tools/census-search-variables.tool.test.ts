@@ -3,19 +3,24 @@
  * @module tests/tools/census-search-variables.tool.test
  */
 
-import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import {
+  createMockContext,
+  getEnrichment,
+  type MockContextLogger,
+  runToolContract,
+} from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { censusSearchVariables } from '@/mcp-server/tools/definitions/census-search-variables.tool.js';
 
-// Mock the variable cache service and server config; dataset resolution stays real.
+// Mock the variable cache service and server config; dataset and default-year resolution stay real.
 vi.mock('@/services/variable-cache/variable-cache-service.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/services/variable-cache/variable-cache-service.js')>()),
-  DATASET_LATEST_YEARS: { 'acs/acs5': 2024 },
   getVariableCacheService: vi.fn(),
 }));
 
 vi.mock('@/config/server-config.js', () => ({
-  getDiscoveryConfig: vi.fn(() => ({ defaultYear: 2024, variableCacheTtlHours: 24 })),
+  activeDiscoveryConfig: vi.fn(() => ({ variableCacheTtlHours: 24, clampLimits: true })),
+  getDiscoveryConfig: vi.fn(() => ({ variableCacheTtlHours: 24, clampLimits: true })),
 }));
 
 const mockSearchVariables = vi.fn();
@@ -146,19 +151,17 @@ describe('censusSearchVariables', () => {
     );
   });
 
-  it('rejects a limit above 100 at the schema rather than clamping it', () => {
-    expect(censusSearchVariables.input.safeParse({ query: 'income', limit: 101 }).success).toBe(
-      false,
-    );
-    expect(censusSearchVariables.input.safeParse({ query: 'income', limit: 100 }).success).toBe(
-      true,
-    );
-  });
-
-  it('passes limit 100 through and does not advise raising it once truncated there', async () => {
+  /** #95: a limit above the 3,000 cap is served at the cap and said so; at the cap, it is not. */
+  it.each([
+    [
+      3001,
+      'limit 3,001 is over the 3,000-variable cap, so this page holds up to 3,000 variables. ',
+    ],
+    [3000, ''],
+  ])('serves limit %i at 3,000, without advising a larger page', async (requested, clamp) => {
     mockSearchVariables.mockResolvedValue({
-      variables: Array.from({ length: 100 }, (_, i) => ({
-        code: `B01001_${String(i).padStart(3, '0')}E`,
+      variables: Array.from({ length: 3000 }, (_, i) => ({
+        code: `B01001_${String(i).padStart(4, '0')}E`,
         label: 'Sex by age',
         concept: 'SEX BY AGE',
         predicateType: 'int',
@@ -167,17 +170,135 @@ describe('censusSearchVariables', () => {
     });
 
     const ctx = createMockContext({ errors: censusSearchVariables.errors });
-    const input = censusSearchVariables.input.parse({ query: 'income', limit: 100 });
+    const input = censusSearchVariables.input.parse({ query: 'income', limit: requested });
     await censusSearchVariables.handler(input, ctx);
 
     expect(mockSearchVariables).toHaveBeenCalledWith(
-      expect.objectContaining({ limit: 100 }),
+      expect.objectContaining({ limit: 3000 }),
       expect.anything(),
     );
-    const notice = getEnrichment(ctx).notice as string;
-    expect(notice).toContain('19423 variables matched');
-    expect(notice).toContain('Narrow the query');
-    expect(notice).not.toMatch(/raise limit/i);
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.cap).toBe(3000);
+    expect(enrichment.notice).toBe(
+      `${clamp}19,423 variables matched — 16,423 not shown. Call again with offset: 3000, keeping query, dataset, year and limit unchanged, for the next page. Narrow the query for fewer matches.`,
+    );
+  });
+
+  /** `n` variables of one table, in code order. */
+  const tableOf = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({
+      code: `B01001_${String(i + 1).padStart(4, '0')}E`,
+      label: 'Sex by age',
+      concept: 'SEX BY AGE',
+      predicateType: 'int',
+    }));
+
+  const CLAMP =
+    'limit 3,001 is over the 3,000-variable cap, so this page holds up to 3,000 variables.';
+
+  /** #95: a clamped limit is disclosed whichever notice the search ends on, not only a cut page. */
+  it.each([
+    [
+      'no letters',
+      { query: '!!!' },
+      { variables: [], totalMatches: 0, termCount: 0, matchedTermCount: 0 },
+      `${CLAMP} "!!!" has no letters or digits to match. Search with words from a variable's label or concept, such as "median household income".`,
+    ],
+    [
+      'an offset past the end',
+      { query: 'income', offset: 5 },
+      { variables: [], totalMatches: 2, termCount: 1, matchedTermCount: 1 },
+      `${CLAMP} offset 5 is past the last of the 2 matching variables. Pass an offset below 2, or offset: 0 to start again.`,
+    ],
+    [
+      'no match',
+      { query: 'xyzzy' },
+      { variables: [], totalMatches: 0, termCount: 1, matchedTermCount: 0 },
+      `${CLAMP} No variables matched "xyzzy". Try broader keywords or a different dataset.`,
+    ],
+    [
+      'the last page',
+      { query: 'income', offset: 2 },
+      { variables: tableOf(1), totalMatches: 3, termCount: 1, matchedTermCount: 1 },
+      `${CLAMP} This is the last page of 3 matching variables; offset: 0 starts again.`,
+    ],
+    [
+      'a partial match on one page',
+      { query: 'median tract' },
+      { variables: tableOf(1), totalMatches: 1, termCount: 2, matchedTermCount: 1 },
+      `No variable contains every word of "median tract"; these are the 1 that contain 1 of its 2 words, and each can be missing a different one. Change or drop a word to match them all. ${CLAMP}`,
+    ],
+    [
+      'every match on one page',
+      { query: 'income' },
+      { variables: tableOf(1), totalMatches: 1, termCount: 1, matchedTermCount: 1 },
+      CLAMP,
+    ],
+    [
+      'a cut page of partial matches',
+      { query: 'median income tract' },
+      { variables: tableOf(3000), totalMatches: 19423, termCount: 3, matchedTermCount: 2 },
+      `No variable contains every word of "median income tract"; these are the 19,423 that contain 2 of its 3 words, and each can be missing a different one. Change or drop a word to match them all. ${CLAMP} 19,423 variables matched — 16,423 not shown. Call again with offset: 3000, keeping query, dataset, year and limit unchanged, for the next page. Narrow the query for fewer matches.`,
+    ],
+  ])('discloses limit 3001 served at 3,000 on %s', async (_label, call, found, notice) => {
+    mockSearchVariables.mockResolvedValue(found);
+
+    const ctx = createMockContext({ errors: censusSearchVariables.errors });
+    await censusSearchVariables.handler(
+      censusSearchVariables.input.parse({ ...call, limit: 3001 }),
+      ctx,
+    );
+
+    expect(getEnrichment(ctx).notice).toBe(notice);
+  });
+
+  it.each([
+    [
+      'an offset past the end',
+      { query: 'income', offset: 20000 },
+      { variables: [], totalMatches: 19423, termCount: 1, matchedTermCount: 1 },
+      'offset 20,000 is past the last of the 19,423 matching variables. Pass an offset below 19,423, or offset: 0 to start again.',
+    ],
+    [
+      'the last page',
+      { query: 'income', offset: 1000, limit: 3000 },
+      { variables: tableOf(200), totalMatches: 1200, termCount: 1, matchedTermCount: 1 },
+      'This is the last page of 1,200 matching variables; offset: 0 starts again.',
+    ],
+    [
+      'a partial match',
+      { query: 'median tract', limit: 3000 },
+      { variables: tableOf(1200), totalMatches: 1200, termCount: 2, matchedTermCount: 1 },
+      'No variable contains every word of "median tract"; these are the 1,200 that contain 1 of its 2 words, and each can be missing a different one. Change or drop a word to match them all.',
+    ],
+  ])('groups the counts in the notice on %s', async (_label, call, found, notice) => {
+    mockSearchVariables.mockResolvedValue(found);
+
+    const ctx = createMockContext({ errors: censusSearchVariables.errors });
+    await censusSearchVariables.handler(censusSearchVariables.input.parse(call), ctx);
+
+    expect(getEnrichment(ctx).notice).toBe(notice);
+  });
+
+  it('logs the limit a clamped search was served with', async () => {
+    mockSearchVariables.mockResolvedValue({
+      variables: [],
+      totalMatches: 0,
+      termCount: 1,
+      matchedTermCount: 0,
+    });
+
+    const ctx = createMockContext({ errors: censusSearchVariables.errors });
+    await censusSearchVariables.handler(
+      censusSearchVariables.input.parse({ query: 'income', limit: 3001 }),
+      ctx,
+    );
+
+    expect((ctx.log as MockContextLogger).calls).toContainEqual({
+      level: 'info',
+      msg: 'Searching Census variables',
+      data: { query: 'income', dataset: 'acs/acs5', year: 2024, limit: 3000 },
+    });
   });
 
   it('returns empty variables list when no match', async () => {
@@ -370,27 +491,27 @@ describe('censusSearchVariables', () => {
       ctx,
     );
     expect(getEnrichment(ctx).notice).toBe(
-      '372 variables matched — 368 not shown; the table continues in code order after S1701_C02_001M. Call again with offset: 4, keeping query, dataset, year and limit unchanged, for the next page. Raise limit (max 100) for a larger page.',
+      '372 variables matched — 368 not shown; the table continues in code order after S1701_C02_001M. Call again with offset: 4, keeping query, dataset, year and limit unchanged, for the next page. Raise limit (max 3,000) for a larger page.',
     );
 
     const atMax = createMockContext({ errors: censusSearchVariables.errors });
     mockSearchVariables.mockResolvedValue({
-      variables: Array.from({ length: 100 }, (_, i) => ({
-        code: `S1701_C01_${String(i + 1).padStart(3, '0')}E`,
+      variables: Array.from({ length: 3000 }, (_, i) => ({
+        code: `S1701_C01_${String(i + 1).padStart(4, '0')}E`,
         label: 'Estimate!!Total',
         predicateType: 'int',
       })),
-      totalMatches: 372,
-      codeMatches: 372,
+      totalMatches: 3372,
+      codeMatches: 3372,
       matchedTermCount: 1,
       termCount: 1,
     });
     await censusSearchVariables.handler(
-      censusSearchVariables.input.parse({ query: 'S1701', limit: 100 }),
+      censusSearchVariables.input.parse({ query: 'S1701', limit: 3000 }),
       atMax,
     );
     const notice = getEnrichment(atMax).notice as string;
-    expect(notice).toContain('after S1701_C01_100E. Call again with offset: 100');
+    expect(notice).toContain('after S1701_C01_3000E. Call again with offset: 3000');
     expect(notice).not.toMatch(/narrow|raise limit/i);
   });
 
@@ -408,7 +529,7 @@ describe('censusSearchVariables', () => {
       ctx,
     );
     expect(getEnrichment(ctx).notice).toBe(
-      '2 variables matched — 1 not shown. Call again with offset: 1, keeping query, dataset, year and limit unchanged, for the next page. Narrow the query or raise limit (max 100).',
+      '2 variables matched — 1 not shown. Call again with offset: 1, keeping query, dataset, year and limit unchanged, for the next page. Narrow the query or raise limit (max 3,000).',
     );
   });
 

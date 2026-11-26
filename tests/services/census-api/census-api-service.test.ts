@@ -32,11 +32,11 @@ import {
 } from '@/services/variable-cache/variable-cache-service.js';
 
 vi.mock('@/config/server-config.js', () => ({
-  getDiscoveryConfig: vi.fn(() => ({ defaultYear: 2024, variableCacheTtlHours: 24 })),
+  getDiscoveryConfig: vi.fn(() => ({ variableCacheTtlHours: 24, clampLimits: true })),
   getServerConfig: vi.fn(() => ({
-    defaultYear: 2024,
     censusApiKey: 'test-key',
     variableCacheTtlHours: 24,
+    clampLimits: true,
   })),
 }));
 
@@ -1439,6 +1439,9 @@ describe('CensusApiService — the API key', () => {
     ],
   ] as const;
 
+  /** Where api.census.gov sends a request whose key it refuses: a same-origin 302 to this page. */
+  const INVALID_KEY_URL = 'https://api.census.gov/data/invalid_key.html';
+
   /** The page api.census.gov redirects a request with a bad key to. */
   const invalidKeyPage = () =>
     new Response(
@@ -1465,12 +1468,12 @@ describe('CensusApiService — the API key', () => {
   };
 
   /** Serve every request with `respond`, recording it. */
-  const serveEvery = (respond: () => Response) => {
+  const serveEvery = (respond: (url: string) => Response) => {
     vi.stubGlobal(
       'fetch',
       vi.fn((url: string | URL) => {
         requestedUrls.push(String(url));
-        return Promise.resolve(respond());
+        return Promise.resolve(respond(String(url)));
       }),
     );
   };
@@ -1482,7 +1485,7 @@ describe('CensusApiService — the API key', () => {
   it.each(keyed)(
     '%s fails missing_api_key before any request when no key is set',
     async (_m, call) => {
-      vi.mocked(getServerConfig).mockReturnValue({ defaultYear: 2024, variableCacheTtlHours: 24 });
+      vi.mocked(getServerConfig).mockReturnValue({ variableCacheTtlHours: 24, clampLimits: true });
 
       const error = await rejectionOf(call);
 
@@ -1516,6 +1519,29 @@ describe('CensusApiService — the API key', () => {
       expect(error?.data?.reason).toBe('missing_api_key');
       expect(error?.data?.retryable).not.toBe(true);
       expect(requestedUrls).toHaveLength(1);
+    },
+  );
+
+  /**
+   * The refusal arrives as a 302, and `fetchWithTimeout` follows it itself rather than leaving
+   * it to the runtime, so the invalid-key page is still the response the body is read from and
+   * the call still ends on that one hop.
+   */
+  it.each(keyed)(
+    '%s follows the redirect to the invalid-key page and reports missing_api_key',
+    async (_m, call) => {
+      serveEvery((url) =>
+        url === INVALID_KEY_URL
+          ? invalidKeyPage()
+          : new Response(null, { status: 302, headers: { location: INVALID_KEY_URL } }),
+      );
+
+      const error = await rejectionOf(call);
+
+      expect(error?.code).toBe(JsonRpcErrorCode.Unauthorized);
+      expect(error?.data?.reason).toBe('missing_api_key');
+      expect(requestedUrls).toHaveLength(2);
+      expect(requestedUrls[1]).toBe(INVALID_KEY_URL);
     },
   );
 

@@ -57,6 +57,7 @@ export function describeBoundaryChange(call: {
   tool: BoundaryTool;
   dataset: string;
   year: number;
+  /** The level as geography.json names it, lowercase — the data tools normalize it on entry. */
   level: string;
   /** The call names a tract: a tract code, a `tract_fips`, or a `geographies` entry carrying one. */
   namesTract: boolean;

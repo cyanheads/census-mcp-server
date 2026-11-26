@@ -19,6 +19,7 @@ import {
   DATASET_LATEST_YEARS,
   describeAmbiguousRows,
   describeEmptyPredicatedResult,
+  describeNaicsSectorRange,
   describeRecordRows,
   describeTableSplit,
   describeUnsetPredicates,
@@ -26,17 +27,18 @@ import {
   initVariableCacheService,
   isAcsDataset,
   KNOWN_DATASETS,
+  latestYearOf,
   resolveDataset,
   SIBLING_LOOKUP_DEADLINE_MS,
   VariableCacheService,
 } from '@/services/variable-cache/variable-cache-service.js';
 
 vi.mock('@/config/server-config.js', () => ({
-  getDiscoveryConfig: vi.fn(() => ({ defaultYear: 2024, variableCacheTtlHours: 24 })),
+  getDiscoveryConfig: vi.fn(() => ({ variableCacheTtlHours: 24, clampLimits: true })),
   getServerConfig: vi.fn(() => ({
-    defaultYear: 2024,
     censusApiKey: 'test-key',
     variableCacheTtlHours: 24,
+    clampLimits: true,
   })),
 }));
 
@@ -1120,10 +1122,10 @@ describe('describeUnsetPredicates', () => {
 });
 
 describe('describeEmptyPredicatedResult', () => {
-  it('names the unset dimensions as the likely cause of an empty result', () => {
+  it('names an unset ecnbasic NAICS dimension as the likely cause of an empty result', () => {
     const text = describeEmptyPredicatedResult(
       [{ code: 'NAICS2022', label: '2022 NAICS code' }],
-      [],
+      {},
       'ecnbasic',
       2022,
       ['ESTAB'],
@@ -1138,7 +1140,7 @@ describe('describeEmptyPredicatedResult', () => {
    * the caller supplied rather than from a dimension it left out.
    */
   it('points at the supplied values too, since a bad one returns nothing rather than erroring', () => {
-    const text = describeEmptyPredicatedResult([], ['NAICS2017'], 'cbp', 2023, ['ESTAB']);
+    const text = describeEmptyPredicatedResult([], { NAICS2017: 'ZZZZ' }, 'cbp', 2023, ['ESTAB']);
 
     expect(text).toContain('does not exist in cbp (2023)');
     expect(text).toContain('NAICS2017 value');
@@ -1146,23 +1148,96 @@ describe('describeEmptyPredicatedResult', () => {
 
   it('lists three codes as prose rather than chaining "and"', () => {
     const text = describeEmptyPredicatedResult(
-      [
-        { code: 'NAICS2022', label: '2022 NAICS code' },
-        { code: 'TAXSTAT', label: 'Tax status code' },
-        { code: 'TYPOP', label: 'Type of operation code' },
-      ],
       [],
-      'ecnbasic',
-      2022,
+      { EMPSZES: '001', LFO: '001', NAICS2017: '5112' },
+      'cbp',
+      2021,
       ['ESTAB'],
     );
 
-    expect(text).toContain('NAICS2022, TAXSTAT, and TYPOP are set');
-    expect(text).not.toContain('and TAXSTAT and');
+    expect(text).toContain('check the EMPSZES, LFO, and NAICS2017 values');
+    expect(text).not.toContain('and LFO and');
   });
 
   it('returns nothing when the dataset has no predicates in play', () => {
-    expect(describeEmptyPredicatedResult([], [], 'acs/acs5', 2024, ['B19013_001E'])).toBe('');
+    expect(describeEmptyPredicatedResult([], {}, 'acs/acs5', 2024, ['B19013_001E'])).toBe('');
+  });
+
+  /**
+   * #101: a default that is the all-categories total publishes wherever its geography does, so
+   * naming it sends the caller to set a dimension that changes nothing — cbp answers 204 for
+   * NAICS2017 "48" with EMPSZES and LFO set to "001" exactly as it does with them unset. Only a
+   * default that is one category can empty a result: ecnbasic's NAICS sector and the one
+   * POPGROUP group dec/ddhca and dec/ddhcb fall back on.
+   */
+  it.each([
+    ['ecnbasic', 2022, ['NAICS2022', 'TAXSTAT', 'TYPOP'], 'NAICS2022'],
+    ['ecnbasic', 2012, ['NAICS2012', 'TAXSTAT', 'TYPOP'], 'NAICS2012'],
+    ['dec/ddhca', 2020, ['POPGROUP'], 'POPGROUP'],
+    ['dec/ddhcb', 2020, ['POPGROUP'], 'POPGROUP'],
+    ['cbp', 2021, ['EMPSZES', 'LFO', 'NAICS2017'], undefined],
+    ['nonemp', 2024, ['LFO', 'NAICS2022', 'RCPSZES'], undefined],
+    ['acs/acs1/spp', 2024, ['POPGROUP'], undefined],
+    ['pep/charv', 2023, ['YEAR'], undefined],
+  ] as const)('%s (%i) with %j unset names only %s (#101)', (dataset, year, unset, named) => {
+    const text = describeEmptyPredicatedResult(
+      unset.map((code) => ({ code, label: `${code} label` })),
+      {},
+      dataset,
+      year,
+      ['ESTAB'],
+    );
+
+    if (named) {
+      expect(text).toBe(
+        `${dataset} (${year}) may publish nothing at this level until ${named} is set — add predicates, e.g. {"${named}": "<code>"}.`,
+      );
+    } else {
+      expect(text).toBe('');
+    }
+  });
+
+  describe('a two-digit NAICS value inside a published range (#101)', () => {
+    it('names 48-49 for cbp NAICS2017 "48", keeps the value check, and blames neither EMPSZES nor LFO', () => {
+      const text = describeEmptyPredicatedResult(
+        [
+          { code: 'EMPSZES', label: 'Employment size of establishments code' },
+          { code: 'LFO', label: 'Legal form of organization code' },
+        ],
+        { NAICS2017: '48' },
+        'cbp',
+        2021,
+        ['ESTAB'],
+      );
+
+      expect(text).toBe(
+        'cbp (2021) publishes sector 48-49 only as the range "48-49", never as "48" alone, so NAICS2017 "48" returns no row — send "48-49" for the whole sector, or a longer code starting with 48 for part of it. A predicate value that does not exist in cbp (2021) also returns nothing rather than an error, so check the NAICS2017 value this query sent — census_list_predicate_values enumerates the codes each dimension accepts. A valid code can also be unpublished at the queried geography level; pass the same geography_level to a live enumeration, while dictionary lists do not validate publication at that level.',
+      );
+    });
+
+    it.each([
+      ['cbp', 2012, 'NAICS2012', '48', '48-49'],
+      ['nonemp', 2024, 'NAICS2022', '44', '44-45'],
+      ['nonemp', 1997, 'NAICS1997', '33', '31-33'],
+      ['ecnbasic', 2017, 'NAICS2017', '45', '44-45'],
+    ])('names the range under %s (%i) %s "%s"', (dataset, year, code, value, range) => {
+      const text = describeEmptyPredicatedResult([], { [code]: value }, dataset, year, ['ESTAB']);
+
+      expect(text).toContain(`so ${code} "${value}" returns no row — send "${range}"`);
+      expect(text).toContain(`check the ${code} value`);
+    });
+
+    it.each([
+      ['NAICS2017', '5112'],
+      ['NAICS2017', '48-49'],
+      ['NAICS2017', '*'],
+      ['LFO', '48'],
+    ])('adds no range line for %s "%s"', (code, value) => {
+      const text = describeEmptyPredicatedResult([], { [code]: value }, 'cbp', 2021, ['ESTAB']);
+
+      expect(text).not.toContain('publishes sector');
+      expect(text).toContain(`check the ${code} value`);
+    });
   });
 
   /**
@@ -1171,7 +1246,7 @@ describe('describeEmptyPredicatedResult', () => {
    * the value check stays behind them, since an unknown value also returns nothing.
    */
   it('leads with the sibling tables when a dec/ddhca sex-by-age table came back empty (#68)', () => {
-    const text = describeEmptyPredicatedResult([], ['POPGROUP'], 'dec/ddhca', 2020, [
+    const text = describeEmptyPredicatedResult([], { POPGROUP: '1360' }, 'dec/ddhca', 2020, [
       'T02003_001N',
     ]);
 
@@ -1180,7 +1255,7 @@ describe('describeEmptyPredicatedResult', () => {
   });
 
   it('names T03002, T03003, and T03004 for an empty dec/ddhcb T03001 query (#54)', () => {
-    const text = describeEmptyPredicatedResult([], ['POPGROUP'], 'dec/ddhcb', 2020, [
+    const text = describeEmptyPredicatedResult([], { POPGROUP: '1002' }, 'dec/ddhcb', 2020, [
       'T03001_001N',
     ]);
 
@@ -1192,7 +1267,7 @@ describe('describeEmptyPredicatedResult', () => {
   it('names the sibling tables when POPGROUP was left unset too', () => {
     const text = describeEmptyPredicatedResult(
       [{ code: 'POPGROUP', label: 'Race/Ethnic Group', labelAttribute: 'POPGROUP_LABEL' }],
-      [],
+      {},
       'dec/ddhcb',
       2020,
       ['T04002_004N'],
@@ -1204,7 +1279,7 @@ describe('describeEmptyPredicatedResult', () => {
 
   /** T01001 publishes every group the dataset serves, so nothing about it is split. */
   it('adds no table guidance for dec/ddhca T01001 (characterization)', () => {
-    const text = describeEmptyPredicatedResult([], ['POPGROUP'], 'dec/ddhca', 2020, [
+    const text = describeEmptyPredicatedResult([], { POPGROUP: '1002' }, 'dec/ddhca', 2020, [
       'T01001_001N',
     ]);
 
@@ -1212,6 +1287,49 @@ describe('describeEmptyPredicatedResult', () => {
       'A predicate value that does not exist in dec/ddhca (2020) also returns nothing rather than an error, so check the POPGROUP value this query sent — census_list_predicate_values enumerates the codes each dimension accepts. A valid code can also be unpublished at the queried geography level; pass the same geography_level to a live enumeration, while dictionary lists do not validate publication at that level.',
     );
   });
+});
+
+/**
+ * #101: cbp, ecnbasic, and nonemp publish manufacturing, retail trade, and transportation and
+ * warehousing only as 31-33, 44-45, and 48-49, and answer every two-digit code inside one with no
+ * row. The value is named, never rewritten: 49 alone is narrower than 48-49.
+ */
+describe('describeNaicsSectorRange (#101)', () => {
+  it.each([
+    ['31', '31-33'],
+    ['32', '31-33'],
+    ['33', '31-33'],
+    ['44', '44-45'],
+    ['45', '44-45'],
+    ['48', '48-49'],
+    ['49', '48-49'],
+  ])('names "%s" as part of "%s" on cbp, ecnbasic, and nonemp', (value, range) => {
+    for (const dataset of ['cbp', 'ecnbasic', 'nonemp']) {
+      expect(describeNaicsSectorRange(dataset, 2021, 'NAICS2017', value)).toBe(
+        `${dataset} (2021) publishes sector ${range} only as the range "${range}", never as "${value}" alone, so NAICS2017 "${value}" returns no row — send "${range}" for the whole sector, or a longer code starting with ${value} for part of it.`,
+      );
+    }
+  });
+
+  it('names the input the value was sent in', () => {
+    expect(describeNaicsSectorRange('ecnbasic', 2022, 'within_naics', '31')).toContain(
+      'so within_naics "31" returns no row',
+    );
+  });
+
+  it.each(['48-49', '31-33', '44-45', '5112', '481', '4', '11', '62', '*', ''])(
+    'says nothing for %j',
+    (value) => {
+      expect(describeNaicsSectorRange('cbp', 2021, 'NAICS2017', value)).toBe('');
+    },
+  );
+
+  it.each(['acs/acs5', 'acs/acs1/spp', 'dec/ddhca', 'pep/charv', 'geoinfo'])(
+    'says nothing on %s',
+    (dataset) => {
+      expect(describeNaicsSectorRange(dataset, 2021, 'NAICS2017', '48')).toBe('');
+    },
+  );
 });
 
 describe('describeTableSplit (#54, #68)', () => {
@@ -1616,6 +1734,25 @@ describe('dataset registries derived from DATASET_AVAILABLE_YEARS', () => {
       nonemp: 2024,
       geoinfo: 2025,
     });
+  });
+
+  /**
+   * #96: the vintage every tool reads when `year` is omitted. The datasets differ in their newest
+   * vintage, so no single configured default year could stand in for them.
+   */
+  it.each([
+    ['acs/acs5', 2024],
+    ['acs/acs1', 2025],
+    ['dec/pl', 2020],
+    ['pep/charv', 2023],
+  ])('latestYearOf(%s) is %i', (dataset, year) => {
+    expect(latestYearOf(dataset)).toBe(year);
+  });
+
+  it('latestYearOf throws for an unregistered dataset rather than inventing a year', () => {
+    expect(() => latestYearOf('acs/acs7')).toThrow(
+      'No vintage is registered for dataset "acs/acs7".',
+    );
   });
 
   /**

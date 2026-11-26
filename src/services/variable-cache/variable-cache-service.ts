@@ -169,6 +169,17 @@ export const DATASET_LATEST_YEARS: Record<string, number> = Object.fromEntries(
 );
 
 /**
+ * The vintage a call that omits `year` reads: the dataset's newest. Every registered dataset has
+ * one, and `resolveDataset` rejects an unregistered code before any handler reads this, so a
+ * miss is a programmer error rather than a caller's.
+ */
+export function latestYearOf(dataset: string): number {
+  const year = DATASET_LATEST_YEARS[dataset];
+  if (year === undefined) throw new Error(`No vintage is registered for dataset "${dataset}".`);
+  return year;
+}
+
+/**
  * True for the ACS dataset family, the only family where the `E` estimate / `M` margin-of-error
  * suffix convention holds. ACS omits its `M` codes from variables.json but serves them from the
  * data API, so they are inferred; other families use `E`-final codes for unrelated fields
@@ -194,6 +205,9 @@ function publishesMarginsOfError(dataset: string): boolean {
  * it beside real filter dimensions like `NAICS2017` would bury the ones that change the answer.
  */
 export const NON_FILTERING_PREDICATES = new Set(['GEOCOMP']);
+
+/** Filter dimensions carrying an industry classification, under any NAICS revision's name. */
+export const NAICS_DIMENSION = /^NAICS\d{4}$/;
 
 /** Join codes into readable prose: `A`, `A and B`, `A, B, and C` (or `A or B` for alternatives). */
 function listCodes(codes: readonly string[], conjunction: 'and' | 'or' = 'and'): string {
@@ -547,17 +561,77 @@ export function describeUnsetPredicates(
 }
 
 /**
- * Word why a predicated query came back empty, for the `no_data` recovery hint. Covers three
+ * The two-digit NAICS codes the business datasets publish only inside a sector range. `cbp`,
+ * `ecnbasic`, and `nonemp` publish manufacturing, retail trade, and transportation and warehousing
+ * as `31-33`, `44-45`, and `48-49` under every NAICS revision they declare, and answer `31`, `32`,
+ * `33`, `44`, `45`, `48`, and `49` with no row (api.census.gov: `cbp` 2012–2023, `ecnbasic` 2012,
+ * 2017, and 2022, `nonemp` 1997, 2012, and 2024). Keyed by caller-supplied value.
+ */
+const NAICS_SECTOR_RANGES: ReadonlyMap<string, string> = new Map([
+  ['31', '31-33'],
+  ['32', '31-33'],
+  ['33', '31-33'],
+  ['44', '44-45'],
+  ['45', '44-45'],
+  ['48', '48-49'],
+  ['49', '48-49'],
+]);
+
+/** The datasets whose NAICS dimensions publish those sectors only as ranges. */
+const NAICS_RANGE_DATASETS: ReadonlySet<string> = new Set(['cbp', 'ecnbasic', 'nonemp']);
+
+/**
+ * Word why a two-digit NAICS code inside a published sector range came back empty, naming the
+ * range. `field` is the input the value arrived in — a dimension code (`NAICS2017`) or
+ * `within_naics`. Returns `''` for any other value or dataset.
+ *
+ * The value is named rather than rewritten: `49` alone is narrower than `48-49`, so swapping one
+ * for the other would answer a question the caller did not ask.
+ */
+export function describeNaicsSectorRange(
+  dataset: string,
+  year: number,
+  field: string,
+  value: string,
+): string {
+  const range = NAICS_RANGE_DATASETS.has(dataset) ? NAICS_SECTOR_RANGES.get(value) : undefined;
+  if (!range) return '';
+  return `${dataset} (${year}) publishes sector ${range} only as the range "${range}", never as "${value}" alone, so ${field} "${value}" returns no row — send "${range}" for the whole sector, or a longer code starting with ${value} for part of it.`;
+}
+
+/**
+ * The filter dimensions whose default can leave a result empty, by dataset. Most defaults are
+ * the all-categories total, which publishes wherever its geography does — `cbp` `NAICS2017`,
+ * `EMPSZES`, and `LFO`; every `nonemp` dimension; `ecnbasic` `TAXSTAT` and `TYPOP`; `acs/acs1/spp`
+ * `POPGROUP` — or a category that always publishes (`pep/charv` `YEAR` 2020). Naming one of those
+ * sends the caller to set a dimension that changes nothing. Two defaults are one ordinary category
+ * instead: `ecnbasic` answers an unset NAICS with one sector, which a county often lacks (county
+ * `053` in Washington answers 204), and `dec/ddhca` and `dec/ddhcb` answer an unset `POPGROUP`
+ * with one group, which a table can leave unpublished (`dec/ddhcb` `T03001_001N` in Washington
+ * answers 204).
+ */
+const EMPTYING_DEFAULTS: ReadonlyMap<string, RegExp> = new Map([
+  ['ecnbasic', NAICS_DIMENSION],
+  ['dec/ddhca', /^POPGROUP$/],
+  ['dec/ddhcb', /^POPGROUP$/],
+]);
+
+/**
+ * Word why a predicated query came back empty, for the `no_data` recovery hint. Covers four
  * causes: a requested table that does not publish the group at that geography while a sibling
- * table does (`dec/ddhca` `T02003` lacks `1360`, which `T02002` publishes), a dimension left unset
- * (`ecnbasic` publishes nothing below the national level until an industry is named), and a
- * supplied value that does not exist (an unknown `NAICS2017` value is a `204`, not a `400`). The
- * sibling tables lead, since the value is usually valid there. Returns `''` when none applies, so
- * the caller falls back to its own dataset-aware hint.
+ * table does (`dec/ddhca` `T02003` lacks `1360`, which `T02002` publishes); a dimension left unset
+ * whose default is one category (`ecnbasic` answers an unset NAICS with one sector at the national
+ * and state levels and often with nothing below them, `dec/ddhca` and `dec/ddhcb` an unset
+ * `POPGROUP` with one group — see `EMPTYING_DEFAULTS`); a two-digit NAICS code inside a sector the
+ * business datasets publish only as a range (`48` for `48-49`); and a supplied value that does not
+ * exist (an unknown `NAICS2017` value is a `204`, not a `400`). `predicates` is the normalized map
+ * the query sent, read for its values as well as its keys. The sibling tables lead, since the
+ * value is usually valid there. Returns `''` when none applies, so the caller falls back to its
+ * own dataset-aware hint.
  */
 export function describeEmptyPredicatedResult(
   unset: UnsetPredicate[],
-  supplied: string[],
+  predicates: Readonly<Record<string, string>>,
   dataset: string,
   year: number,
   variables: readonly string[],
@@ -565,13 +639,21 @@ export function describeEmptyPredicatedResult(
   const split = describeTableSplit(variables, dataset, false);
   const parts: string[] = split ? [split] : [];
 
-  if (unset.length > 0) {
-    const codes = unset.map((p) => p.code);
+  const emptying = EMPTYING_DEFAULTS.get(dataset);
+  const codes = emptying ? unset.map((p) => p.code).filter((code) => emptying.test(code)) : [];
+  if (codes.length > 0) {
     parts.push(
-      `${dataset} (${year}) may publish nothing at this level until ${listCodes(codes)} ${unset.length === 1 ? 'is' : 'are'} set — add predicates, e.g. {"${codes[0]}": "<code>"}.`,
+      `${dataset} (${year}) may publish nothing at this level until ${listCodes(codes)} ${codes.length === 1 ? 'is' : 'are'} set — add predicates, e.g. {"${codes[0]}": "<code>"}.`,
     );
   }
 
+  for (const [code, value] of Object.entries(predicates)) {
+    if (!NAICS_DIMENSION.test(code)) continue;
+    const range = describeNaicsSectorRange(dataset, year, code, value);
+    if (range) parts.push(range);
+  }
+
+  const supplied = Object.keys(predicates);
   if (supplied.length > 0) {
     parts.push(
       `A predicate value that does not exist in ${dataset} (${year}) also returns nothing rather than an error, so check the ${listCodes(supplied)} ${supplied.length === 1 ? 'value' : 'values'} this query sent — census_list_predicate_values enumerates the codes each dimension accepts. A valid code can also be unpublished at the queried geography level; pass the same geography_level to a live enumeration, while dictionary lists do not validate publication at that level.`,

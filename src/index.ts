@@ -6,6 +6,7 @@
  */
 
 import { createApp } from '@cyanheads/mcp-ts-core';
+import { getServerConfig } from './config/server-config.js';
 import { allToolDefinitions } from './mcp-server/tools/definitions/index.js';
 import { initCensusApiService } from './services/census-api/census-api-service.js';
 import { initGeographyService } from './services/geography/geography-service.js';
@@ -21,6 +22,10 @@ await createApp({
   sessionMode: 'stateless',
   landing: { requireAuth: false },
   setup() {
+    // Parsed here, after createApp() has loaded .env, so a malformed CENSUS_* value stops startup
+    // with the configuration banner naming it instead of failing tools at call time. Its schema
+    // extends the discovery one, so this covers every variable; the input schemas read the result.
+    getServerConfig();
     initCensusApiService();
     initVariableCacheService();
     initGeographyService();

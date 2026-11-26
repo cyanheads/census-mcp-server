@@ -12,13 +12,8 @@ vi.mock('@/services/census-api/census-api-service.js', () => ({
   getCensusApiService: vi.fn(),
 }));
 
-vi.mock('@/services/variable-cache/variable-cache-service.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('@/services/variable-cache/variable-cache-service.js')>()),
-  DATASET_LATEST_YEARS: { 'acs/acs5': 2024, 'dec/pl': 2020 },
-}));
-
 vi.mock('@/config/server-config.js', () => ({
-  getDiscoveryConfig: vi.fn(() => ({ defaultYear: 2024, variableCacheTtlHours: 24 })),
+  getDiscoveryConfig: vi.fn(() => ({ variableCacheTtlHours: 24, clampLimits: true })),
 }));
 
 const mockFetchGeographyLevels = vi.fn();

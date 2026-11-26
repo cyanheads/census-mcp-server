@@ -20,11 +20,12 @@ import { initVariableCacheService } from '@/services/variable-cache/variable-cac
 import { readNotice } from '../helpers/markdown-readback.js';
 
 vi.mock('@/config/server-config.js', () => ({
-  getDiscoveryConfig: vi.fn(() => ({ defaultYear: 2024, variableCacheTtlHours: 24 })),
+  activeDiscoveryConfig: vi.fn(() => ({ variableCacheTtlHours: 24, clampLimits: true })),
+  getDiscoveryConfig: vi.fn(() => ({ variableCacheTtlHours: 24, clampLimits: true })),
   getServerConfig: vi.fn(() => ({
-    defaultYear: 2024,
     censusApiKey: 'test-key',
     variableCacheTtlHours: 24,
+    clampLimits: true,
   })),
 }));
 
@@ -623,7 +624,7 @@ describe('census_search_variables matches a variable or table code (#63)', () =>
     expect(out.totalMatches).toBe(6);
     expect(out.truncated).toBe(true);
     expect(out.notice).toBe(
-      '6 variables matched — 3 not shown; the table continues in code order after S1701_C02_001E. Call again with offset: 3, keeping query, dataset, year and limit unchanged, for the next page. Raise limit (max 100) for a larger page.',
+      '6 variables matched — 3 not shown; the table continues in code order after S1701_C02_001E. Call again with offset: 3, keeping query, dataset, year and limit unchanged, for the next page. Raise limit (max 3,000) for a larger page.',
     );
     expect(textOf(result)).toContain('the table continues in code order after S1701_C02_001E');
     expect(textOf(result)).not.toContain('### `S1701_C02_001M`');
@@ -1540,7 +1541,7 @@ describe('a dataset code resolves regardless of case, padding, or a bare acs5 (#
     expect(textOf(result)).toContain('**cbp (2023)**');
   });
 
-  /** The default year follows the resolved code: dec/pl ends in 2020, not the server's 2024. */
+  /** The default year follows the resolved code: dec/pl ends in 2020, not acs/acs5's 2024. */
   it('census_search_variables searches dec/pl 2020 for a bare "pl"', async () => {
     routes['/data/2020/dec/pl/variables.json'] = {
       variables: {
@@ -2431,7 +2432,7 @@ describe('census_list_predicate_values publication check under cancellation and 
 
     it('sends no probe when the key is unset', async () => {
       serveDdhca();
-      vi.mocked(getServerConfig).mockReturnValue({ defaultYear: 2024, variableCacheTtlHours: 24 });
+      vi.mocked(getServerConfig).mockReturnValue({ variableCacheTtlHours: 24, clampLimits: true });
 
       const result = await runToolContract(censusListPredicateValues, {
         predicate: 'POPGROUP',

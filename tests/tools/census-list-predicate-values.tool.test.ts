@@ -16,17 +16,16 @@ vi.mock('@/services/census-api/census-api-service.js', async (importOriginal) =>
 
 vi.mock('@/services/variable-cache/variable-cache-service.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/services/variable-cache/variable-cache-service.js')>()),
-  DATASET_LATEST_YEARS: { cbp: 2023, ecnbasic: 2022, 'dec/ddhca': 2020 },
-  KNOWN_DATASETS: new Set(['cbp', 'ecnbasic', 'dec/ddhca', 'acs/acs5']),
   getVariableCacheService: vi.fn(),
 }));
 
 vi.mock('@/config/server-config.js', () => ({
-  getDiscoveryConfig: vi.fn(() => ({ defaultYear: 2024, variableCacheTtlHours: 24 })),
+  activeDiscoveryConfig: vi.fn(() => ({ variableCacheTtlHours: 24, clampLimits: true })),
+  getDiscoveryConfig: vi.fn(() => ({ variableCacheTtlHours: 24, clampLimits: true })),
   getServerConfig: vi.fn(() => ({
-    defaultYear: 2024,
     censusApiKey: 'test-key',
     variableCacheTtlHours: 24,
+    clampLimits: true,
   })),
 }));
 
@@ -200,6 +199,37 @@ describe('censusListPredicateValues — dimensions with no published value list'
     }
   });
 
+  it.each([
+    [1000, 'This is the last page of 1,200 matching codes; offset: 0 starts again.'],
+    [
+      1200,
+      'offset 1,200 is past the last of the 1,200 matching codes. Pass an offset below 1,200, or offset: 0 to start again.',
+    ],
+  ])('groups the counts in the terminal notice at offset %i', async (offset, notice) => {
+    mockFindVariable.mockResolvedValue(empszes);
+    mockFetchPredicateValues.mockResolvedValue(
+      Array.from({ length: 1200 }, (_, i) => ({ code: String(i + 1000), label: `Size ${i}` })),
+    );
+    const result = await runToolContract(censusListPredicateValues, {
+      predicate: 'EMPSZES',
+      dataset: 'cbp',
+      limit: 500,
+      offset,
+    });
+    expect((result.structuredContent as { notice?: string }).notice).toContain(notice);
+  });
+
+  it('counts a single code in the singular in the text header', async () => {
+    mockFindVariable.mockResolvedValue(empszes);
+    mockFetchPredicateValues.mockResolvedValue([{ code: '273', label: '5,000 employees or more' }]);
+    const result = await runToolContract(censusListPredicateValues, {
+      predicate: 'EMPSZES',
+      dataset: 'cbp',
+    });
+    const text = result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+    expect(text).toContain('· 1 code\n');
+  });
+
   it.each([-1, 0.5])('rejects offset %s', (offset) => {
     expect(
       censusListPredicateValues.input.safeParse({ predicate: 'EMPSZES', dataset: 'cbp', offset })
@@ -329,6 +359,73 @@ describe('censusListPredicateValues — dimensions with no published value list'
     await expect(censusListPredicateValues.handler(call(), ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.NotFound,
       data: { reason: 'no_values' },
+    });
+  });
+
+  describe('no_values under within_naics', () => {
+    const taxstat = {
+      code: 'TAXSTAT',
+      label: 'Tax status code',
+      concept: '',
+      predicateType: 'string',
+      required: true,
+      labelAttribute: 'TAXSTAT_LABEL',
+    };
+
+    beforeEach(() => {
+      mockFindVariable.mockResolvedValue(taxstat);
+      mockGetFilterDimensions.mockResolvedValue([
+        { code: 'NAICS2022', label: '2022 NAICS code', concept: '', predicateType: 'string' },
+        { code: 'TAXSTAT', label: 'Tax status code', concept: '', predicateType: 'string' },
+      ]);
+      mockFetchPredicateValues.mockResolvedValue([]);
+    });
+
+    const hintOf = async (within_naics: string) => {
+      const result = await runToolContract(censusListPredicateValues, {
+        predicate: 'TAXSTAT',
+        dataset: 'ecnbasic',
+        within_naics,
+      });
+      const error = (
+        result.structuredContent as {
+          error: { data: { reason: string; recovery: { hint: string } } };
+        }
+      ).error;
+      const text = result.content
+        .map((block) => (block.type === 'text' ? block.text : ''))
+        .join('\n');
+      return { reason: error.data.reason, hint: error.data.recovery.hint, text };
+    };
+
+    it('points a narrow industry at a broader one (characterization)', async () => {
+      const { reason, hint, text } = await hintOf('7111');
+
+      expect(reason).toBe('no_values');
+      expect(hint).toBe(
+        'Drop within_naics, or try a broader industry code — a narrow leaf industry often publishes only the all-establishments row.',
+      );
+      expect(text).toContain('try a broader industry code');
+    });
+
+    it('documents the three NAICS ranges in the within_naics description (#101)', () => {
+      const schema = censusListPredicateValues.input.toJSONSchema() as {
+        properties: Record<string, { description?: string }>;
+      };
+      const description = schema.properties.within_naics?.description ?? '';
+
+      for (const range of ['31-33', '44-45', '48-49']) expect(description).toContain(range);
+    });
+
+    /** #101: ecnbasic publishes manufacturing only as 31-33, so "31" scopes to no industry. */
+    it('names the published range for a two-digit code inside one (#101)', async () => {
+      const { reason, hint, text } = await hintOf('31');
+
+      expect(reason).toBe('no_values');
+      expect(hint).toContain('"31-33"');
+      expect(hint).toContain('within_naics "31"');
+      expect(hint).not.toContain('a broader industry code');
+      expect(text).toContain('31-33');
     });
   });
 });
@@ -574,26 +671,63 @@ describe('censusListPredicateValues — dimensions with a published value list',
     expect(enrichment.truncated).toBe(true);
     expect(enrichment.totalCount).toBe(3);
     expect(enrichment.notice).toContain('Showing 2 of 3');
-    expect(enrichment.notice).toContain('raise limit (max 500)');
+    expect(enrichment.notice).toContain('raise limit (max 10,000)');
   });
 
-  it('does not advise raising a limit already at its maximum', async () => {
+  /** #95: a limit above the 10,000 cap is served at the cap and said so; at the cap, it is not. */
+  it.each([
+    [10_001, 'limit 10,001 is over the 10,000-code cap, so this page holds up to 10,000 codes. '],
+    [10_000, ''],
+  ])('serves limit %i at 10,000 without advising a larger page', async (requested, clamp) => {
     mockFindVariable.mockResolvedValue(empszes);
     mockFetchPredicateValues.mockResolvedValue(
-      Array.from({ length: 2003 }, (_, i) => ({
-        code: String(i).padStart(4, '0'),
+      Array.from({ length: 10_050 }, (_, i) => ({
+        code: String(i).padStart(5, '0'),
         label: `Code ${i}`,
       })),
     );
 
     const ctx = createMockContext({ errors: censusListPredicateValues.errors });
-    const result = await censusListPredicateValues.handler(call({ limit: 500 }), ctx);
+    const result = await censusListPredicateValues.handler(call({ limit: requested }), ctx);
 
-    expect(result.values).toHaveLength(500);
+    expect(result.values).toHaveLength(10_000);
     const notice = getEnrichment(ctx).notice as string;
-    expect(notice).toContain('Showing 500 of 2,003');
-    expect(notice).toContain('Narrow with query');
+    expect(notice).toContain(`${clamp}Showing 10,000 of 10,050 codes.`);
+    expect(notice).toContain('Narrow with query for fewer matches.');
     expect(notice).not.toMatch(/raise limit/i);
+  });
+
+  it('groups the code count when a keyword matches none of a long list', async () => {
+    mockFindVariable.mockResolvedValue(empszes);
+    mockFetchPredicateValues.mockResolvedValue(
+      Array.from({ length: 10_050 }, (_, i) => ({
+        code: String(i).padStart(5, '0'),
+        label: `Code ${i}`,
+      })),
+    );
+
+    const ctx = createMockContext({ errors: censusListPredicateValues.errors });
+    await censusListPredicateValues.handler(call({ query: 'zzz' }), ctx);
+
+    expect(getEnrichment(ctx).notice).toContain(
+      'No EMPSZES code matched "zzz". EMPSZES takes 10,050 codes here — drop query to list them, or try a broader keyword.',
+    );
+  });
+
+  it('discloses limit 20,000 served at 10,000 when every code fits the page', async () => {
+    mockFindVariable.mockResolvedValue(empszes);
+    mockFetchPredicateValues.mockResolvedValue([
+      { code: '210', label: 'Establishments with less than 5 employees' },
+      { code: '273', label: '5,000 employees or more' },
+    ]);
+
+    const ctx = createMockContext({ errors: censusListPredicateValues.errors });
+    const result = await censusListPredicateValues.handler(call({ limit: 20_000 }), ctx);
+
+    expect(result.values).toHaveLength(2);
+    expect(getEnrichment(ctx).notice).toBe(
+      'These codes cover geography level "us"; codes can vary by geography level, industry and individual geography. Keep geography_level unchanged when following nextOffset. limit 20,000 is over the 10,000-code cap, so this page holds up to 10,000 codes.',
+    );
   });
 });
 

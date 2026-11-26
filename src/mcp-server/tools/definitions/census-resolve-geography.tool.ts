@@ -89,6 +89,13 @@ export const censusResolveGeography = tool('census_resolve_geography', {
         "County FIPS code to resolve within — 1 to 3 digits, zero-padded here to the 3 the Census stores. A tract name is unique only inside its county, and a town or township name can repeat across a state's counties, so a name matching two counties comes back as ambiguous_name until this is set: take the countyFips of the candidate you want from that error and re-call. Only county, county subdivision, and tract sit within a county, so this restricts resolution to those three levels — pairing it with any other geography_type, or with a street address, is a county_scope_unsupported error rather than a scope quietly dropped. census_query_data takes the same code as its own county_fips.",
       ),
   }),
+  // Common names for the place being resolved, and the data tools' name for the level.
+  inputAliases: {
+    place_name: 'name',
+    place: 'name',
+    query: 'name',
+    geography_level: 'geography_type',
+  },
   output: z.object({
     name: z.string().describe('Canonical name of the resolved geography.'),
     geography_type: z

@@ -5,10 +5,9 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { getDiscoveryConfig } from '@/config/server-config.js';
 import {
-  DATASET_LATEST_YEARS,
   getVariableCacheService,
+  latestYearOf,
   resolveDataset,
 } from '@/services/variable-cache/variable-cache-service.js';
 
@@ -34,6 +33,8 @@ export const censusGetVariable = tool('census_get_variable', {
       .optional()
       .describe('Vintage year (default: latest available for the dataset).'),
   }),
+  // The name census_list_datasets returns the code under.
+  inputAliases: { dataset_id: 'dataset' },
   output: z.object({
     variables: z
       .array(
@@ -141,8 +142,7 @@ export const censusGetVariable = tool('census_get_variable', {
 
   async handler(input, ctx) {
     const dataset = resolveDataset(input.dataset, 'acs/acs5');
-    const { defaultYear } = getDiscoveryConfig();
-    const year = input.year ?? DATASET_LATEST_YEARS[dataset] ?? defaultYear;
+    const year = input.year ?? latestYearOf(dataset);
 
     // Case is resolved against the dataset's own spellings by the variable cache.
     const codes = input.variables.map((code) => code.trim());

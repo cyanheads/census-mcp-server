@@ -2,7 +2,7 @@
 
 **Server:** census-mcp-server
 **Version:** 0.8.0
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.22`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.23`
 **Engines:** Bun ≥1.4.4, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.4.0
 **Zod:** ^4.6.7
@@ -49,8 +49,18 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 ```ts
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { getDiscoveryConfig } from '@/config/server-config.js';
-import { DATASET_LATEST_YEARS, getVariableCacheService, resolveDataset } from '@/services/variable-cache/variable-cache-service.js';
+import { countLimit } from '@/mcp-server/tools/count-limit.js';
+import { getVariableCacheService, latestYearOf, resolveDataset } from '@/services/variable-cache/variable-cache-service.js';
+
+// A `limit` over the cap is served at the cap with a notice (CENSUS_CLAMP_LIMITS=false rejects it
+// instead), so the schema advertises no maximum unless clamping is off.
+const LIMIT = countLimit({
+  tool: 'census_search_variables',
+  default: 20,
+  cap: 3_000,
+  unit: ['variable', 'variables'],
+  describe: (bounds) => `Variables per page. ${bounds}`,
+});
 
 export const censusSearchVariables = tool('census_search_variables', {
   description: 'Search Census variables by keyword across labels and concepts.',
@@ -59,7 +69,7 @@ export const censusSearchVariables = tool('census_search_variables', {
     query: z.string().describe('Keyword to search (e.g., "median household income")'),
     dataset: z.string().optional().describe('Dataset to search (default: "acs/acs5")'),
     year: z.number().optional().describe('Vintage year (default: latest for dataset)'),
-    limit: z.number().int().min(1).max(100).optional().describe('Max results (default: 20, max: 100)'),
+    limit: LIMIT.schema,
     offset: z.number().int().min(0).optional().describe('Matching variables to skip (default: 0)'),
   }),
   output: z.object({
@@ -88,9 +98,8 @@ export const censusSearchVariables = tool('census_search_variables', {
 
   async handler(input, ctx) {
     const dataset = resolveDataset(input.dataset, 'acs/acs5');
-    const { defaultYear } = getDiscoveryConfig();
-    const year = input.year ?? DATASET_LATEST_YEARS[dataset] ?? defaultYear;
-    const limit = input.limit ?? 20;
+    const year = input.year ?? latestYearOf(dataset);
+    const { limit, clampNotice } = LIMIT.apply(ctx, input.limit); // clampNotice leads the response notice
     const offset = input.offset ?? 0;
 
     const service = getVariableCacheService();
@@ -127,16 +136,19 @@ import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
 
 // Discovery config — no key. Tools that never call the Census Data API read only this.
 const DiscoveryConfigSchema = z.object({
-  defaultYear: z.coerce.number().default(2024).describe('Default vintage year'),
   variableCacheTtlHours: z.coerce.number().default(24).describe('Variable cache TTL in hours'),
+  clampLimits: z.stringbool().default(true).describe('Serve an over-cap limit at the cap instead of rejecting it'),
 });
+
+// One env-var map for both configs.
+const DISCOVERY_ENV = {
+  variableCacheTtlHours: 'CENSUS_VARIABLE_CACHE_TTL_HOURS',
+  clampLimits: 'CENSUS_CLAMP_LIMITS',
+} as const;
 
 let _discoveryConfig: z.infer<typeof DiscoveryConfigSchema> | undefined;
 export function getDiscoveryConfig() {
-  _discoveryConfig ??= parseEnvConfig(DiscoveryConfigSchema, {
-    defaultYear: 'CENSUS_DEFAULT_YEAR',
-    variableCacheTtlHours: 'CENSUS_VARIABLE_CACHE_TTL_HOURS',
-  });
+  _discoveryConfig ??= parseEnvConfig(DiscoveryConfigSchema, DISCOVERY_ENV);
   return _discoveryConfig;
 }
 
@@ -148,19 +160,18 @@ const ServerConfigSchema = DiscoveryConfigSchema.extend({
 let _config: z.infer<typeof ServerConfigSchema> | undefined;
 export function getServerConfig() {
   _config ??= parseEnvConfig(ServerConfigSchema, {
+    ...DISCOVERY_ENV,
     censusApiKey: 'CENSUS_API_KEY',
-    defaultYear: 'CENSUS_DEFAULT_YEAR',
-    variableCacheTtlHours: 'CENSUS_VARIABLE_CACHE_TTL_HOURS',
   });
   return _config;
 }
 ```
 
-Tool handlers read `getDiscoveryConfig()`; only the Census API service calls `getServerConfig()`, through one helper (`requireApiKey`) that its two keyed methods — `queryData` and `fetchPredicateValues` — call before building a request. An unset key there throws `missing_api_key` (Unauthorized), so the keyless tools keep working without `CENSUS_API_KEY` and the keyed ones (`census_query_data`, `census_compare_geographies`, and `census_list_predicate_values`'s live route and publication check) fail with a typed reason rather than a config error. The "Invalid Key" page the Census API answers a rejected key with is the same reason, read once by the shared body parser, so it is never retried.
+`setup()` in `src/index.ts` calls `getServerConfig()` after `createApp()` has loaded `.env`, so a malformed `CENSUS_VARIABLE_CACHE_TTL_HOURS` or `CENSUS_CLAMP_LIMITS` stops startup with the configuration banner instead of failing a tool at call time. Input schemas read `activeDiscoveryConfig()`, which returns the parsed config once one exists and the schema defaults before, and never parses: `tool()` serializes input schemas at import, before `createApp()` loads `.env`. The Census API service calls `getServerConfig()`, through one helper (`requireApiKey`) that its two keyed methods — `queryData` and `fetchPredicateValues` — call before building a request. An unset key there throws `missing_api_key` (Unauthorized), so the keyless tools keep working without `CENSUS_API_KEY` and the keyed ones (`census_query_data`, `census_compare_geographies`, and `census_list_predicate_values`'s live route and publication check) fail with a typed reason rather than a config error. The "Invalid Key" page the Census API answers a rejected key with is the same reason, read once by the shared body parser, so it is never retried.
 
-`parseEnvConfig` maps Zod schema paths → env var names so errors name the variable (`CENSUS_DEFAULT_YEAR`) not the path (`defaultYear`), and reads a blank, whitespace-only, or unsubstituted `${…}` value as unset. Throws `ConfigurationError`, which the framework prints as a clean startup banner — a malformed year or TTL still does; the key no longer can.
+`parseEnvConfig` maps Zod schema paths → env var names so errors name the variable (`CENSUS_VARIABLE_CACHE_TTL_HOURS`) not the path (`variableCacheTtlHours`), and reads a blank, whitespace-only, or unsubstituted `${…}` value as unset. Throws `ConfigurationError`, which the framework prints as a clean startup banner — a malformed TTL or clamp switch still does; the key no longer can.
 
-For env booleans use `z.stringbool()`, never `z.coerce.boolean()` — `Boolean("false")` is `true`, so a coerced flag can't be disabled through the environment. `z.stringbool()` parses `true/false/1/0/yes/no/on/off` and rejects anything else, so `=false` actually disables.
+For env booleans use `z.stringbool()`, never `z.coerce.boolean()` — `Boolean("false")` is `true`, so a coerced flag can't be disabled through the environment. `z.stringbool()` parses `true/false`, `1/0`, `yes/no`, `on/off`, `y/n`, and `enabled/disabled` (any case) and rejects anything else, so `=false` actually disables.
 
 ### Census call contracts
 
@@ -284,6 +295,8 @@ src/
       types.ts                          # Variable types
   mcp-server/
     tools/acs-coverage.ts               # ACS publication guidance for missing geographies
+    tools/count-limit.ts                # `limit` schema and over-cap clamp (LIMIT.schema / LIMIT.apply) for the four paged tools
+    tools/geoid-layout.ts               # Parent codes and level-code width of a full GEOID, and the reading of a geography_fips list of GEOIDs
     tools/boundary-vintage.ts           # Tract-vintage and Connecticut county-scheme guidance for a named code with no row
     tools/notice-trailer.ts             # Notice render that escapes quoted caller and upstream text in content[]
     tools/variable-entry.ts             # Per-variable output entry, variable_labels legend, and rendering shared by both data tools

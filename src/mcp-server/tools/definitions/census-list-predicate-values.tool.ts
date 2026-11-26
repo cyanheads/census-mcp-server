@@ -8,7 +8,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { getDiscoveryConfig } from '@/config/server-config.js';
+import { countLimit } from '@/mcp-server/tools/count-limit.js';
 import { renderNotice } from '@/mcp-server/tools/notice-trailer.js';
 import { getCensusApiService } from '@/services/census-api/census-api-service.js';
 import {
@@ -19,14 +19,28 @@ import {
 import { levelNotSupportedMessage } from '@/services/census-api/errors.js';
 import type { CensusPredicateValue } from '@/services/census-api/types.js';
 import {
-  DATASET_LATEST_YEARS,
+  describeNaicsSectorRange,
   getVariableCacheService,
+  latestYearOf,
+  NAICS_DIMENSION,
   NON_FILTERING_PREDICATES,
   resolveDataset,
 } from '@/services/variable-cache/variable-cache-service.js';
 
-/** Filter dimensions carrying an industry classification, whose value scopes the others. */
-const NAICS_DIMENSION = /^NAICS\d{4}$/;
+/**
+ * Codes per page. The longest whole list, cbp NAICS2017 unverified at 6,694 codes, is about 455 KB
+ * of structuredContent, so every list fits under the cap.
+ */
+const LIMIT = countLimit({
+  tool: 'census_list_predicate_values',
+  default: 50,
+  cap: 10_000,
+  unit: ['code', 'codes'],
+  describe: (bounds) =>
+    `Codes per page. ${bounds} totalCount counts matches before offset and limit; nextOffset continues the list.`,
+});
+
+const n = (value: number) => value.toLocaleString('en-US');
 
 /** How many withheld codes a notice names before it stops listing them. */
 const WITHHELD_SAMPLE_SIZE = 3;
@@ -160,22 +174,18 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
         z
           .string()
           .regex(/^\d{2,8}(-\d{2})?$/)
-          .describe('A NAICS code: 2 to 8 digits, or a hyphenated sector range such as "31-33".'),
+          .describe(
+            'A NAICS code: 2 to 8 digits, or a hyphenated sector range — "31-33", "44-45", or "48-49".',
+          ),
       ])
       .optional()
       .describe(
-        'Industry code to scope the enumeration by, for dimensions the Census publishes per industry. On ecnbasic, TAXSTAT and TYPOP return only the all-establishments row until a NAICS sector is named — pass a sector code such as "62" (Health Care) or "42" (Wholesale Trade) and the result is complete for that industry alone. Ignored for dimensions with a published value list. Get sector codes by calling this tool on the dataset\'s own NAICS dimension. Blank is treated as omitted.',
+        'Industry code to scope the enumeration by, for dimensions the Census publishes per industry. On ecnbasic, TAXSTAT and TYPOP return only the all-establishments row until a NAICS sector is named — pass a sector code such as "62" (Health Care) or "42" (Wholesale Trade) and the result is complete for that industry alone. cbp, ecnbasic, and nonemp publish three sectors only as ranges — "31-33" manufacturing, "44-45" retail trade, and "48-49" transportation and warehousing — so a two-digit code inside one, such as "31", returns nothing. Ignored for dimensions with a published value list. Get sector codes by calling this tool on the dataset\'s own NAICS dimension. Blank is treated as omitted.',
       ),
-    limit: z
-      .number()
-      .int()
-      .min(1)
-      .max(500)
-      .optional()
-      .describe(
-        'Maximum codes per page (default: 50, max: 500). totalCount counts matches before offset and limit; nextOffset continues the list.',
-      ),
+    limit: LIMIT.schema,
   }),
+  // The name census_list_datasets returns the code under, and a common name for a search term.
+  inputAliases: { dataset_id: 'dataset', keyword: 'query' },
   output: z.object({
     values: z
       .array(
@@ -225,7 +235,7 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
       .string()
       .optional()
       .describe(
-        'Guidance when the list was truncated, when query matched no published code, when codes from the dataset dictionary could not be checked against its published rows, or when the codes returned are complete only for a named industry rather than for the dimension as a whole.',
+        'Guidance when the list was truncated or a limit above 10,000 was served at 10,000, when query matched no published code, when codes from the dataset dictionary could not be checked against its published rows, or when the codes returned are complete only for a named industry rather than for the dimension as a whole.',
       ),
   },
   // The notice quotes the query and the labels of withheld codes.
@@ -313,9 +323,8 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
   async handler(input, ctx) {
     const upstream = censusCallContext(ctx);
     const dataset = resolveDataset(input.dataset);
-    const { defaultYear } = getDiscoveryConfig();
-    const year = input.year ?? DATASET_LATEST_YEARS[dataset] ?? defaultYear;
-    const limit = input.limit ?? 50;
+    const year = input.year ?? latestYearOf(dataset);
+    const { limit, clampNotice } = LIMIT.apply(ctx, input.limit);
     const offset = input.offset ?? 0;
     const geographyLevel = input.geography_level?.trim().toLowerCase() || 'us';
     // Every supported dataset names its dimensions in uppercase.
@@ -350,7 +359,8 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
     // has to be enumerated against the data endpoint.
     let all: CensusPredicateValue[];
     let source: string;
-    let naicsScopeApplied: string | undefined;
+    /** The industry the live enumeration was scoped to, when within_naics applied. */
+    let naicsScope: { code: string; value: string } | undefined;
     /** Declared codes the dataset publishes no rows for — dropped from `all`, named in a notice. */
     let withheld: CensusPredicateValue[] = [];
     /** Why the declared codes were returned unchecked, when they were. */
@@ -423,9 +433,7 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
         }
       }
       const naicsValue = input.within_naics?.trim();
-      const naicsScope =
-        naicsCode && naicsValue ? { code: naicsCode, value: naicsValue } : undefined;
-      naicsScopeApplied = naicsScope ? `${naicsScope.code}=${naicsScope.value}` : undefined;
+      naicsScope = naicsCode && naicsValue ? { code: naicsCode, value: naicsValue } : undefined;
 
       all = await getCensusApiService().fetchPredicateValues(
         {
@@ -443,14 +451,17 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
 
     if (all.length === 0) {
       // Only an industry scope the call applied is a lever it can loosen; without one, the
-      // contract's hint names what is left to change.
+      // contract's hint names what is left to change. A two-digit code inside a published sector
+      // range names no industry at all, so the range is the fix rather than a broader code.
       throw ctx.fail('no_values', `${predicate} returned no codes in ${dataset} (${year}).`, {
         dataset,
         year,
         predicate,
-        ...(naicsScopeApplied && {
+        ...(naicsScope && {
           recovery: {
-            hint: 'Drop within_naics, or try a broader industry code — a narrow leaf industry often publishes only the all-establishments row.',
+            hint:
+              describeNaicsSectorRange(dataset, year, 'within_naics', naicsScope.value) ||
+              'Drop within_naics, or try a broader industry code — a narrow leaf industry often publishes only the all-establishments row.',
           },
         }),
       });
@@ -485,9 +496,9 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
         `This dictionary list does not validate publication at geography_level "${input.geography_level.trim()}"; its classification and any publication check remain dataset-wide. Confirm a code with census_query_data at the geography you need.`,
       );
     }
-    if (naicsScopeApplied) {
+    if (naicsScope) {
       notices.push(
-        `These codes are the ones ${predicate} takes under ${naicsScopeApplied}, and are complete for that industry only — a different industry can publish a different set. Send the same ${naicsScopeApplied.split('=')[0]} value alongside ${predicate} in predicates.`,
+        `These codes are the ones ${predicate} takes under ${naicsScope.code}=${naicsScope.value}, and are complete for that industry only — a different industry can publish a different set. Send the same ${naicsScope.code} value alongside ${predicate} in predicates.`,
       );
     } else if (source === 'live_query' && all.length === 1 && naicsCode) {
       notices.push(
@@ -496,7 +507,7 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
     }
     if (withheld.length > 0) {
       notices.push(
-        `${dataset} (${year}) declares ${(withheld.length + all.length).toLocaleString('en-US')} ${predicate} codes and publishes rows for ${all.length.toLocaleString('en-US')} of them; only those are listed. The rest belong to the wider classification the value map is shared from and return nothing at any geography. A single geography, or a more detailed table, can publish fewer still.`,
+        `${dataset} (${year}) declares ${n(withheld.length + all.length)} ${predicate} codes and publishes rows for ${n(all.length)} of them; only those are listed. The rest belong to the wider classification the value map is shared from and return nothing at any geography. A single geography, or a more detailed table, can publish fewer still.`,
       );
     } else if (unchecked === 'per_industry') {
       notices.push(
@@ -511,17 +522,19 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
         `These are the codes ${predicate} declares in ${dataset} (${year}); checking them against the rows the dataset publishes was not possible on this call. A declared code can return nothing at any geography, so confirm one with census_query_data before relying on it.`,
       );
     }
+    // A clamped limit is disclosed where the paging sentence goes, ahead of it.
+    if (clampNotice) notices.push(clampNotice);
     if (truncated) {
       notices.push(
-        `Showing ${values.length} of ${matched.length.toLocaleString('en-US')} codes. Call again with offset: ${nextOffset}, keeping predicate, dataset, year, query, geography_level and within_naics unchanged, for the next page. Narrow with query${limit < 500 ? ', or raise limit (max 500)' : ' for fewer matches'}.`,
+        `Showing ${n(values.length)} of ${n(matched.length)} codes. Call again with offset: ${nextOffset}, keeping predicate, dataset, year, query, geography_level and within_naics unchanged, for the next page. Narrow with query${limit < LIMIT.cap ? `, or raise limit (max ${n(LIMIT.cap)})` : ' for fewer matches'}.`,
       );
     } else if (matched.length > 0 && values.length === 0) {
       notices.push(
-        `offset ${offset} is past the last of the ${matched.length} matching codes. Pass an offset below ${matched.length}, or offset: 0 to start again.`,
+        `offset ${n(offset)} is past the last of the ${n(matched.length)} matching codes. Pass an offset below ${n(matched.length)}, or offset: 0 to start again.`,
       );
     } else if (matched.length > 0 && offset > 0) {
       notices.push(
-        `This is the last page of ${matched.length} matching codes; offset: 0 starts again.`,
+        `This is the last page of ${n(matched.length)} matching codes; offset: 0 starts again.`,
       );
     } else if (matched.length === 0) {
       // A keyword that matches only withheld codes is the sharpest version of this dimension's
@@ -540,11 +553,11 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
           .join(', ');
         const plural = withheldMatches.length === 1 ? 'code' : 'codes';
         notices.push(
-          `No published ${predicate} code matched "${input.query?.trim()}". ${dataset} (${year}) does declare ${withheldMatches.length} matching ${plural} — ${named} — but publishes no rows for ${withheldMatches.length === 1 ? 'it' : 'them'} at any geography, so ${withheldMatches.length === 1 ? 'it is' : 'they are'} not listed. A declared code a dataset serves nothing for means the category it names is outside what that dataset covers, not that the query was wrong — try another keyword, or census_list_datasets for a dataset that reports it.`,
+          `No published ${predicate} code matched "${input.query?.trim()}". ${dataset} (${year}) does declare ${n(withheldMatches.length)} matching ${plural} — ${named} — but publishes no rows for ${withheldMatches.length === 1 ? 'it' : 'them'} at any geography, so ${withheldMatches.length === 1 ? 'it is' : 'they are'} not listed. A declared code a dataset serves nothing for means the category it names is outside what that dataset covers, not that the query was wrong — try another keyword, or census_list_datasets for a dataset that reports it.`,
         );
       } else {
         notices.push(
-          `No ${predicate} code matched "${input.query?.trim()}". ${predicate} takes ${all.length} ${all.length === 1 ? 'code' : 'codes'} here — drop query to list them, or try a broader keyword.`,
+          `No ${predicate} code matched "${input.query?.trim()}". ${predicate} takes ${n(all.length)} ${all.length === 1 ? 'code' : 'codes'} here — drop query to list them, or try a broader keyword.`,
         );
       }
     }
@@ -562,7 +575,7 @@ export const censusListPredicateValues = tool('census_list_predicate_values', {
   format: (result) => {
     const lines: string[] = [
       `## ${result.predicate} — ${result.predicate_label}`,
-      `**${result.dataset} (${result.year})** · ${result.values.length} codes\n`,
+      `**${result.dataset} (${result.year})** · ${n(result.values.length)} ${result.values.length === 1 ? 'code' : 'codes'}\n`,
     ];
     for (const v of result.values) {
       lines.push(`- **\`${v.code}\`** — ${v.label}`);

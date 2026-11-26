@@ -10,12 +10,11 @@ import { censusGetVariable } from '@/mcp-server/tools/definitions/census-get-var
 
 vi.mock('@/services/variable-cache/variable-cache-service.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/services/variable-cache/variable-cache-service.js')>()),
-  DATASET_LATEST_YEARS: { 'acs/acs5': 2024 },
   getVariableCacheService: vi.fn(),
 }));
 
 vi.mock('@/config/server-config.js', () => ({
-  getDiscoveryConfig: vi.fn(() => ({ defaultYear: 2024, variableCacheTtlHours: 24 })),
+  getDiscoveryConfig: vi.fn(() => ({ variableCacheTtlHours: 24, clampLimits: true })),
 }));
 
 const mockGetVariablesByCode = vi.fn();

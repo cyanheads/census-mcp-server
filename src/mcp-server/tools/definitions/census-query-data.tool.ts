@@ -375,7 +375,7 @@ export const censusQueryData = tool('census_query_data', {
             geography_geoid: z
               .string()
               .describe(
-                'Full GEOID — the queried level concatenated with its parent levels (e.g., "53033" for King County, "53033000101" for a tract). Nationally unique, unlike geography_fips. Pass these to the geographies filter in census_compare_geographies to compare geographies across different states, or back as geography_fips here, which reads the parents a GEOID carries.',
+                'Full GEOID — the queried level concatenated with its parent levels (e.g., "53033" for King County, "53033000101" for a tract). Nationally unique, unlike geography_fips. Pass these to the geographies filter in census_compare_geographies to compare geographies across different states, or back as geography_fips here at the levels that input lists, where it is read as its parents plus the level code.',
               ),
             variables: z
               .object({})

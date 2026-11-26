@@ -4,7 +4,7 @@ description: "Census Bureau data through the census_* tools: choose the dataset 
 license: Apache-2.0
 metadata:
   author: cyanheads
-  version: "1.2"
+  version: "1.3"
 ---
 
 ## Scope
@@ -62,7 +62,7 @@ In CT, ME, MA, MI, MN, NH, NJ, NY, PA, RI, VT, and WI, put the state after the n
 
 1. Call census_list_geographies for the dataset and year to get the level's exact name and the parents it requires.
 2. Call census_query_data at that level with geography_fips `"*"`, requesting `GEO_ID`, and supply the parents the level still requires. With `"*"` some levels need fewer parents than a single code does: on the 2020 decennial files county subdivision needs only the state, and the national American Indian area/Alaska Native area/Hawaiian home land level needs none.
-3. Pick the row by its geography name, then carry its code and the same parents into the real query. The row's GEOID (geography_geoid) can instead go straight into census_query_data as geography_fips, which reads it as its parents plus the level code, or into census_compare_geographies.
+3. Pick the row by its geography name, then carry its code and the same parents into the real query, or pass its GEOID (geography_geoid) to census_compare_geographies. census_query_data also takes the GEOID as geography_fips at congressional district and school district (unified), reading it as its parents plus the level code; at the other levels here, elementary and secondary school districts among them, send the code.
 
 Towns in the states above are county subdivisions ("Brookline town, Norfolk County, Massachusetts"), not places. To rank every town in a state, call census_compare_geographies at county subdivision within the state, after dropping the placeholder rows.
 

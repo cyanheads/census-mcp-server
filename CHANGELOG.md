@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.8.1](changelog/0.8.x/0.8.1.md) — 2026-11-26
+
+A limit above a tool's cap is served at the cap with a notice, full GEOIDs and dec/pl 2000 whole-number tracts reach their rows, cbp NAICS sector ranges are named when a two-digit code returns nothing, and the tools accept dataset_id, place_name, keyword, and the resolver's field names as input aliases.
+
 ## [0.8.0](changelog/0.8.x/0.8.0.md) — 2026-11-15 · ⚠️ Breaking
 
 census_query_data takes a whole table through group, variable labels move to one top-level variable_labels map, census_resolve_geography reaches county subdivisions and Connecticut's pre-2022 counties, and the 2025 ACS 1-year vintages, nonemp 2024, and geoinfo land area join the catalog.

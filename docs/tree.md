@@ -1,6 +1,6 @@
 # census-mcp-server - Directory Structure
 
-Generated on: 2026-11-16 06:08:46
+Generated on: 2026-11-26 21:06:14
 
 ```text
 census-mcp-server/
@@ -169,6 +169,8 @@ census-mcp-server/
 │   │       │   └── index.ts
 │   │       ├── acs-coverage.ts
 │   │       ├── boundary-vintage.ts
+│   │       ├── count-limit.ts
+│   │       ├── geoid-layout.ts
 │   │       ├── notice-trailer.ts
 │   │       └── variable-entry.ts
 │   ├── services/
@@ -204,21 +206,24 @@ census-mcp-server/
 │   │   │   └── geography-service.test.ts
 │   │   └── variable-cache/
 │   │       └── variable-cache-service.test.ts
-│   └── tools/
-│       ├── boundary-vintage.test.ts
-│       ├── census-compare-geographies.tool.test.ts
-│       ├── census-data-tools.contract.test.ts
-│       ├── census-get-variable.tool.test.ts
-│       ├── census-list-datasets.tool.test.ts
-│       ├── census-list-geographies.tool.test.ts
-│       ├── census-list-predicate-values.tool.test.ts
-│       ├── census-query-data.tool.test.ts
-│       ├── census-resolve-geography.tool.test.ts
-│       ├── census-search-variables.tool.test.ts
-│       ├── census-variable-tools.contract.test.ts
-│       ├── notice-trailer.test.ts
-│       ├── tool-input-contract.test.ts
-│       └── variable-entry.test.ts
+│   ├── tools/
+│   │   ├── boundary-vintage.test.ts
+│   │   ├── census-compare-geographies.tool.test.ts
+│   │   ├── census-data-tools.contract.test.ts
+│   │   ├── census-get-variable.tool.test.ts
+│   │   ├── census-list-datasets.tool.test.ts
+│   │   ├── census-list-geographies.tool.test.ts
+│   │   ├── census-list-predicate-values.tool.test.ts
+│   │   ├── census-query-data.tool.test.ts
+│   │   ├── census-resolve-geography.tool.test.ts
+│   │   ├── census-search-variables.tool.test.ts
+│   │   ├── census-variable-tools.contract.test.ts
+│   │   ├── count-limit.test.ts
+│   │   ├── geoid-layout.test.ts
+│   │   ├── notice-trailer.test.ts
+│   │   ├── tool-input-contract.test.ts
+│   │   └── variable-entry.test.ts
+│   └── index.test.ts
 ├── .dockerignore
 ├── .env.example
 ├── .gitattributes
